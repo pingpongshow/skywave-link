@@ -48,3 +48,24 @@ SKYLINK_TEST_LOG=scriptA.log \
 | `screenshot <path.ppm>` | the next rendered frame, read back from GL (works with the display asleep) |
 | `dump <path.json>` | report: chat, transfers, mail in/out, heard stations and beacons, ping results, weather, BBS files, modem/link state |
 | `quit` | normal shutdown (graceful link teardown, config save) |
+
+## Two-station runs
+
+Each app needs its own modem. Start the modems with
+`SKW_CHANMEM_PATH=` (empty: no channel-memory persistence) so test
+sessions never read or write the operator's `~/.skywave/chanmem.bin`;
+otherwise test peers' link history is stored there and seeds real
+sessions' starting modes. Cross the audio devices between the two and
+give each its own ports:
+
+```bash
+SKW_CHANMEM_PATH= skywave --callsign N0AAA --audio-in "VB-Cable" \
+  --audio-out "BlackHole 2ch" --data-port 9400 --ctrl-port 9401 --voice-port 9402 &
+SKW_CHANMEM_PATH= skywave --callsign N0BBB --audio-in "BlackHole 2ch" \
+  --audio-out "VB-Cable" --data-port 9500 --ctrl-port 9501 --voice-port 9502 &
+```
+
+Point each app's `[modem]` ports at its modem (in that station's `HOME`)
+and run the two scripts. Give each station its own working directory,
+too: relative paths in the config (the BBS folder, downloads) resolve
+against it, and two apps sharing one directory see each other's files.
