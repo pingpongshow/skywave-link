@@ -1,0 +1,61 @@
+# Build directories
+build*/
+cmake-build-*/
+
+# IDE files
+.idea/
+.vscode/
+.cache/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Dolt database files
+.dolt/
+
+# ImGui state
+imgui.ini
+
+# Logs
+*.log
+run/
+
+# Temporary files
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+
+# Channel scanner data
+channel_history.csv
+
+# Voice message recordings
+*.c2v
