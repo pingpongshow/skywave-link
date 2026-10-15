@@ -100,17 +100,27 @@ Consequences for the app:
 
 * `BEACON` and `CQ` now carry **only station metadata** (callsign, noise
   floor, family). Operator payloads ride `BCAST_DATA`.
-* Broadcast application messages arrive through the new
-  `ModemClient::onBroadcast` callback once the fragment chain completes, and
-  are handled by `App::onBroadcastMessage()`. `App::onMonitorFrame()` no
-  longer tries to read app payloads out of beacons.
+* Broadcast application messages arrive through the
+  `ModemClient::onBroadcast` callback and are handled by
+  `App::onBroadcastMessage()`. `App::onMonitorFrame()` no longer tries to
+  read app payloads out of beacons.
 * The data-port reader demultiplexes `0xFB` records from payload bytes,
   following the modem's own rule: while a session is connected every byte is
   payload.
+* A connected session is a plain byte stream: the modem coalesces and splits
+  writes, so two app messages can arrive as one read and one message as two.
+  `ModemClient::sendData()` therefore frames every message written while
+  connected as `A5 5A | len (u16 BE) | message`, and the reader delivers each
+  complete message to the data callback on its own (resynchronizing on the
+  header if bytes are ever lost). Before this, a fragmented chat, a mail ACK
+  pair, or a BBS request sent during a file transfer arrived merged and was
+  lost or garbled.
 
-The modem now also surfaces its own reassembly as `EVT:BROADCAST`; the
-client prefers that and keeps `BroadcastReassembler` for older modems and
-for the binary-record path.
+The modem surfaces its own reassembly as `EVT:BROADCAST`, which names the
+sender and keeps flowing while connected; it is the only broadcast path. The
+client used to also reassemble the same chains from `MON:` lines and binary
+records, which showed every broadcast two or three times (once as UNKNOWN).
+`BroadcastReassembler` stays in the protocol library and its tests.
 
 ## 5. Configuration schema
 
@@ -143,8 +153,7 @@ and the app now depends on the fixed behaviour:
 * `EVT:BROADCAST <src> <hex>` is new — the modem's own reassembly of a
   `BCAST_DATA` chain, which it previously built and discarded. Unlike the
   data port's binary records it keeps flowing during a session, so the
-  client prefers it and keeps `BroadcastReassembler` as the fallback for
-  older modems.
+  client uses it as its only broadcast path.
 
 ## 7. What the emulator now does
 

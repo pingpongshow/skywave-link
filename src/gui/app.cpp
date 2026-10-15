@@ -413,6 +413,8 @@ bool isDisconnectedBroadcastPayload(uint8_t msg_type) {
         case 0xF4:  // Position beacon
         case 0xF9:  // Pending-message notification
         case 0xE3:  // Legacy broadcast mail
+        case 0xE0:  // Ping request (addressed broadcast)
+        case 0xE1:  // Ping response (addressed broadcast)
         case kMailBroadcastReliableMarker:
             return true;
         default:
@@ -1426,6 +1428,7 @@ bool App::initialize() {
     initializeSharedState();
     initializeWindows();
 
+    loadTestScript();
     return true;
 }
 
@@ -1461,7 +1464,10 @@ bool App::initSDL() {
     }
 
     SDL_GL_MakeCurrent(window_, gl_context_);
-    SDL_GL_SetSwapInterval(1);  // VSync
+    // VSync, except under a test script: with the display asleep or the
+    // window occluded the swap blocks, and the update loop (and the
+    // script) would stall. run() caps the frame rate with SDL_Delay anyway.
+    SDL_GL_SetSwapInterval(std::getenv("SKYLINK_TEST_SCRIPT") ? 0 : 1);
 
     return true;
 }
@@ -2338,6 +2344,7 @@ bool App::handleVoiceHotkeyEvent(const SDL_KeyboardEvent& key, bool pressed) {
 
 void App::update() {
     auto now = std::chrono::steady_clock::now();
+    runTestScript();
 
     // Poll modem and APRS at regular intervals
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_poll_);
@@ -2683,6 +2690,24 @@ void App::render() {
         SDL_GL_MakeCurrent(backup_current_window, backup_current_context);
     }
 
+    if (!test_shot_path_.empty()) {
+        // Test hook: read back the frame just rendered (works with the
+        // display asleep, unlike a screen capture) and write a binary PPM.
+        int w = 0, h = 0;
+        SDL_GL_GetDrawableSize(window_, &w, &h);
+        std::vector<unsigned char> px(size_t(w) * size_t(h) * 3);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadBuffer(GL_BACK);
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+        std::ofstream f(test_shot_path_, std::ios::binary);
+        f << "P6\n" << w << " " << h << "\n255\n";
+        for (int y = h - 1; y >= 0; --y) {
+            f.write(reinterpret_cast<const char*>(px.data() + size_t(y) * size_t(w) * 3),
+                    std::streamsize(w) * 3);
+        }
+        testLog("screenshot written: " + test_shot_path_);
+        test_shot_path_.clear();
+    }
     SDL_GL_SwapWindow(window_);
 }
 
@@ -5476,6 +5501,17 @@ void App::sendPendingMessages() {
             continue;
         }
 
+        // Mail composed in this session is owned by updateReliableMail()
+        // (send, ACK timeout, retry); sending it here too delivers it twice.
+        const bool tracked = std::any_of(
+            mail_outbox_.begin(), mail_outbox_.end(), [&](const MailMessage& m) {
+                return (msg.id > 0 && m.store_id == msg.id) ||
+                       (!msg.message_id.empty() && m.message_id == msg.message_id);
+            });
+        if (tracked) {
+            continue;
+        }
+
         if (msg.message_id.empty()) {
             msg.message_id = MessageStore::generateMessageId(
                 normalizeCallsign(config_.station.callsign));
@@ -5522,7 +5558,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     if (data.empty()) return;
 
     std::string sender = normalizeCallsign(from_override.empty() ? current_chat_partner_ : from_override);
-    if (sender.empty()) {
+    if (sender.empty() || sender == "?") {  // the modem names unknown senders "?"
         sender = "UNKNOWN";
     }
 
@@ -8134,47 +8170,78 @@ void App::sendPing(const std::string& callsign) {
         return;
     }
 
+    // Connectionless ping: a broadcast addressed to one station, answered by
+    // a broadcast addressed back. Both carry the callsigns themselves: the
+    // modem names a sender it has not heard a BEACON from as "?".
+    // 0xE0 | target_len | target | origin_len | origin | grid_len | grid
+    std::string grid = config_.station.grid_square;
+    if (grid.size() > 8) grid = grid.substr(0, 8);
+    const std::string self = normalizeCallsign(config_.station.callsign);
+    std::vector<uint8_t> request;
+    request.push_back(0xE0);
+    request.push_back(static_cast<uint8_t>(target.size()));
+    request.insert(request.end(), target.begin(), target.end());
+    request.push_back(static_cast<uint8_t>(self.size()));
+    request.insert(request.end(), self.begin(), self.end());
+    request.push_back(static_cast<uint8_t>(grid.size()));
+    request.insert(request.end(), grid.begin(), grid.end());
+
     ChatMessage msg;
     msg.from = "SYSTEM";
-    msg.text = "Ping is unavailable with the current Skywave TCP control API.";
     msg.is_outgoing = false;
     msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!sendBroadcastPayload(request)) {
+        msg.text = "Ping to " + target + " could not be sent";
+    } else {
+        ping_in_progress_ = true;
+        ping_target_ = target;
+        ping_sent_time_ = std::chrono::steady_clock::now();
+        msg.text = "Ping sent to " + target;
+    }
     chat_history_.push_back(msg);
     chat_scroll_to_bottom_ = true;
 }
 
 void App::processPingRequest(const std::string& from, const std::vector<uint8_t>& data) {
-    // Parse ping request: 0xE0 | grid_len | grid_square
-    std::string remote_grid;
-    if (data.size() >= 2) {
-        uint8_t grid_len = data[1];
-        if (data.size() >= 2 + grid_len) {
-            remote_grid = std::string(data.begin() + 2, data.begin() + 2 + grid_len);
-        }
+    // 0xE0 | target_len | target | origin_len | origin | grid_len | grid
+    size_t at = 1;
+    auto field = [&](std::string* out) {
+        if (data.size() <= at || data.size() < at + 1 + data[at]) return false;
+        out->assign(data.begin() + static_cast<std::ptrdiff_t>(at + 1),
+                    data.begin() + static_cast<std::ptrdiff_t>(at + 1 + data[at]));
+        at += 1 + data[at];
+        return true;
+    };
+    std::string target, origin, remote_grid;
+    if (!field(&target) || !field(&origin)) return;
+    (void)field(&remote_grid);
+    if (normalizeCallsign(target) != normalizeCallsign(config_.station.callsign)) {
+        return;  // addressed to another station
     }
+    origin = normalizeCallsign(origin);
+    if (origin.empty()) origin = normalizeCallsign(from);
+    if (origin.empty()) return;
 
-    // Send ping response: 0xE1 | snr_byte | grid_len | grid_square
+    // 0xE1 | origin_len | origin | responder_len | responder | snr | grid_len | grid
+    const std::string self = normalizeCallsign(config_.station.callsign);
     std::vector<uint8_t> response;
-    response.push_back(0xE1);  // Ping response marker
-
-    // Include SNR
+    response.push_back(0xE1);
+    response.push_back(static_cast<uint8_t>(origin.size()));
+    response.insert(response.end(), origin.begin(), origin.end());
+    response.push_back(static_cast<uint8_t>(self.size()));
+    response.insert(response.end(), self.begin(), self.end());
     float snr = modem_ ? modem_->getStatus().snr_db : 0.0f;
-    response.push_back(static_cast<uint8_t>(static_cast<int8_t>(snr)));
-
-    // Include our grid square
+    response.push_back(static_cast<uint8_t>(static_cast<int8_t>(std::clamp(snr, -127.0f, 127.0f))));
     std::string grid = config_.station.grid_square;
     if (grid.size() > 8) grid = grid.substr(0, 8);
     response.push_back(static_cast<uint8_t>(grid.size()));
     response.insert(response.end(), grid.begin(), grid.end());
-
-    if (modem_) {
-        modem_->sendData(response);
-    }
+    (void)sendBroadcastPayload(response);
 
     // Add to ping results
     PingResult result;
-    result.callsign = from;
+    result.callsign = origin;
     result.grid_square = remote_grid;
     result.snr_db = snr;
     result.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -8185,8 +8252,8 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
     while (ping_results_.size() > MAX_PING_RESULTS) {
         ping_results_.pop_back();
     }
-    if (isKnownEmailGateway(from)) {
-        const std::string gateway_call = normalizeCallsign(from);
+    if (isKnownEmailGateway(origin)) {
+        const std::string gateway_call = origin;
         auto& stats = gateway_stats_[gateway_call];
         stats.snr_accum += snr;
         stats.snr_samples++;
@@ -8200,7 +8267,7 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
     }
     if (store_ && store_->isOpen()) {
         PingRecord rec;
-        rec.callsign = from;
+        rec.callsign = origin;
         rec.snr_db = snr;
         rec.grid_square = remote_grid;
         rec.band = current_band_;
@@ -8211,7 +8278,7 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
 
     ChatMessage msg;
     msg.from = "SYSTEM";
-    msg.text = "Ping from " + from;
+    msg.text = "Ping from " + origin;
     if (!remote_grid.empty()) {
         msg.text += " [" + remote_grid + "]";
     }
@@ -8226,25 +8293,31 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
 void App::processPingResponse(const std::string& from, const std::vector<uint8_t>& data) {
     if (!ping_in_progress_) return;
 
-    // Parse ping response: 0xE1 | snr_byte | grid_len | grid_square
-    float remote_snr = 0.0f;
-    std::string remote_grid;
-
-    if (data.size() >= 2) {
-        remote_snr = static_cast<float>(static_cast<int8_t>(data[1]));
+    // 0xE1 | origin_len | origin | responder_len | responder | snr | grid_len | grid
+    size_t at = 1;
+    auto field = [&](std::string* out) {
+        if (data.size() <= at || data.size() < at + 1 + data[at]) return false;
+        out->assign(data.begin() + static_cast<std::ptrdiff_t>(at + 1),
+                    data.begin() + static_cast<std::ptrdiff_t>(at + 1 + data[at]));
+        at += 1 + data[at];
+        return true;
+    };
+    std::string origin, responder, remote_grid;
+    if (!field(&origin) || !field(&responder) || data.size() <= at) return;
+    const float remote_snr = static_cast<float>(static_cast<int8_t>(data[at++]));
+    (void)field(&remote_grid);
+    if (responder.empty()) responder = from;
+    if (normalizeCallsign(origin) != normalizeCallsign(config_.station.callsign) ||
+        normalizeCallsign(responder) != normalizeCallsign(ping_target_)) {
+        return;
     }
-    if (data.size() >= 3) {
-        uint8_t grid_len = data[2];
-        if (data.size() >= 3 + grid_len) {
-            remote_grid = std::string(data.begin() + 3, data.begin() + 3 + grid_len);
-        }
-    }
+    (void)from;
 
     ping_in_progress_ = false;
 
     // Add to results
     PingResult result;
-    result.callsign = from;
+    result.callsign = ping_target_;
     result.grid_square = remote_grid;
     result.snr_db = remote_snr;
     result.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -8255,8 +8328,8 @@ void App::processPingResponse(const std::string& from, const std::vector<uint8_t
     while (ping_results_.size() > MAX_PING_RESULTS) {
         ping_results_.pop_back();
     }
-    if (isKnownEmailGateway(from)) {
-        const std::string gateway_call = normalizeCallsign(from);
+    if (isKnownEmailGateway(ping_target_)) {
+        const std::string gateway_call = normalizeCallsign(ping_target_);
         auto& stats = gateway_stats_[gateway_call];
         stats.snr_accum += remote_snr;
         stats.snr_samples++;
@@ -8270,7 +8343,7 @@ void App::processPingResponse(const std::string& from, const std::vector<uint8_t
     }
     if (store_ && store_->isOpen()) {
         PingRecord rec;
-        rec.callsign = from;
+        rec.callsign = ping_target_;
         rec.snr_db = remote_snr;
         rec.grid_square = remote_grid;
         rec.band = current_band_;
@@ -8281,7 +8354,7 @@ void App::processPingResponse(const std::string& from, const std::vector<uint8_t
 
     ChatMessage msg;
     msg.from = "SYSTEM";
-    msg.text = "Pong from " + from;
+    msg.text = "Pong from " + ping_target_;
     if (!remote_grid.empty()) {
         msg.text += " [" + remote_grid + "]";
     }
@@ -9312,7 +9385,9 @@ void App::sendMail(const std::string& to, const std::string& subject, const std:
     } else {
         msg.text = sent
             ? ("Mail sent to " + to_field + " [MID " + mail.message_id + "]")
-            : ("Mail queued (link unavailable) for " + to_field + " [MID " + mail.message_id + "]");
+            : ((status.link_state == LinkState::Connected && channel_busy)
+                   ? ("Mail queued (channel busy) for " + to_field + " [MID " + mail.message_id + "]")
+                   : ("Mail queued (link unavailable) for " + to_field + " [MID " + mail.message_id + "]"));
     }
     msg.is_outgoing = false;
     msg.timestamp = unixNowSeconds();
@@ -11214,3 +11289,232 @@ bool App::sendPSKReporterUDP(const std::string& payload) {
 }
 
 } // namespace skylink
+
+
+// ---------------------------------------------------------------------------
+// Scripted test hook (docs/TESTING_HOOK.md)
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string trimCopy(const std::string& v) {
+    size_t a = v.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = v.find_last_not_of(" \t\r\n");
+    return v.substr(a, b - a + 1);
+}
+std::vector<std::string> splitBar(const std::string& v) {
+    std::vector<std::string> out;
+    size_t p = 0;
+    while (true) {
+        size_t q = v.find('|', p);
+        out.push_back(trimCopy(v.substr(p, q == std::string::npos ? std::string::npos : q - p)));
+        if (q == std::string::npos) break;
+        p = q + 1;
+    }
+    return out;
+}
+std::string jsonEsc(const std::string& v) {
+    // Valid UTF-8 passes through; any other byte becomes U+FFFD so the
+    // report always parses.
+    std::string o;
+    size_t i = 0;
+    while (i < v.size()) {
+        const unsigned char c = static_cast<unsigned char>(v[i]);
+        if (c < 0x80) {
+            if (c == '"' || c == '\\') { o += '\\'; o += static_cast<char>(c); }
+            else if (c == '\n') o += "\\n";
+            else if (c < 0x20) o += ' ';
+            else o += static_cast<char>(c);
+            ++i;
+            continue;
+        }
+        const size_t len = (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        bool ok = len != 0 && i + len <= v.size();
+        for (size_t k = 1; ok && k < len; ++k) {
+            ok = (static_cast<unsigned char>(v[i + k]) & 0xC0) == 0x80;
+        }
+        if (ok) {
+            o.append(v, i, len);
+            i += len;
+        } else {
+            o += "\xEF\xBF\xBD";
+            ++i;
+        }
+    }
+    return o;
+}
+}  // namespace
+
+void skylink::App::testLog(const std::string& line) {
+    std::cout << "TEST: " << line << std::endl;
+    if (test_log_.is_open()) {
+        test_log_ << line << std::endl;
+    }
+}
+
+void skylink::App::loadTestScript() {
+    const char* path = std::getenv("SKYLINK_TEST_SCRIPT");
+    if (!path || !*path) return;
+    std::ifstream in(path);
+    if (!in) {
+        std::cerr << "TEST: cannot open script " << path << "\n";
+        return;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trimCopy(line);
+        if (line.empty() || line[0] == '#') continue;
+        test_script_.push_back(line);
+    }
+    if (const char* log = std::getenv("SKYLINK_TEST_LOG")) test_log_.open(log);
+    testLog("script loaded: " + std::to_string(test_script_.size()) + " actions");
+}
+
+void skylink::App::runTestScript() {
+    if (test_script_.empty() || test_pc_ >= test_script_.size()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < test_wait_until_) return;
+    if (!test_wait_cond_.empty()) {
+        bool met = false;
+        if (test_wait_cond_ == "modem") met = modem_ && modem_->isConnected();
+        else if (test_wait_cond_ == "connected") met = isStationLinkConnected(false);
+        else if (test_wait_cond_ == "disconnected") met = !isStationLinkConnected(false);
+        if (!met && now < test_cond_deadline_) return;
+        testLog(std::string("wait ") + test_wait_cond_ + (met ? " -> ok" : " -> TIMEOUT"));
+        test_wait_cond_.clear();
+    }
+    const std::string line = test_script_[test_pc_++];
+    const size_t sp = line.find(' ');
+    const std::string cmd = line.substr(0, sp);
+    const std::string arg = sp == std::string::npos ? "" : trimCopy(line.substr(sp + 1));
+    testLog("> " + line);
+    if (cmd == "wait") {
+        test_wait_until_ = now + std::chrono::milliseconds(int64_t(std::atof(arg.c_str()) * 1000.0));
+    } else if (cmd == "wait_modem" || cmd == "wait_connected" || cmd == "wait_disconnected") {
+        test_wait_cond_ = cmd.substr(5);
+        test_cond_deadline_ = now + std::chrono::seconds(arg.empty() ? 60 : std::atoi(arg.c_str()));
+    } else if (cmd == "connect_modem") {
+        connectToModem();
+    } else if (cmd == "disconnect_modem") {
+        disconnectFromModem();
+    } else if (cmd == "connect") {
+        connectToStation(arg);
+    } else if (cmd == "disconnect") {
+        if (modem_) modem_->sendCommand("DISCONNECT");
+    } else if (cmd == "chat") {
+        sendChatMessage(arg);
+    } else if (cmd == "file") {
+        sendFile(arg);
+    } else if (cmd == "ping") {
+        sendPing(arg);
+    } else if (cmd == "cq_start") {
+        startCQ();
+    } else if (cmd == "cq_stop") {
+        stopCQ();
+    } else if (cmd == "broadcast") {
+        sendBroadcast(arg);
+    } else if (cmd == "beacon") {
+        sendBeacon();
+    } else if (cmd == "mail") {
+        auto f = splitBar(arg);
+        if (f.size() >= 3) sendMail(f[0], f[1], f[2]);
+        else testLog("mail needs TO|SUBJECT|BODY");
+    } else if (cmd == "broadcast_mail") {
+        auto f = splitBar(arg);
+        if (f.size() >= 2) sendBroadcastMail(f[0], f[1]);
+    } else if (cmd == "weather") {
+        requestWeatherForecast(arg);
+    } else if (cmd == "metar") {
+        requestMETAR(arg);
+    } else if (cmd == "bbs_upload") {
+        auto f = splitBar(arg);
+        uploadToBBS(f[0], f.size() > 1 ? f[1] : "");
+    } else if (cmd == "bbs_announce") {
+        for (const auto& b : bbs_files_) {
+            if (!b.remote) announceBBSFile(b);
+        }
+    } else if (cmd == "bbs_fetch") {
+        auto f = splitBar(arg);
+        if (f.size() >= 2) requestRemoteBBSDownload(f[0], f[1]);
+    } else if (cmd == "snr") {
+        exchangeSNR(true);
+    } else if (cmd == "position") {
+        auto f = splitBar(arg);
+        if (f.size() >= 2) updatePosition(std::atof(f[0].c_str()), std::atof(f[1].c_str()));
+    } else if (cmd == "modem") {
+        if (modem_) modem_->sendCommand(arg);
+    } else if (cmd == "screenshot") {
+        test_shot_path_ = arg;
+    } else if (cmd == "dump") {
+        dumpTestReport(arg);
+    } else if (cmd == "quit") {
+        running_ = false;
+    } else {
+        testLog("unknown action: " + cmd);
+    }
+}
+
+void skylink::App::dumpTestReport(const std::string& path) {
+    std::ofstream o(path);
+    o << "{\n  \"callsign\": \"" << jsonEsc(config_.station.callsign) << "\",\n";
+    o << "  \"modem_connected\": " << (modem_ && modem_->isConnected() ? "true" : "false") << ",\n";
+    o << "  \"link_connected\": " << (isStationLinkConnected(false) ? "true" : "false") << ",\n";
+    o << "  \"chat\": [";
+    for (size_t i = 0; i < chat_history_.size(); ++i) {
+        const auto& m = chat_history_[i];
+        o << (i ? "," : "") << "\n    {\"from\": \"" << jsonEsc(m.from) << "\", \"to\": \"" << jsonEsc(m.to)
+          << "\", \"out\": " << (m.is_outgoing ? "true" : "false") << ", \"bcast\": "
+          << (m.is_broadcast ? "true" : "false") << ", \"text\": \"" << jsonEsc(m.text) << "\"}";
+    }
+    o << "\n  ],\n  \"transfers\": [";
+    for (size_t i = 0; i < transfers_.size(); ++i) {
+        const auto& t = transfers_[i];
+        o << (i ? "," : "") << "\n    {\"file\": \"" << jsonEsc(t.filename) << "\", \"peer\": \""
+          << jsonEsc(t.remote_callsign) << "\", \"upload\": " << (t.is_upload ? "true" : "false")
+          << ", \"bytes\": " << t.transferred_bytes << ", \"total\": " << t.total_bytes
+          << ", \"completed\": " << (t.completed ? "true" : "false") << ", \"failed\": "
+          << (t.failed ? "true" : "false") << ", \"error\": \"" << jsonEsc(t.error) << "\"}";
+    }
+    auto mails = [&](const char* name, const std::vector<MailMessage>& v) {
+        o << "\n  ],\n  \"" << name << "\": [";
+        for (size_t i = 0; i < v.size(); ++i) {
+            const auto& m = v[i];
+            o << (i ? "," : "") << "\n    {\"from\": \"" << jsonEsc(m.from) << "\", \"to\": \""
+              << jsonEsc(m.to) << "\", \"subject\": \"" << jsonEsc(m.subject) << "\", \"body\": \""
+              << jsonEsc(m.body) << "\", \"status\": " << int(m.status) << ", \"bcast\": "
+              << (m.is_broadcast ? "true" : "false") << "}";
+        }
+    };
+    mails("mail_inbox", mail_inbox_);
+    mails("mail_outbox", mail_outbox_);
+    o << "\n  ],\n  \"heard_stations\": [";
+    for (size_t i = 0; i < heard_stations_.size(); ++i) {
+        o << (i ? ", " : "") << "\"" << jsonEsc(heard_stations_[i].first) << "\"";
+    }
+    o << "],\n  \"heard_beacons\": [";
+    for (size_t i = 0; i < heard_beacons_.size(); ++i) {
+        o << (i ? ", " : "") << "{\"call\": \"" << jsonEsc(heard_beacons_[i].callsign)
+          << "\", \"grid\": \"" << jsonEsc(heard_beacons_[i].grid_square) << "\"}";
+    }
+    o << "],\n  \"ping_results\": [";
+    for (size_t i = 0; i < ping_results_.size(); ++i) {
+        o << (i ? ", " : "") << "{\"call\": \"" << jsonEsc(ping_results_[i].callsign)
+          << "\", \"online\": " << (ping_results_[i].online ? "true" : "false") << "}";
+    }
+    o << "],\n  \"weather\": [";
+    for (size_t i = 0; i < weather_reports_.size(); ++i) {
+        const auto& w = weather_reports_[i];
+        o << (i ? ", " : "") << "{\"type\": \"" << jsonEsc(w.type) << "\", \"loc\": \""
+          << jsonEsc(w.location) << "\", \"from\": \"" << jsonEsc(w.source_station)
+          << "\", \"pending\": " << (w.is_request_pending ? "true" : "false") << ", \"len\": "
+          << w.report.size() << "}";
+    }
+    o << "],\n  \"bbs_files\": [";
+    for (size_t i = 0; i < bbs_files_.size(); ++i) {
+        const auto& b = bbs_files_[i];
+        o << (i ? ", " : "") << "{\"file\": \"" << jsonEsc(b.filename) << "\", \"remote\": "
+          << (b.remote ? "true" : "false") << ", \"uploader\": \"" << jsonEsc(b.uploader) << "\"}";
+    }
+    o << "]\n}\n";
+    testLog("report written: " + path);
+}

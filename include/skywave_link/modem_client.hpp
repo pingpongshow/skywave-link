@@ -295,6 +295,8 @@ private:
     // Receive buffers
     std::string cmd_buffer_;
     std::vector<uint8_t> data_buffer_;
+    // Connected-session bytes awaiting de-framing (see kSessionMagic).
+    std::vector<uint8_t> session_rx_;
     std::vector<uint8_t> voice_buffer_;
     std::deque<int16_t> voice_rx_samples_;
     mutable std::mutex voice_mutex_;
@@ -302,8 +304,6 @@ private:
     uint64_t voice_tx_sample_counter_ = 0;
 
     // Broadcast fragment chains, one per source of monitor evidence.
-    BroadcastReassembler mon_bcast_;
-    BroadcastReassembler rec_bcast_;
 
     // Response queue
     std::queue<std::string> response_queue_;
@@ -336,8 +336,7 @@ private:
     void applyStatusLine(const std::string& fields);
     void handleMonitorRecord(const std::vector<uint8_t>& record);
     void dispatchMonitorFrame(MonitorFrame frame,
-                              const std::vector<uint8_t>& body,
-                              BroadcastReassembler& reasm);
+                              const std::vector<uint8_t>& body);
     void readCommandSocket();
     void readDataSocket();
     void readVoiceSocket();

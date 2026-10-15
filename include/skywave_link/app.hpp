@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <fstream>
+
 #include "config.hpp"
 #include "modem_client.hpp"
 #include "message_store.hpp"
@@ -297,7 +299,7 @@ private:
     bool ping_in_progress_ = false;
     std::string ping_target_;
     std::chrono::steady_clock::time_point ping_sent_time_;
-    static constexpr int PING_TIMEOUT_MS = 10000;
+    static constexpr int PING_TIMEOUT_MS = 120000;  // two broadcast frames at a robust mode
 
     // Mail state
     std::vector<MailMessage> mail_inbox_;
@@ -345,6 +347,21 @@ private:
     // Main loop
     void processEvents();
     void update();
+    // Scripted test hook (SKYLINK_TEST_SCRIPT=<file>): runs one action
+    // per line through the app's own methods from the update loop, so
+    // end-to-end tests drive exactly the code the GUI drives. See
+    // docs/TESTING_HOOK.md.
+    void loadTestScript();
+    void runTestScript();
+    void dumpTestReport(const std::string& path);
+    std::vector<std::string> test_script_;
+    size_t test_pc_ = 0;
+    std::chrono::steady_clock::time_point test_wait_until_{};
+    std::string test_wait_cond_;
+    std::chrono::steady_clock::time_point test_cond_deadline_{};
+    std::ofstream test_log_;
+    void testLog(const std::string& line);
+    std::string test_shot_path_;  // "screenshot" action: read back next frame
     void render();
 
     // UI rendering

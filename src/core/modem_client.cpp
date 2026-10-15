@@ -40,6 +40,16 @@ constexpr size_t kVoiceMediaHeaderLen = 16u;
 // Data-port binary monitor record (INTERFACES.md "Data Port"): tag, frame
 // type, family, mode, 24-bit source/destination hashes, BE length, payload.
 constexpr uint8_t kMonitorRecordTag = 0xFBu;
+
+// A connected session is a plain byte stream: the modem coalesces and splits
+// writes freely, so two app messages can arrive as one read or one message
+// as two. Each message written while connected is therefore framed as
+// [0xA5 0x5A][len u16 BE][message] and the receiver hands every complete
+// message to the data callback on its own.
+constexpr uint8_t kSessionMagic0 = 0xA5u;
+constexpr uint8_t kSessionMagic1 = 0x5Au;
+constexpr size_t kSessionHeaderLen = 4;
+constexpr size_t kSessionMaxMessage = 0xFFFFu;
 constexpr size_t kMonitorRecordHeaderLen = 12u;
 
 std::string trimCopy(std::string_view value) {
@@ -360,6 +370,7 @@ bool ModemClient::connect(const std::string& host,
     clearResponseQueue();
     cmd_buffer_.clear();
     data_buffer_.clear();
+    session_rx_.clear();
     voice_buffer_.clear();
     {
         std::lock_guard<std::mutex> lock(voice_mutex_);
@@ -415,6 +426,7 @@ void ModemClient::disconnect() {
 
     cmd_buffer_.clear();
     data_buffer_.clear();
+    session_rx_.clear();
     voice_buffer_.clear();
     {
         std::lock_guard<std::mutex> lock(voice_mutex_);
@@ -576,9 +588,35 @@ void ModemClient::readDataSocket() {
         data_buffer_.clear();
     }
 
-    if (!payload.empty() && data_callback_) {
-        data_callback_(payload);
+    // Session bytes can arrive just before the CONNECTED event is processed,
+    // so a payload that starts with a frame header is de-framed either way.
+    const bool framed_start = payload.size() >= 2 && payload[0] == kSessionMagic0 &&
+                              payload[1] == kSessionMagic1;
+    if (!connected_session && session_rx_.empty() && !framed_start) {
+        if (!payload.empty() && data_callback_) {
+            data_callback_(payload);
+        }
+        return;
     }
+
+    session_rx_.insert(session_rx_.end(), payload.begin(), payload.end());
+    size_t pos = 0;
+    while (session_rx_.size() - pos >= kSessionHeaderLen) {
+        if (session_rx_[pos] != kSessionMagic0 || session_rx_[pos + 1] != kSessionMagic1) {
+            ++pos;  // resynchronize on the next header
+            continue;
+        }
+        const size_t len = loadU16Be(session_rx_.data() + pos + 2);
+        if (session_rx_.size() - pos < kSessionHeaderLen + len) break;  // need more
+        std::vector<uint8_t> message(
+            session_rx_.begin() + static_cast<std::ptrdiff_t>(pos + kSessionHeaderLen),
+            session_rx_.begin() + static_cast<std::ptrdiff_t>(pos + kSessionHeaderLen + len));
+        pos += kSessionHeaderLen + len;
+        if (!message.empty() && data_callback_) {
+            data_callback_(message);
+        }
+    }
+    session_rx_.erase(session_rx_.begin(), session_rx_.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
 void ModemClient::handleMonitorRecord(const std::vector<uint8_t>& record) {
@@ -594,7 +632,7 @@ void ModemClient::handleMonitorRecord(const std::vector<uint8_t>& record) {
     // stations but are not reversible, so callsigns come from the body.
     const std::vector<uint8_t> raw(record.begin() + kMonitorRecordHeaderLen,
                                    record.end());
-    dispatchMonitorFrame(std::move(frame), raw, rec_bcast_);
+    dispatchMonitorFrame(std::move(frame), raw);
 }
 
 void ModemClient::readVoiceSocket() {
@@ -744,8 +782,7 @@ void ModemClient::applyStatusLine(const std::string& fields) {
 }
 
 void ModemClient::dispatchMonitorFrame(MonitorFrame frame,
-                                       const std::vector<uint8_t>& raw,
-                                       BroadcastReassembler& reasm) {
+                                       const std::vector<uint8_t>& raw) {
     auto parsed = parseSkywaveFrame(raw, /*allow_truncated=*/true);
     if (!parsed) return;
 
@@ -760,7 +797,6 @@ void ModemClient::dispatchMonitorFrame(MonitorFrame frame,
     // Callsigns: `MON:` lines carry the modem's cached context, but the
     // bodies of CQ/BEACON name their sender outright, which is both more
     // reliable and the only source the binary records have.
-    std::vector<uint8_t> broadcast;
     switch (static_cast<SkywaveFrameType>(parsed->type)) {
         case SkywaveFrameType::Cq:
             if (auto cq = parseSkywaveCq(parsed->body)) {
@@ -777,22 +813,15 @@ void ModemClient::dispatchMonitorFrame(MonitorFrame frame,
                 }
             }
             break;
-        case SkywaveFrameType::BcastData:
-            if (auto frag = parseSkywaveBcast(parsed->body)) {
-                if (auto whole = reasm.feed(*frag)) {
-                    broadcast = std::move(*whole);
-                }
-            }
-            break;
         default:
             break;
     }
 
+    // Complete broadcasts are delivered once, by EVT:BROADCAST (it names the
+    // sender and keeps flowing while connected); reassembling the same chain
+    // here as well showed every broadcast two or three times.
     if (monitor_callback_) {
         monitor_callback_(frame);
-    }
-    if (!broadcast.empty() && broadcast_callback_) {
-        broadcast_callback_(frame.src_callsign, broadcast);
     }
 }
 
@@ -817,7 +846,7 @@ void ModemClient::handleMonitorLine(const std::string& body) {
         return;
     }
 
-    dispatchMonitorFrame(std::move(frame), line->raw_frame, mon_bcast_);
+    dispatchMonitorFrame(std::move(frame), line->raw_frame);
 }
 
 // `EVT:<NAME> [args]` (INTERFACES.md "Notifications").
@@ -1169,9 +1198,26 @@ bool ModemClient::setAutoMode(bool enabled) {
     return setMode("M" + std::to_string(index));
 }
 
-bool ModemClient::sendData(const std::vector<uint8_t>& data) {
+bool ModemClient::sendData(const std::vector<uint8_t>& message) {
     if (!isConnected()) return false;
-    if (data.empty()) return true;
+    if (message.empty()) return true;
+
+    bool connected_session;
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        connected_session = (status_.link_state == LinkState::Connected);
+    }
+    std::vector<uint8_t> framed;
+    if (connected_session) {
+        if (message.size() > kSessionMaxMessage) return false;
+        framed.reserve(kSessionHeaderLen + message.size());
+        framed.push_back(kSessionMagic0);
+        framed.push_back(kSessionMagic1);
+        framed.push_back(static_cast<uint8_t>(message.size() >> 8));
+        framed.push_back(static_cast<uint8_t>(message.size() & 0xFFu));
+        framed.insert(framed.end(), message.begin(), message.end());
+    }
+    const std::vector<uint8_t>& data = connected_session ? framed : message;
 
     bool ok = false;
     size_t total_sent = 0;

@@ -6,6 +6,24 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed - found by the two-station end-to-end test
+
+- Session data is framed (`A5 5A | len | message`): the modem's connected
+  stream merges and splits writes, which lost long (fragmented) chat
+  messages, garbled mail ACKs and swallowed BBS requests sent during a file
+  transfer
+- Ping works without a session: an addressed broadcast (`0xE0`) answered by
+  an addressed broadcast (`0xE1`), 120 s timeout
+- Mail composed while the channel is busy is sent once (the store-backed
+  pending sender skipped nothing the reliable-mail loop already owned, so
+  the peer got it twice); the queue notice says "channel busy" rather than
+  "link unavailable" while connected
+- Broadcasts are shown once: `EVT:BROADCAST` is the only broadcast path
+- A beacon from a sender the modem has not named yet (`?`) takes its
+  callsign from the beacon text
+- Test hook (`SKYLINK_TEST_SCRIPT`, see [TESTING_HOOK.md](TESTING_HOOK.md)):
+  scripted GUI runs, GL screenshots and a JSON report
+
 ### Changed - ported to the Skywave modem
 
 Full detail in [SKYWAVE_PORT.md](SKYWAVE_PORT.md).
