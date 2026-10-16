@@ -6,6 +6,8 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <algorithm>
+#include <cctype>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -21,6 +23,34 @@
 #endif
 
 namespace skylink {
+
+std::string APRSClient::sanitizeText(const std::string& text) {
+    // APRS-IS is line oriented: a CR/LF (or any other control byte) in
+    // free text would let the sender inject extra lines on our
+    // authenticated session. Drop all control characters.
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) continue;
+        out += c;
+    }
+    return out;
+}
+
+bool APRSClient::isValidCallsign(const std::string& callsign) {
+    // Base call (letters/digits) with optional -SSID; max 9 chars on APRS-IS.
+    if (callsign.empty() || callsign.size() > 9) return false;
+    for (char c : callsign) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-') return false;
+    }
+    return callsign.front() != '-' && callsign.back() != '-';
+}
+
+bool APRSClient::isValidCoordinate(double lat, double lon) {
+    return std::isfinite(lat) && std::isfinite(lon) &&
+           lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+}
 
 APRSClient::APRSClient() = default;
 
@@ -87,8 +117,22 @@ bool APRSClient::connect(const std::string& server, uint16_t port) {
     return true;
 }
 
-bool APRSClient::authenticate(const std::string& callsign, const std::string& passcode) {
-    if (!isConnected()) return false;
+bool APRSClient::authenticate(const std::string& callsign, const std::string& passcode_in) {
+    std::string passcode = passcode_in;
+    while (!passcode.empty() && std::isspace(static_cast<unsigned char>(passcode.back()))) passcode.pop_back();
+    while (!passcode.empty() && std::isspace(static_cast<unsigned char>(passcode.front()))) passcode.erase(0, 1);
+    if (socket_ == INVALID_SOCK) return false;
+    // Both go verbatim on the login line: callsign must be a plain callsign
+    // and the passcode an integer (e.g. "12345" or "-1" for receive-only).
+    bool passcode_ok = !passcode.empty() && passcode.size() <= 6;
+    for (size_t i = 0; i < passcode.size() && passcode_ok; ++i) {
+        const char c = passcode[i];
+        passcode_ok = std::isdigit(static_cast<unsigned char>(c)) || (i == 0 && c == '-' && passcode.size() > 1);
+    }
+    if (!isValidCallsign(callsign) || !passcode_ok) {
+        std::cerr << "[APRS] Invalid callsign/passcode for login\n";
+        return false;
+    }
 
     my_callsign_ = callsign;
 
@@ -110,6 +154,10 @@ bool APRSClient::authenticate(const std::string& callsign, const std::string& pa
     struct timeval tv = {2, 0};  // 2 second timeout
     if (select(static_cast<int>(socket_) + 1, &readfds, nullptr, nullptr, &tv) > 0) {
         int rn = recv(socket_, resp_buf, sizeof(resp_buf) - 1, 0);
+        if (rn == 0) {
+            disconnect();  // server closed the connection
+            return false;
+        }
         if (rn > 0) {
             resp_buf[rn] = '\0';
             std::string response(resp_buf);
@@ -161,6 +209,12 @@ void APRSClient::poll() {
         return;
     }
 #endif
+    if (n == 0) {
+        // Orderly shutdown by the server: mark disconnected so the caller
+        // reconnects instead of polling a dead socket forever.
+        disconnect();
+        return;
+    }
 
     if (n > 0) {
         buffer[n] = '\0';
@@ -221,6 +275,7 @@ void APRSClient::setBeaconInterval(int seconds) {
 
 bool APRSClient::sendPositionNow() {
     if (!isConnected()) return false;
+    if (!isValidCoordinate(my_position_.latitude, my_position_.longitude)) return false;
 
     std::string packet = my_callsign_ + ">APRS,TCPIP*:" +
                          formatPosition(my_position_) + "\r\n";
@@ -232,6 +287,9 @@ bool APRSClient::sendPositionNow() {
 bool APRSClient::sendPositionFor(const std::string& callsign, double lat, double lon,
                                   const std::string& grid, const std::string& comment) {
     if (!isConnected()) return false;
+    // Callsign comes from the radio packet: it goes into the APRS header, so
+    // it must be a plain callsign. Position must be finite and in range.
+    if (!isValidCallsign(callsign) || !isValidCoordinate(lat, lon)) return false;
 
     // Build position for another station (HF gateway relay)
     // Third-party format: GATEWAY>APRS,TCPIP*:}ORIGCALL>APRS,TCPIP,GATEWAY*:=position
@@ -240,12 +298,13 @@ bool APRSClient::sendPositionFor(const std::string& callsign, double lat, double
     pos.latitude = lat;
     pos.longitude = lon;
     pos.symbol = Symbols::HFGateway;  // HF gateway symbol
-    std::string relayed_comment = comment;
-    if (!grid.empty()) {
+    std::string relayed_comment = sanitizeText(comment);
+    const std::string safe_grid = sanitizeText(grid);
+    if (!safe_grid.empty()) {
         if (!relayed_comment.empty()) {
             relayed_comment += " ";
         }
-        relayed_comment += "QTH " + grid;
+        relayed_comment += "QTH " + safe_grid;
     }
     pos.comment = relayed_comment.empty()
         ? ("via " + my_callsign_ + " HF")
@@ -269,6 +328,7 @@ void APRSClient::enableBeaconing(bool enabled) {
 
 void APRSClient::requestPosition(const std::string& callsign) {
     if (!isConnected()) return;
+    if (!isValidCallsign(callsign)) return;
 
     std::string packet = my_callsign_ + ">APRS,TCPIP*:?" + callsign + "\r\n";
     sendPacket(packet);
@@ -276,18 +336,19 @@ void APRSClient::requestPosition(const std::string& callsign) {
 
 void APRSClient::sendMessage(const std::string& to_callsign, const std::string& message) {
     if (!isConnected()) return;
+    if (!isValidCallsign(to_callsign)) return;
 
     // Format: FROMCALL>APRS::TOCALL   :message{seq
     std::stringstream ss;
     ss << my_callsign_ << ">APRS,TCPIP*::" << std::setw(9) << std::left << to_callsign
-       << ":" << message << "\r\n";
+       << ":" << sanitizeText(message) << "\r\n";
     sendPacket(ss.str());
 }
 
 void APRSClient::setFilter(const std::string& filter) {
     if (!isConnected()) return;
 
-    std::string packet = "#filter " + filter + "\r\n";
+    std::string packet = "#filter " + sanitizeText(filter) + "\r\n";
     sendPacket(packet);
 }
 
@@ -320,11 +381,13 @@ int32_t APRSClient::calculatePasscode(const std::string& callsign) {
 
 std::string APRSClient::formatLatitude(double lat) {
     // Format: DDMM.hhN/S
+    if (!std::isfinite(lat)) lat = 0.0;
+    lat = std::clamp(lat, -90.0, 90.0);
     char ns = lat >= 0 ? 'N' : 'S';
-    lat = std::abs(lat);
-
-    int degrees = static_cast<int>(lat);
-    double minutes = (lat - degrees) * 60.0;
+    // Round to hundredths of a minute first so 59.999' never prints as 60.00
+    long hundredths = std::lround(std::abs(lat) * 6000.0);
+    int degrees = static_cast<int>(hundredths / 6000);
+    double minutes = static_cast<double>(hundredths % 6000) / 100.0;
 
     std::stringstream ss;
     ss << std::setfill('0') << std::setw(2) << degrees
@@ -335,11 +398,12 @@ std::string APRSClient::formatLatitude(double lat) {
 
 std::string APRSClient::formatLongitude(double lon) {
     // Format: DDDMM.hhE/W
+    if (!std::isfinite(lon)) lon = 0.0;
+    lon = std::clamp(lon, -180.0, 180.0);
     char ew = lon >= 0 ? 'E' : 'W';
-    lon = std::abs(lon);
-
-    int degrees = static_cast<int>(lon);
-    double minutes = (lon - degrees) * 60.0;
+    long hundredths = std::lround(std::abs(lon) * 6000.0);
+    int degrees = static_cast<int>(hundredths / 6000);
+    double minutes = static_cast<double>(hundredths % 6000) / 100.0;
 
     std::stringstream ss;
     ss << std::setfill('0') << std::setw(3) << degrees
@@ -350,13 +414,18 @@ std::string APRSClient::formatLongitude(double lon) {
 
 std::string APRSClient::formatPosition(const APRSPosition& pos) {
     // Format: =DDMM.hhN/DDDMM.hhWSymbol Comment
+    auto printable = [](char c, char fallback) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        return (uc < 0x21 || uc > 0x7E) ? fallback : c;
+    };
     std::stringstream ss;
     ss << "=" << formatLatitude(pos.latitude)
-       << pos.symbol.table << formatLongitude(pos.longitude)
-       << pos.symbol.symbol;
+       << printable(pos.symbol.table, '/') << formatLongitude(pos.longitude)
+       << printable(pos.symbol.symbol, '-');
 
-    if (!pos.comment.empty()) {
-        ss << " " << pos.comment;
+    const std::string comment = sanitizeText(pos.comment);
+    if (!comment.empty()) {
+        ss << " " << comment;
     }
 
     return ss.str();

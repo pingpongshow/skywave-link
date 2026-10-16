@@ -639,4 +639,34 @@ TEST(create_relay_empty_destination_fails) {
     PASS();
 }
 
+TEST(nested_relay_payload_dropped) {
+    MeshRelay relay;
+    relay.setMyCallsign("K2DEF");
+    relay.setEnabled(true);
+
+    RelayHeader inner;
+    inner.source = "N0SPF";
+    inner.destination = "K2DEF";
+    inner.message_id = "inner_1";
+    auto inner_packet = buildPacket(inner, {0x48, 0x69});
+
+    // Wrap the relay packet inside another one, for us and for relaying.
+    for (const char* dest : {"K2DEF", "W9XYZ", "*"}) {
+        RelayHeader outer;
+        outer.source = "W1ABC";
+        outer.destination = dest;
+        outer.message_id = std::string("outer_") + dest;
+        auto packet = buildPacket(outer, inner_packet);
+        std::vector<uint8_t> out_payload;
+        ASSERT_TRUE(relay.processRelayPacket(packet, out_payload) == RelayResult::Dropped);
+        ASSERT_TRUE(out_payload.empty());
+    }
+    ASSERT_EQ(relay.getStats().packets_dropped_nested, uint64_t(3));
+    ASSERT_EQ(relay.relayQueueSize(), size_t(0));
+
+    // And we never build one.
+    ASSERT_TRUE(relay.createRelayPacket("W9XYZ", inner_packet).empty());
+    PASS();
+}
+
 TEST_MAIN()

@@ -339,12 +339,15 @@ bool RadioController::getPtt() {
 }
 
 bool RadioController::startPttServer() {
+    std::lock_guard<std::mutex> lifecycle(ptt_lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     return startPttServerLocked();
 }
 
 void RadioController::stopPttServer() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Must NOT hold mutex_ while joining: client threads take it (setPtt /
+    // getPtt) and would deadlock the join.
+    std::lock_guard<std::mutex> lifecycle(ptt_lifecycle_mutex_);
     stopPttServerLocked();
 }
 
@@ -666,24 +669,45 @@ bool RadioController::startPttServerLocked() {
     return true;
 }
 
+// Called with ptt_lifecycle_mutex_ held and mutex_ NOT held.
 void RadioController::stopPttServerLocked() {
     ptt_server_stop_.store(true);
 
-    if (ptt_listener_fd_ >= 0) {
-        closeSocket(static_cast<socket_handle_t>(ptt_listener_fd_));
-        ptt_listener_fd_ = -1;
-    }
-
+    // The accept loop polls the stop flag every 200 ms; join it before
+    // closing the listener so it never selects on a closed/reused fd.
     if (ptt_server_thread_.joinable()) {
         ptt_server_thread_.join();
     }
 
-    for (std::thread& thread : ptt_client_threads_) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ptt_listener_fd_ >= 0) {
+            closeSocket(static_cast<socket_handle_t>(ptt_listener_fd_));
+            ptt_listener_fd_ = -1;
+        }
+    }
+
+    // Wake client threads blocked in recv(), then join them. Each client
+    // unkeys the rig on exit if it had keyed it.
+    std::vector<std::thread> clients;
+    {
+        std::lock_guard<std::mutex> lock(ptt_clients_mutex_);
+        for (int fd : ptt_client_fds_) {
+#ifdef _WIN32
+            shutdown(static_cast<socket_handle_t>(fd), SD_BOTH);
+#else
+            shutdown(fd, SHUT_RDWR);
+#endif
+        }
+        clients.swap(ptt_client_threads_);
+    }
+    for (std::thread& thread : clients) {
         if (thread.joinable()) {
             thread.join();
         }
     }
-    ptt_client_threads_.clear();
+
+    std::lock_guard<std::mutex> lock(mutex_);
     ptt_server_running_ = false;
 }
 
@@ -713,7 +737,8 @@ void RadioController::pttServerLoop() {
             continue;
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(ptt_clients_mutex_);
+        ptt_client_fds_.push_back(static_cast<int>(client));
         ptt_client_threads_.emplace_back(&RadioController::pttClientLoop,
                                          this,
                                          static_cast<int>(client));
@@ -723,6 +748,7 @@ void RadioController::pttServerLoop() {
 void RadioController::pttClientLoop(int client_fd) {
     const socket_handle_t client = static_cast<socket_handle_t>(client_fd);
     std::string line;
+    bool keyed_by_this_client = false;
     while (!ptt_server_stop_.load() && recvLine(client, &line)) {
         const std::string command = upperCopy(trimCopy(line));
         std::string response;
@@ -731,9 +757,19 @@ void RadioController::pttClientLoop(int client_fd) {
         } else if (command == "STATUS") {
             response = getPtt() ? "PTT:ON\n" : "PTT:OFF\n";
         } else if (command == "KEY" || command == "SETPTT ON") {
-            response = setPtt(true) ? "OK\n" : ("ERROR " + getStatus().last_error + "\n");
+            if (setPtt(true)) {
+                keyed_by_this_client = true;
+                response = "OK\n";
+            } else {
+                response = "ERROR " + getStatus().last_error + "\n";
+            }
         } else if (command == "UNKEY" || command == "SETPTT OFF") {
-            response = setPtt(false) ? "OK\n" : ("ERROR " + getStatus().last_error + "\n");
+            if (setPtt(false)) {
+                keyed_by_this_client = false;
+                response = "OK\n";
+            } else {
+                response = "ERROR " + getStatus().last_error + "\n";
+            }
         } else {
             response = "ERROR unsupported command\n";
         }
@@ -742,7 +778,19 @@ void RadioController::pttClientLoop(int client_fd) {
             break;
         }
     }
-    closeSocket(client);
+
+    // A client that keyed the rig and then dropped (or the server stopping)
+    // must never leave the transmitter stuck on.
+    if (keyed_by_this_client) {
+        setPtt(false);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ptt_clients_mutex_);
+        ptt_client_fds_.erase(std::remove(ptt_client_fds_.begin(), ptt_client_fds_.end(), client_fd),
+                              ptt_client_fds_.end());
+        closeSocket(client);
+    }
 }
 
 } // namespace skylink

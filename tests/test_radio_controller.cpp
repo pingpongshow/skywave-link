@@ -179,4 +179,67 @@ TEST(radio_controller_ptt_server_roundtrip) {
     PASS();
 }
 
+namespace {
+skylink::RadioConfig pttServerConfig(uint16_t port) {
+    skylink::RadioConfig cfg;
+    cfg.enabled = true;
+    cfg.hamlib_model = 0;
+    cfg.ptt_server_enabled = true;
+    cfg.ptt_server_bind = "127.0.0.1";
+    cfg.ptt_server_port = port;
+    return cfg;
+}
+} // namespace
+
+TEST(radio_controller_ptt_client_drop_unkeys) {
+    skylink::RadioController radio;
+    const auto cfg = pttServerConfig(46332);
+    radio.applyConfig(cfg);
+    ASSERT_TRUE(radio.connect());
+    ASSERT_TRUE(radio.startPttServer());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    socket_handle_t fd = connect_local(cfg.ptt_server_port);
+    ASSERT_TRUE(fd != kInvalidSocket);
+    ASSERT_TRUE(send_line(fd, "KEY\n"));
+    ASSERT_EQ(recv_line(fd), std::string("OK"));
+    ASSERT_TRUE(radio.getPtt());
+
+    close_socket(fd);  // drop without UNKEY
+    bool unkeyed = false;
+    for (int i = 0; i < 50 && !unkeyed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        unkeyed = !radio.getPtt();
+    }
+    ASSERT_TRUE(unkeyed);
+    radio.stopPttServer();
+    PASS();
+}
+
+TEST(radio_controller_ptt_stop_with_idle_keyed_client) {
+    skylink::RadioController radio;
+    const auto cfg = pttServerConfig(46333);
+    radio.applyConfig(cfg);
+    ASSERT_TRUE(radio.connect());
+    ASSERT_TRUE(radio.startPttServer());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    socket_handle_t fd = connect_local(cfg.ptt_server_port);
+    ASSERT_TRUE(fd != kInvalidSocket);
+    ASSERT_TRUE(send_line(fd, "KEY\n"));
+    ASSERT_EQ(recv_line(fd), std::string("OK"));
+
+    // Client stays connected and silent (blocked in the server's recv).
+    // stopPttServer must wake it, unkey and return promptly.
+    const auto t0 = std::chrono::steady_clock::now();
+    radio.stopPttServer();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    ASSERT_LT(ms, 2000);
+    ASSERT_FALSE(radio.getPtt());
+    ASSERT_FALSE(radio.getStatus().ptt_server_running);
+    close_socket(fd);
+    PASS();
+}
+
 TEST_MAIN()

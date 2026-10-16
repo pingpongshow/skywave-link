@@ -350,7 +350,11 @@ public:
         return count;
     }
 
-    std::string retrieveMessage(int msg_num, std::string* error) {
+    // *complete is set true only when the whole message was read up to its
+    // "." terminator without truncation or a read error/EOF. Callers must not
+    // DELE a message that was not complete.
+    std::string retrieveMessage(int msg_num, std::string* error, bool* complete) {
+        if (complete) *complete = false;
         if (!sendLine("RETR " + std::to_string(msg_num))) {
             if (error) *error = "Failed to send RETR command";
             return "";
@@ -363,7 +367,15 @@ public:
         }
 
         // Read multi-line response (dot-terminated)
-        std::string body = readMultiLine();
+        bool truncated = false;
+        bool terminated = false;
+        std::string body = readMultiLine(&truncated, &terminated);
+        if (!terminated) {
+            if (error) *error = "connection lost during RETR";
+        } else if (truncated) {
+            if (error) *error = "message exceeds size limit (truncated)";
+        }
+        if (complete) *complete = terminated && !truncated;
         return dotUnstuff(body);
     }
 
@@ -373,7 +385,13 @@ public:
         return isOK(resp);
     }
 
+    bool isConnected() const { return connected_ && !read_error_; }
+
     void quit() {
+        if (!isConnected()) {
+            disconnect();
+            return;
+        }
         sendLine("QUIT");
         readLine();  // Ignore response
         disconnect();
@@ -512,20 +530,15 @@ private:
                 n = recv(socket_, chunk, static_cast<int>(READ_CHUNK_SIZE), 0);
             }
 
-            if (n < 0) {
-                // Read error
+            if (n <= 0) {
+                // Read error, timeout or EOF (server closed the connection).
+                // Either way the session is over: flag it so multi-line
+                // readers terminate instead of spinning on empty lines. Any
+                // partial line left in the buffer is incomplete and dropped.
                 read_error_ = true;
+                connected_ = false;
                 read_buffer_.clear();
                 return "";
-            }
-            if (n == 0) {
-                // EOF — return whatever is left in buffer (may be empty)
-                std::string line;
-                line.swap(read_buffer_);
-                if (!line.empty() && line.back() == '\r') {
-                    line.pop_back();
-                }
-                return line;
             }
 
             read_buffer_.append(chunk, static_cast<size_t>(n));
@@ -540,22 +553,27 @@ private:
     }
 
     // Read a dot-terminated multi-line response
-    // Returns the body content (without the terminating ".\r\n")
-    std::string readMultiLine() {
+    // Returns the body content (without the terminating ".\r\n").
+    // *truncated: the size cap was hit (content beyond it was discarded).
+    // *terminated: the "." terminator was seen (false on read error / EOF).
+    std::string readMultiLine(bool* truncated_out = nullptr,
+                              bool* terminated_out = nullptr) {
         std::string result;
         result.reserve(4096);
         bool truncated = false;
+        bool terminated = false;
 
         while (result.size() < MAX_MESSAGE_SIZE) {
             std::string line = readLine();
 
-            // Break on read error or EOF (empty line with error flag or
-            // empty return from a closed connection)
-            if (read_error_) break;
-            if (line.empty() && read_buffer_.empty() && !connected_) break;
+            // Break on read error or EOF (readLine flags both)
+            if (read_error_ || !connected_) break;
 
             // Terminator: a line containing just "."
-            if (line == ".") break;
+            if (line == ".") {
+                terminated = true;
+                break;
+            }
 
             if (!result.empty()) result += "\r\n";
             result += line;
@@ -563,16 +581,20 @@ private:
 
         // If we hit the size cap, drain remaining lines until the "."
         // terminator to keep the POP3 protocol in sync.
-        if (result.size() >= MAX_MESSAGE_SIZE) {
+        if (!terminated && result.size() >= MAX_MESSAGE_SIZE) {
             truncated = true;
-            while (!read_error_) {
+            while (!read_error_ && connected_) {
                 std::string line = readLine();
-                if (read_error_) break;
-                if (line == ".") break;
-                if (line.empty() && read_buffer_.empty() && !connected_) break;
+                if (read_error_ || !connected_) break;
+                if (line == ".") {
+                    terminated = true;
+                    break;
+                }
             }
         }
 
+        if (truncated_out) *truncated_out = truncated;
+        if (terminated_out) *terminated_out = terminated;
         return result;
     }
 };
@@ -610,18 +632,26 @@ POP3FetchResult fetchPOP3Messages(const POP3FetchRequest& req) {
 
     for (int i = 1; i <= fetch_count; ++i) {
         std::string msg_error;
-        std::string raw = client.retrieveMessage(i, &msg_error);
+        bool complete = false;
+        std::string raw = client.retrieveMessage(i, &msg_error, &complete);
+        if (!msg_error.empty()) {
+            if (!errors_accumulated.empty()) errors_accumulated += "; ";
+            errors_accumulated += "msg " + std::to_string(i) + ": " + msg_error;
+        }
+        if (!client.isConnected()) {
+            // Connection lost mid-RETR: the partial message is discarded and
+            // never DELE'd, so it stays on the server for the next poll.
+            break;
+        }
         if (raw.empty()) {
-            if (!msg_error.empty()) {
-                if (!errors_accumulated.empty()) errors_accumulated += "; ";
-                errors_accumulated += "msg " + std::to_string(i) + ": " + msg_error;
-            }
             continue;
         }
 
         result.messages.push_back(parseEmailMessage(raw));
+        result.messages.back().truncated = !complete;
 
-        if (req.delete_after_fetch) {
+        // Never delete a message we did not receive in full.
+        if (req.delete_after_fetch && complete) {
             if (!client.deleteMessage(i)) {
                 if (!errors_accumulated.empty()) errors_accumulated += "; ";
                 errors_accumulated += "msg " + std::to_string(i) + ": DELE failed";

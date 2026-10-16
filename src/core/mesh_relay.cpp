@@ -197,6 +197,13 @@ RelayResult MeshRelay::processRelayPacket(const std::vector<uint8_t>& data,
     std::vector<uint8_t> payload(data.begin() + payload_start,
                                   data.begin() + payload_start + payload_len);
 
+    // A relay payload must never itself be a relay packet: nesting would let
+    // a sender recurse the receiver unboundedly and spoof the inner source.
+    if (!payload.empty() && payload[0] == RELAY_PACKET_MARKER) {
+        stats_.packets_dropped_nested++;
+        return RelayResult::Dropped;
+    }
+
     // Check dedup
     if (isDuplicate(header.message_id)) {
         stats_.packets_dropped_dedup++;
@@ -302,6 +309,10 @@ std::vector<uint8_t> MeshRelay::createRelayPacket(const std::string& destination
 
     // #2: Payload size validation
     if (payload.size() > 65535) {
+        return {};
+    }
+    // Never wrap a relay packet in another relay packet (receivers drop it).
+    if (!payload.empty() && payload[0] == RELAY_PACKET_MARKER) {
         return {};
     }
 

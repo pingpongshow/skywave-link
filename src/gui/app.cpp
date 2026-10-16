@@ -405,22 +405,7 @@ constexpr uint8_t kBbsFileRequestMarker = 0xD2;
 constexpr size_t kBbsMaxFilenameLen = 180;
 constexpr size_t kBbsMaxDescriptionLen = 220;
 
-bool isDisconnectedBroadcastPayload(uint8_t msg_type) {
-    switch (msg_type) {
-        case 0xFB:  // Text broadcast
-        case 0xFC:  // CQ
-        case 0xFA:  // Advanced beacon
-        case 0xF4:  // Position beacon
-        case 0xF9:  // Pending-message notification
-        case 0xE3:  // Legacy broadcast mail
-        case 0xE0:  // Ping request (addressed broadcast)
-        case 0xE1:  // Ping response (addressed broadcast)
-        case kMailBroadcastReliableMarker:
-            return true;
-        default:
-            return false;
-    }
-}
+using app_detail::isDisconnectedBroadcastPayload;
 
 std::string resolveStorePath(const std::string& config_path, const std::string& db_path) {
     std::filesystem::path path(db_path);
@@ -1169,8 +1154,6 @@ bool buildReliableMailWirePacket(const MailMessage& mail,
 App::App() = default;
 
 App::~App() {
-    // Signal any detached weather thread that this object is being destroyed.
-    weather_alive_flag_->store(false);
     shutdown();
 }
 
@@ -1276,20 +1259,25 @@ bool App::initialize() {
         syncTransfersFromManager();
     });
     file_transfer_mgr_->onFileOffer([this](const std::string& from, const std::string& filename, size_t size) {
+        // Accept only by policy: auto-accept, a trusted callsign, or a BBS
+        // download this station asked for. Being the linked peer is not
+        // consent; anything else is refused and the operator is told.
         bool accept = config_.files.auto_accept;
         const std::string normalized_from = normalizeCallsign(from);
-        if (!accept && !current_chat_partner_.empty() &&
-            normalized_from == normalizeCallsign(current_chat_partner_)) {
-            accept = true;
-        }
-        if (!accept && modem_) {
-            const std::string linked_peer = normalizeCallsign(modem_->getStatus().remote_callsign);
-            if (!linked_peer.empty() && normalized_from == linked_peer) {
-                accept = true;
-            }
+        if (!accept && !normalized_from.empty()) {
+            accept = std::any_of(config_.files.trusted_callsigns.begin(),
+                                 config_.files.trusted_callsigns.end(),
+                                 [&](const std::string& trusted) {
+                                     return normalizeCallsign(trusted) == normalized_from;
+                                 });
         }
         if (!accept) {
             accept = shouldAcceptRemoteBbsOffer(normalized_from, filename);
+        }
+        if (!accept) {
+            appendSystemChat("File offer refused. To receive files from " +
+                             (normalized_from.empty() ? std::string("this station") : normalized_from) +
+                             ", enable auto-accept or add it to trusted callsigns in Settings.");
         }
 
         ChatMessage msg;
@@ -1752,7 +1740,6 @@ void App::initializeSharedState() {
     shared_state_.last_typing_sent = &last_typing_sent_;
     shared_state_.last_input_was_empty = &last_input_was_empty_;
 
-    shared_state_.fragment_buffer = &fragment_buffer_;
     shared_state_.outgoing_fragment_counter = &outgoing_fragment_counter_;
 
     shared_state_.transfers = &transfers_;
@@ -2528,6 +2515,15 @@ void App::update() {
             chat_history_.push_back(msg);
             chat_scroll_to_bottom_ = true;
         }
+    }
+
+    pruneFragmentBuffers();
+
+    // Bound in-memory chat history; the oldest lines go first.
+    if (chat_history_.size() > MAX_CHAT_HISTORY) {
+        chat_history_.erase(chat_history_.begin(),
+                            chat_history_.begin() +
+                                static_cast<std::ptrdiff_t>(chat_history_.size() - MAX_CHAT_HISTORY));
     }
 
     if (auto_exit_after_ms_ > 0) {
@@ -3581,13 +3577,24 @@ std::vector<std::pair<std::string, float>> App::computeBandRecommendations() con
 void App::refreshBBSFiles() {
     std::vector<BBSFile> local_files;
     std::filesystem::path bbs_dir(config_.bbs.bbs_path);
-    if (!std::filesystem::exists(bbs_dir)) {
-        std::filesystem::create_directories(bbs_dir);
+    std::error_code ec;
+    if (!std::filesystem::exists(bbs_dir, ec)) {
+        std::filesystem::create_directories(bbs_dir, ec);
+        if (ec) {
+            appendSystemChat("[BBS] Cannot create BBS folder " + bbs_dir.string() + ": " + ec.message());
+        }
     }
 
-    if (std::filesystem::exists(bbs_dir)) {
-        for (const auto& entry : std::filesystem::directory_iterator(bbs_dir)) {
-            if (!entry.is_regular_file()) {
+    ec.clear();
+    if (std::filesystem::is_directory(bbs_dir, ec)) {
+        std::filesystem::directory_iterator it(bbs_dir, ec);
+        if (ec) {
+            appendSystemChat("[BBS] Cannot read BBS folder " + bbs_dir.string() + ": " + ec.message());
+        }
+        for (; !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            const auto& entry = *it;
+            std::error_code entry_ec;
+            if (!entry.is_regular_file(entry_ec) || entry_ec) {
                 continue;
             }
             if (entry.path().extension() == ".desc") {
@@ -3596,9 +3603,14 @@ void App::refreshBBSFiles() {
 
             BBSFile file;
             file.filename = entry.path().filename().string();
-            file.size_bytes = entry.file_size();
-            file.upload_time = std::chrono::duration_cast<std::chrono::seconds>(
-                entry.last_write_time().time_since_epoch()).count();
+            const auto size = entry.file_size(entry_ec);
+            if (entry_ec) {
+                continue;
+            }
+            file.size_bytes = static_cast<size_t>(size);
+            const auto mtime = entry.last_write_time(entry_ec);
+            file.upload_time = entry_ec ? 0 : std::chrono::duration_cast<std::chrono::seconds>(
+                mtime.time_since_epoch()).count();
             file.remote = false;
             file.uploader = normalizeCallsign(config_.station.callsign);
             if (file.uploader.empty()) {
@@ -3637,22 +3649,42 @@ void App::refreshBBSFiles() {
 
 void App::uploadToBBS(const std::string& filepath, const std::string& description) {
     std::filesystem::path src(filepath);
-    if (!std::filesystem::exists(src)) {
-        std::cerr << "[BBS] File not found: " << filepath << "\n";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(src, ec)) {
+        appendSystemChat("[BBS] Upload failed, file not found: " + filepath);
         return;
     }
 
-    auto file_size = std::filesystem::file_size(src);
+    const auto file_size = std::filesystem::file_size(src, ec);
+    if (ec) {
+        appendSystemChat("[BBS] Upload failed for " + filepath + ": " + ec.message());
+        return;
+    }
     if (file_size > config_.bbs.max_upload_size) {
-        std::cerr << "[BBS] File too large: " << file_size << " bytes\n";
+        appendSystemChat("[BBS] Upload failed, file too large: " + std::to_string(file_size) + " bytes");
         return;
     }
 
     std::filesystem::path bbs_dir(config_.bbs.bbs_path);
-    std::filesystem::create_directories(bbs_dir);
+    std::filesystem::create_directories(bbs_dir, ec);
+    if (ec) {
+        appendSystemChat("[BBS] Upload failed, cannot create " + bbs_dir.string() + ": " + ec.message());
+        return;
+    }
 
     std::filesystem::path dest = bbs_dir / src.filename();
-    std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing);
+    // Uploading a file that already lives in the BBS folder is a re-announce,
+    // not a copy (copy_file onto itself fails).
+    const bool same_file = std::filesystem::exists(dest, ec) &&
+                           std::filesystem::equivalent(src, dest, ec) && !ec;
+    ec.clear();
+    if (!same_file) {
+        std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            appendSystemChat("[BBS] Upload failed for " + src.filename().string() + ": " + ec.message());
+            return;
+        }
+    }
 
     // Save description to sidecar file
     if (!description.empty()) {
@@ -3687,14 +3719,15 @@ void App::downloadFromBBS(const std::string& filename) {
     // Sanitize filename to prevent path traversal
     std::string safe_name = std::filesystem::path(filename).filename().string();
     if (safe_name.empty() || safe_name == "." || safe_name == "..") {
-        std::cerr << "[BBS] Invalid filename: " << filename << "\n";
+        appendSystemChat("[BBS] Invalid filename: " + filename);
         return;
     }
 
     std::filesystem::path src(config_.bbs.bbs_path);
     src /= safe_name;
 
-    if (!std::filesystem::exists(src)) {
+    std::error_code ec;
+    if (!std::filesystem::exists(src, ec)) {
         for (const auto& entry : remote_bbs_files_) {
             const BBSFile& remote = entry.second;
             if (!remote.remote || remote.filename != safe_name) {
@@ -3703,7 +3736,7 @@ void App::downloadFromBBS(const std::string& filename) {
             requestRemoteBBSDownload(remote.uploader, remote.filename);
             return;
         }
-        std::cerr << "[BBS] File not found: " << safe_name << "\n";
+        appendSystemChat("[BBS] File not found: " + safe_name);
         return;
     }
 
@@ -3712,31 +3745,47 @@ void App::downloadFromBBS(const std::string& filename) {
         download_dir = "downloads";
     }
     std::filesystem::path dest(download_dir);
-    std::filesystem::create_directories(dest);
+    std::filesystem::create_directories(dest, ec);
+    if (ec) {
+        appendSystemChat("[BBS] Cannot create download folder " + dest.string() + ": " + ec.message());
+        return;
+    }
     dest /= safe_name;
 
-    std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing);
+    if (std::filesystem::exists(dest, ec) && std::filesystem::equivalent(src, dest, ec) && !ec) {
+        return;  // Download folder is the BBS folder; nothing to copy.
+    }
+    ec.clear();
+    std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        appendSystemChat("[BBS] Download of " + safe_name + " failed: " + ec.message());
+        return;
+    }
+    appendSystemChat("[BBS] Saved " + safe_name + " to " + dest.string());
 }
 
 void App::deleteBBSFile(const std::string& filename) {
     // Sanitize filename to prevent path traversal
     std::string safe_name = std::filesystem::path(filename).filename().string();
     if (safe_name.empty() || safe_name == "." || safe_name == "..") {
-        std::cerr << "[BBS] Invalid filename: " << filename << "\n";
+        appendSystemChat("[BBS] Invalid filename: " + filename);
         return;
     }
 
     std::filesystem::path file(config_.bbs.bbs_path);
     file /= safe_name;
 
-    if (std::filesystem::exists(file)) {
-        std::filesystem::remove(file);
+    std::error_code ec;
+    if (std::filesystem::exists(file, ec)) {
+        std::filesystem::remove(file, ec);
+        if (ec) {
+            appendSystemChat("[BBS] Cannot delete " + safe_name + ": " + ec.message());
+            return;
+        }
 
         // Also remove description sidecar
         std::filesystem::path desc(file.string() + ".desc");
-        if (std::filesystem::exists(desc)) {
-            std::filesystem::remove(desc);
-        }
+        std::filesystem::remove(desc, ec);
 
         refreshBBSFiles();
         announceBBSFileRemoval(safe_name);
@@ -3829,19 +3878,12 @@ void App::processBBSAnnouncement(const std::string& from, const std::vector<uint
     if (filename.empty() || filename == "." || filename == "..") {
         return;
     }
-    std::string owner = normalizeCallsign(from);
-    if (data.size() > offset) {
-        const uint8_t owner_len = data[offset++];
-        if (owner_len > 0 && data.size() >= offset + owner_len) {
-            std::string owner_candidate(data.begin() + offset, data.begin() + offset + owner_len);
-            owner_candidate = normalizeCallsign(owner_candidate);
-            if (isLikelyCallsignToken(owner_candidate)) {
-                owner = owner_candidate;
-            }
-        }
-    }
-    if (owner.empty()) {
-        owner = "UNKNOWN";
+    // The owner is the station that sent the announcement; the owner field
+    // inside the packet is ignored so nobody can list files under another
+    // station's callsign.
+    const std::string owner = normalizeCallsign(from);
+    if (owner.empty() || owner == "UNKNOWN") {
+        return;
     }
 
     BBSFile file;
@@ -3877,24 +3919,21 @@ void App::processBBSRemoval(const std::string& from, const std::vector<uint8_t>&
         return;
     }
 
-    std::string owner = normalizeCallsign(from);
-    const size_t owner_offset = 2 + name_len;
-    if (data.size() > owner_offset) {
-        const uint8_t owner_len = data[owner_offset];
-        if (owner_len > 0 && data.size() >= owner_offset + 1 + owner_len) {
-            std::string owner_candidate(data.begin() + owner_offset + 1,
-                                        data.begin() + owner_offset + 1 + owner_len);
-            owner_candidate = normalizeCallsign(owner_candidate);
-            if (isLikelyCallsignToken(owner_candidate)) {
-                owner = owner_candidate;
-            }
-        }
+    // Only the owner (the sender of the original announcement) can remove
+    // a listing; the key is built from the broadcast sender.
+    const std::string owner = normalizeCallsign(from);
+    if (owner.empty() || owner == "UNKNOWN") {
+        return;
     }
     removeRemoteBBSFile(owner, filename);
 }
 
 void App::processBBSFileRequest(const std::string& from, const std::vector<uint8_t>& data) {
     if (!modem_ || !file_transfer_mgr_ || data.size() < 3) {
+        return;
+    }
+    if (!config_.bbs.enabled) {
+        appendSystemChat("[BBS] File request from " + normalizeCallsign(from) + " refused: BBS is disabled");
         return;
     }
     const uint8_t name_len = data[1];
@@ -3932,7 +3971,11 @@ void App::processBBSFileRequest(const std::string& from, const std::vector<uint8
 
     std::filesystem::path src(config_.bbs.bbs_path);
     src /= filename;
-    if (!std::filesystem::exists(src)) {
+    std::error_code src_ec;
+    if (filename.size() > 5 && filename.compare(filename.size() - 5, 5, ".desc") == 0) {
+        return;  // Sidecars are not BBS files.
+    }
+    if (!std::filesystem::is_regular_file(src, src_ec)) {
         ChatMessage msg;
         msg.from = "SYSTEM";
         msg.text = "[BBS] Request from " + requester + " ignored: file not found (" + filename + ")";
@@ -4221,6 +4264,18 @@ void App::upsertRemoteBBSFile(const std::string& from, const BBSFile& file) {
     BBSFile remote = file;
     remote.uploader = normalizeCallsign(from);
     remote.remote = true;
+    if (remote_bbs_files_.find(key) == remote_bbs_files_.end()) {
+        // Bound the remote listing; evict the oldest announcement.
+        while (remote_bbs_files_.size() >= MAX_REMOTE_BBS_FILES) {
+            auto oldest = remote_bbs_files_.begin();
+            for (auto it = remote_bbs_files_.begin(); it != remote_bbs_files_.end(); ++it) {
+                if (it->second.upload_time < oldest->second.upload_time) {
+                    oldest = it;
+                }
+            }
+            remote_bbs_files_.erase(oldest);
+        }
+    }
     remote_bbs_files_[key] = std::move(remote);
     refreshBBSFiles();
 }
@@ -4907,6 +4962,16 @@ void App::renderSettingsTab() {
     }
 }
 
+void App::appendSystemChat(const std::string& text) {
+    ChatMessage msg;
+    msg.from = "SYSTEM";
+    msg.text = text;
+    msg.is_outgoing = false;
+    msg.timestamp = unixNowSeconds();
+    chat_history_.push_back(msg);
+    chat_scroll_to_bottom_ = true;
+}
+
 void App::applyMeshRelaySettings() {
     if (!mesh_relay_) {
         return;
@@ -4978,36 +5043,8 @@ void App::onModemStateChange(const std::string& state) {
 }
 
 void App::onDataReceived(const std::vector<uint8_t>& data) {
-    // Host modem wraps beacon/CQ broadcasts as:
-    // [0xFA][callsign_len][callsign][payload...]
-    // Parse and unwrap when this framing is present.
-    if (data.size() >= 3 && data[0] == 0xFA) {
-        const size_t from_len = static_cast<size_t>(data[1]);
-        const size_t payload_offset = 2 + from_len;
-        if (from_len > 0 && payload_offset <= data.size()) {
-            bool printable_sender = true;
-            for (size_t i = 0; i < from_len; ++i) {
-                unsigned char c = static_cast<unsigned char>(data[2 + i]);
-                if (c < 0x20 || c > 0x7E) {
-                    printable_sender = false;
-                    break;
-                }
-            }
-            if (printable_sender) {
-                std::string from(data.begin() + 2, data.begin() + payload_offset);
-                std::string normalized_from = normalizeCallsign(from);
-                if (isLikelyCallsignToken(normalized_from) || isLikelyHashId(normalized_from)) {
-                    std::vector<uint8_t> payload;
-                    if (payload_offset < data.size()) {
-                        payload.assign(data.begin() + payload_offset, data.end());
-                    }
-                    processIncomingMessage(payload, normalized_from);
-                    return;
-                }
-            }
-        }
-    }
-
+    // The data socket carries link traffic, which is from the connected
+    // peer. Senders are never taken from inside the payload here.
     if (!data.empty() &&
         modem_ &&
         modem_->getStatus().link_state != LinkState::Connected &&
@@ -5018,7 +5055,7 @@ void App::onDataReceived(const std::vector<uint8_t>& data) {
         return;
     }
 
-    processIncomingMessage(data);
+    processIncomingMessage(data, "", RxOrigin::Link);
 }
 
 // Skywave separates telemetry from application traffic: BEACON and CQ carry
@@ -5062,15 +5099,19 @@ void App::onBroadcastMessage(const std::string& raw_sender,
         payload[2] == 0x01) {
         const size_t app_len = static_cast<size_t>(payload[3]);
         if ((4u + app_len) <= payload.size()) {
-            std::vector<uint8_t> inner(payload.begin() + 4,
-                                       payload.begin() + 4 + app_len);
-            processIncomingMessage(inner, sender);
+            // Same whitelist as an unwrapped broadcast: the envelope must
+            // not smuggle session-only types past it.
+            if (app_len > 0 && isDisconnectedBroadcastPayload(payload[4])) {
+                std::vector<uint8_t> inner(payload.begin() + 4,
+                                           payload.begin() + 4 + app_len);
+                processIncomingMessage(inner, sender, RxOrigin::Broadcast);
+            }
             return;
         }
     }
 
     if (isDisconnectedBroadcastPayload(payload[0])) {
-        processIncomingMessage(payload, sender);
+        processIncomingMessage(payload, sender, RxOrigin::Broadcast);
     }
 }
 
@@ -5226,6 +5267,19 @@ void App::onDisconnected() {
         chat_scroll_to_bottom_ = true;
     }
     current_chat_partner_.clear();
+
+    // Requests sent over the dropped link must be re-sent after reconnect.
+    bool bbs_pending_changed = false;
+    for (auto& [key, pending] : pending_remote_bbs_downloads_) {
+        (void)key;
+        if (pending.request_sent) {
+            pending.request_sent = false;
+            bbs_pending_changed = true;
+        }
+    }
+    if (bbs_pending_changed) {
+        syncPendingBbsDownloadsForUi();
+    }
 
     if (workflow_active) {
         returnToCallingFrequency("QSY failover: Returned to calling frequency");
@@ -5490,6 +5544,9 @@ void App::refreshMessages() {
 void App::sendPendingMessages() {
     if (!modem_ || !store_) return;
     if (modem_->getStatus().link_state != LinkState::Connected) return;
+    // An empty partner would match every pending message in the store.
+    if (normalizeCallsign(current_chat_partner_).empty() ||
+        normalizeCallsign(current_chat_partner_) == "UNKNOWN") return;
 
     // Get pending messages for the connected station
     auto pending = store_->getPendingMessages(current_chat_partner_);
@@ -5542,6 +5599,14 @@ void App::sendPendingMessages() {
             store_->markAsSent(msg.id);
         }
 
+        // Hand the message to updateReliableMail() so it is ACK-tracked
+        // and retried like mail composed in this session.
+        if (!mail.is_broadcast) {
+            mail.status = MessageStatus::Sent;
+            mail.timestamp = unixNowSeconds();
+            mail_outbox_.push_back(mail);
+        }
+
         ChatMessage chat_msg;
         chat_msg.from = "SYSTEM";
         chat_msg.text = "Sent pending message: " + mail.subject;
@@ -5554,7 +5619,24 @@ void App::sendPendingMessages() {
     }
 }
 
-void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::string& from_override) {
+bool App::isLinkConnected() const {
+    return modem_ && modem_->getStatus().link_state == LinkState::Connected;
+}
+
+std::string App::linkedPeerCallsign() const {
+    if (!isLinkConnected()) {
+        return "";
+    }
+    // Same attribution processIncomingMessage() uses for link traffic.
+    std::string peer = normalizeCallsign(current_chat_partner_);
+    if (peer.empty() || peer == "UNKNOWN") {
+        peer = normalizeCallsign(modem_->getStatus().remote_callsign);
+    }
+    return peer == "UNKNOWN" ? std::string() : peer;
+}
+
+void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::string& from_override,
+                                 RxOrigin origin, int relay_depth) {
     if (data.empty()) return;
 
     std::string sender = normalizeCallsign(from_override.empty() ? current_chat_partner_ : from_override);
@@ -5565,9 +5647,22 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     // Check for special message types
     uint8_t msg_type = data[0];
 
+    // Session-only types act on the current link; only the connected peer,
+    // over the link itself, may send them.
+    const bool from_linked_peer = origin == RxOrigin::Link && isLinkConnected();
+    if (app_detail::isSessionOnlyPayload(msg_type) && !from_linked_peer) {
+        std::cerr << "[RX] Ignoring session-only packet 0x" << std::hex << static_cast<int>(msg_type)
+                  << std::dec << " from " << sender << " (not the linked peer)\n";
+        return;
+    }
+    // A relay delivers chat/mail only, and never another relay packet.
+    if (origin == RxOrigin::Mesh && !app_detail::isMeshDeliverablePayload(msg_type)) {
+        return;
+    }
+
     // Mesh relay packet (0xE5): enforce TTL/hop/dedup policy before payload handling.
     if (msg_type == RELAY_PACKET_MARKER) {
-        if (!mesh_relay_) {
+        if (!mesh_relay_ || relay_depth >= 1) {
             return;
         }
         RelayHeader relay_header;
@@ -5582,8 +5677,9 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
 
         std::vector<uint8_t> relay_payload;
         const auto relay_result = mesh_relay_->processRelayPacket(data, relay_payload);
-        if (relay_result == RelayResult::ForUs) {
-            processIncomingMessage(relay_payload, relay_source);
+        if (relay_result == RelayResult::ForUs && !relay_payload.empty() &&
+            app_detail::isMeshDeliverablePayload(relay_payload[0])) {
+            processIncomingMessage(relay_payload, relay_source, RxOrigin::Mesh, relay_depth + 1);
         }
         flushMeshRelayQueue();
         return;
@@ -5744,6 +5840,14 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
                 comment = std::string(data.begin() + offset, data.end());
             }
         }
+        // Remote text goes onto our APRS-IS session: no CR/LF/control
+        // characters, and coordinates must be real.
+        grid_square = app_detail::sanitizeRemoteText(grid_square, 10);
+        comment = app_detail::sanitizeRemoteText(comment, 200);
+        if (!app_detail::isValidLatLon(lat, lon)) {
+            appendSystemChat("Position relay request from " + sender + " ignored: invalid coordinates");
+            return;
+        }
 
         recordStationLocation(sender,
                               true,
@@ -5759,7 +5863,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         std::string relay_status_text;
 
         // If we have APRS-IS connection, relay the position
-        if (aprs_ && aprs_->getState() == APRSState::Connected) {
+        if (sender != "UNKNOWN" && aprs_ && aprs_->getState() == APRSState::Connected) {
             relay_ok = aprs_->sendPositionFor(sender, lat, lon, grid_square, comment);
             if (relay_ok) {
                 relay_status_text = "Position relayed to APRS-IS";
@@ -5827,11 +5931,21 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
             }
         }
 
+        grid_square = app_detail::sanitizeRemoteText(grid_square, 10);
+        beacon_text = app_detail::sanitizeRemoteText(beacon_text, 200);
+        if (!app_detail::isValidLatLon(lat, lon)) {
+            return;
+        }
+
+        // The callsign inside the payload is advisory: it may label the
+        // beacon locally but is never used to speak for that station.
+        bool sender_from_payload = false;
         if (beacon_from.empty() || beacon_from == "UNKNOWN" || isLikelyHashId(beacon_from)) {
             auto parsed = extractCallsignPrefix(beacon_text);
             if (!parsed.first.empty()) {
                 beacon_from = parsed.first;
                 beacon_text = parsed.second;
+                sender_from_payload = true;
             }
         }
         auto prefixed = extractCallsignPrefix(beacon_text);
@@ -5855,8 +5969,10 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
                               0.0f,
                               legacy_gateway_marker);
 
-        // Auto-relay to APRS-IS if connected
-        if (aprs_ && aprs_->getState() == APRSState::Connected) {
+        // Auto-relay to APRS-IS if connected (only under a modem-reported sender).
+        const bool relay_to_aprs = !sender_from_payload && beacon_from != "UNKNOWN" &&
+                                   aprs_ && aprs_->getState() == APRSState::Connected;
+        if (relay_to_aprs) {
             aprs_->sendPositionFor(beacon_from, lat, lon, grid_square, beacon_text);
         }
 
@@ -5864,7 +5980,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         msg.from = beacon_from;
         msg.text = "[POSITION] " + grid_square + " (" + std::to_string(lat).substr(0, 8) + ", "
                    + std::to_string(lon).substr(0, 9) + ") " + beacon_text;
-        if (aprs_ && aprs_->getState() == APRSState::Connected) {
+        if (relay_to_aprs) {
             msg.text += " [Relayed to APRS]";
         }
         msg.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -5950,25 +6066,25 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
 
     // Reliable private mail (0xE6)
     if (msg_type == kMailPrivateReliableMarker && data.size() >= 6) {
-        processReliableMailReceived(sender, data, false);
+        processReliableMailReceived(sender, data, false, from_linked_peer);
         return;
     }
 
     // Reliable broadcast mail (0xE7)
     if (msg_type == kMailBroadcastReliableMarker && data.size() >= 5) {
-        processReliableMailReceived(sender, data, true);
+        processReliableMailReceived(sender, data, true, from_linked_peer);
         return;
     }
 
     // Private mail (0xE2 prefix)
     if (msg_type == 0xE2 && data.size() >= 4) {
-        processMailReceived(sender, data);
+        processMailReceived(sender, data, from_linked_peer);
         return;
     }
 
     // Broadcast mail (0xE3 prefix)
     if (msg_type == 0xE3 && data.size() >= 2) {
-        processMailReceived(sender, data);
+        processMailReceived(sender, data, from_linked_peer);
         return;
     }
 
@@ -6065,53 +6181,18 @@ void App::sendFragmentedMessage(const std::string& text) {
 void App::processMessageFragment(const std::string& from, const std::vector<uint8_t>& data) {
     if (data.size() < 4) return;  // Too short
 
-    uint8_t frag_idx = data[1];
-    uint8_t total_frags = data[2];
+    const uint8_t frag_idx = data[1];
+    const uint8_t total_frags = data[2];
+    const std::string frag_data(data.begin() + 3, data.end());
 
-    // Validate fragment index
-    if (total_frags == 0 || frag_idx >= total_frags) return;
-
-    std::string frag_data(data.begin() + 3, data.end());
-
-    // Check for duplicate fragment index
-    auto& frags = fragment_buffer_[from];
-    for (const auto& existing : frags) {
-        if (existing.first == frag_idx) return;  // Duplicate, ignore
-    }
-
-    // Limit buffer size to prevent memory abuse
-    if (frags.size() >= 256) {
-        fragment_buffer_.erase(from);
+    // Fragments from an unattributed sender ("UNKNOWN") are refused by the
+    // assembler so unrelated stations' fragments never mix.
+    std::string full_message;
+    if (!fragment_assembler_.add(normalizeCallsign(from), frag_idx, total_frags, frag_data,
+                                 unixNowSeconds(), &full_message)) {
         return;
     }
 
-    frags.push_back({frag_idx, frag_data});
-
-    // Check if we have all fragments
-    if (frags.size() >= total_frags) {
-        reassembleFragments(from);
-    }
-}
-
-void App::reassembleFragments(const std::string& from) {
-    auto it = fragment_buffer_.find(from);
-    if (it == fragment_buffer_.end()) return;
-
-    // Sort fragments by index
-    auto& frags = it->second;
-    std::sort(frags.begin(), frags.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-
-    // Reassemble
-    std::string full_message;
-    for (const auto& frag : frags) {
-        full_message += frag.second;
-    }
-
-    // Clear buffer
-    fragment_buffer_.erase(it);
-
-    // Add to chat history
     ChatMessage msg;
     msg.from = from;
     msg.to = config_.station.callsign;
@@ -6121,6 +6202,10 @@ void App::reassembleFragments(const std::string& from) {
         std::chrono::system_clock::now().time_since_epoch()).count();
     chat_history_.push_back(msg);
     chat_scroll_to_bottom_ = true;
+}
+
+void App::pruneFragmentBuffers() {
+    fragment_assembler_.expire(unixNowSeconds());
 }
 
 // ============================================================================
@@ -6332,6 +6417,20 @@ void App::processQsySuggestion(const std::string& from, const std::vector<uint8_
         return;
     }
 
+    // Only the connected peer may suggest a QSY (enforced on receive too).
+    const std::string linked_peer = linkedPeerCallsign();
+    if (linked_peer.empty() || from_call != linked_peer) {
+        return;
+    }
+    const std::string suggested_band(data.begin() + pos, data.begin() + pos + band_len);
+    const int suggested_slot = static_cast<int>(static_cast<int8_t>(data[pos + band_len]));
+    const uint32_t suggested_freq = readUint32LE(data.data(), pos + band_len + 1);
+    if (!qsyTargetInBand(suggested_band, suggested_slot == 0 ? 1 : suggested_slot, suggested_freq)) {
+        appendSystemChat("Ignored QSY suggestion from " + from_call + ": target outside band " +
+                         app_detail::sanitizeRemoteText(suggested_band, 16));
+        return;
+    }
+
     qsy_suggestion_band_.assign(data.begin() + pos, data.begin() + pos + band_len);
     pos += band_len;
     qsy_suggestion_slot_ = static_cast<int>(static_cast<int8_t>(data[pos++]));
@@ -6387,6 +6486,10 @@ void App::processQsyConfirm(const std::string& from, const std::vector<uint8_t>&
 
     if (!qsy_workflow_peer_.empty() &&
         from_call != normalizeCallsign(qsy_workflow_peer_)) {
+        return;
+    }
+    if (accepted && !qsyTargetInBand(band, slot == 0 ? 1 : slot, freq_hz)) {
+        appendSystemChat("Ignored QSY confirmation from " + from_call + ": target outside band");
         return;
     }
     qsy_workflow_peer_ = from_call;
@@ -6598,6 +6701,24 @@ void App::resetQsyWorkflow(bool clear_peer) {
     qsy_suggestion_received_unix_ = 0;
 }
 
+bool App::qsyTargetInBand(const std::string& band, int slot, uint32_t frequency_hz) const {
+    if (!freq_mgr_) {
+        return false;
+    }
+    const auto band_cfg = freq_mgr_->getBand(trimSpaces(band));
+    if (!band_cfg) {
+        return false;
+    }
+    auto inside = [&](uint64_t f) {
+        return f >= band_cfg->band_start_hz && f <= band_cfg->band_end_hz;
+    };
+    if (frequency_hz != 0 && !inside(frequency_hz)) {
+        return false;
+    }
+    const uint64_t slot_freq = freq_mgr_->getSlotFrequency(band_cfg->name, slot);
+    return slot_freq != 0 ? inside(slot_freq) : frequency_hz != 0;
+}
+
 bool App::executeQsyTarget(const std::string& band, int slot, uint32_t frequency_hz) {
     if (!modem_ || !modem_->isConnected()) {
         return false;
@@ -6617,6 +6738,10 @@ bool App::executeQsyTarget(const std::string& band, int slot, uint32_t frequency
     int target_slot = std::clamp(slot, -120, 120);
     if (target_slot == 0) {
         target_slot = 1;
+    }
+
+    if (!qsyTargetInBand(target_band, target_slot, frequency_hz)) {
+        return false;
     }
 
     bool ok = false;
@@ -6877,18 +7002,21 @@ void App::updateChannelSniffer() {
             // Complete - cycle done
             channel_sniffer_active_ = false;
 
-            // Find best (free) slot
-            int best_slot = -1;
+            // Find best (free) slot. Slot numbers may be negative, so track
+            // "found" separately from the value.
+            int best_slot = 0;
+            bool found_free = false;
             for (const auto& status : slot_status_) {
                 if (!status.second) {  // Not busy
                     best_slot = status.first;
+                    found_free = true;
                     break;
                 }
             }
 
             ChatMessage msg;
             msg.from = "SYSTEM";
-            if (best_slot >= 0) {
+            if (found_free) {
                 const uint64_t freq_hz = freq_mgr_->getSlotFrequency(sniffer_band_, best_slot);
                 const std::string slot_label = (best_slot >= 0 ? "+" : "") + std::to_string(best_slot);
                 msg.text = "Sniffer complete on " + sniffer_band_ + ". Best slot: " + slot_label +
@@ -7282,19 +7410,57 @@ void App::processIncomingEmail() {
     if (radio_outbox_.empty()) {
         return;
     }
+    // Without a store there is nowhere durable to put the mail; keep it
+    // queued (the server copy is already gone) and retry next pass.
+    if (!store_ || !store_->isOpen()) {
+        return;
+    }
 
     // Process emails received from POP3/Winlink and queue them for radio delivery.
     for (auto& email : radio_outbox_) {
-        if (store_ && store_->isOpen()) {
-            if (!email.message_id.empty() && store_->getMessageById(email.message_id).has_value()) {
-                continue;
-            }
-            email.type = MessageType::Email;
-            email.status = MessageStatus::Pending;
-            store_->createMessage(email);
+        if (!email.message_id.empty() && store_->getMessageById(email.message_id).has_value()) {
+            continue;
         }
+        email.type = MessageType::Email;
+        email.status = MessageStatus::Pending;
+        store_->createMessage(email);
     }
     radio_outbox_.clear();
+}
+
+void App::keepInboundLocally(const std::string& from,
+                             const std::string& to,
+                             const std::string& subject,
+                             const std::string& body,
+                             const std::string& message_id) {
+    const std::string mid = trimSpaces(message_id);
+    if (!mid.empty()) {
+        const bool seen = std::any_of(mail_inbox_.begin(), mail_inbox_.end(),
+                                      [&](const MailMessage& m) { return m.message_id == mid; });
+        if (seen || (store_ && store_->isOpen() && store_->getMessageById(mid).has_value())) {
+            return;
+        }
+    }
+
+    MailMessage mail;
+    mail.message_id = mid;
+    mail.from = trimSpaces(from).empty() ? std::string("EMAIL") : trimSpaces(from);
+    mail.to = trimSpaces(to);
+    mail.subject = trimSpaces(subject).empty() ? std::string("Internet message") : subject;
+    mail.body = body;
+    mail.display_body = body;
+    mail.timestamp = unixNowSeconds();
+    mail.read = false;
+    mail.status = MessageStatus::Delivered;
+    mail_inbox_.push_back(mail);
+    if (store_ && store_->isOpen()) {
+        const int64_t id = store_->createMessage(makeStoreMailMessage(mail, config_.station.callsign, false));
+        if (id > 0) {
+            mail_inbox_.back().store_id = id;
+        }
+    }
+    appendSystemChat("[EMAIL] Kept internet message for " + mail.to +
+                     " in the local inbox (no radio callsign to relay to)");
 }
 
 void App::relayEmailToRadio(const Message& email) {
@@ -7326,6 +7492,9 @@ void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
                                     const std::string& message_id) -> bool {
         const std::string target_callsign = deriveRadioRelayTarget(to);
         if (target_callsign.empty()) {
+            // Not addressed to a radio station: the server copy is gone, so
+            // keep it in the local inbox rather than dropping it.
+            keepInboundLocally(from, to, subject, body, message_id);
             return false;
         }
 
@@ -7377,7 +7546,14 @@ void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
         } else {
             relay_diagnostics_.last_result = "pop3-ok";
             relay_diagnostics_.last_error.clear();
+            int truncated = 0;
             for (const auto& inbound : pop_result.messages) {
+                // Truncated messages stay on the server (no DELE) and are
+                // fetched again; relaying the partial body would lose mail.
+                if (inbound.truncated) {
+                    truncated++;
+                    continue;
+                }
                 if (queueInboundForRadio(inbound.from,
                                          inbound.to,
                                          inbound.subject,
@@ -7385,6 +7561,10 @@ void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
                                          "")) {
                     queued_for_radio++;
                 }
+            }
+            if (truncated > 0) {
+                appendSystemChat("[EMAIL] " + std::to_string(truncated) +
+                                 " oversized message(s) left on the POP3 server (not relayed)");
             }
         }
     }
@@ -8686,8 +8866,24 @@ void App::processMailAck(const std::string& from, const std::vector<uint8_t>& da
         reason.assign(data.begin() + 3 + id_len, data.end());
     }
 
+    const std::string ack_from = normalizeCallsign(from);
     for (auto& mail : mail_outbox_) {
         if (mail.message_id != message_id) {
+            continue;
+        }
+        // Only the addressee (or, for internet mail, the gateway that
+        // carried it) may confirm or refuse delivery.
+        bool from_recipient = !ack_from.empty() && ack_from == normalizeCallsign(mail.to);
+        if (!from_recipient && looksLikeEmailAddress(mail.to)) {
+            const std::string pinned_gateway = normalizeCallsign(auto_gateway_target_);
+            // Internet mail only leaves over a link, so the linked peer is
+            // the gateway it was routed through.
+            from_recipient = !ack_from.empty() &&
+                             (isKnownEmailGateway(ack_from) ||
+                              (!pinned_gateway.empty() && ack_from == pinned_gateway) ||
+                              ack_from == linkedPeerCallsign());
+        }
+        if (!from_recipient) {
             continue;
         }
         if (ack && mail.status == MessageStatus::Delivered) {
@@ -9043,7 +9239,8 @@ void App::updateReliableMail() {
     }
 }
 
-void App::processReliableMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool is_broadcast) {
+void App::processReliableMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool is_broadcast,
+                                      bool via_link) {
     if (data.size() < 5) return;
 
     size_t pos = 1;
@@ -9187,7 +9384,9 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
     const bool to_me = normalizeCallsign(mail.to) == normalizeCallsign(config_.station.callsign);
     if (!is_broadcast && !to_email && !to_me) {
         bool relayed = false;
-        if (config_.email.hf_store_forward_enabled) {
+        // Mesh-delivered packets were already routed by the relay layer;
+        // only mail handed to us over the link starts a new relay.
+        if (config_.email.hf_store_forward_enabled && via_link) {
             relayed = forwardPacketViaMesh(data, mail.to, message_id);
         }
         if ((flags & kMailFlagAckRequired) != 0) {
@@ -9201,7 +9400,11 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
     if (to_email) {
         const std::string normalized_from = normalizeCallsign(mail.from);
         const bool gateway_ready = isEmailGatewayConfigured(config_);
-        const bool sender_allowed = senderAllowedForGateway(config_, normalized_from);
+        // The relay allowlist applies to the station on the other end of
+        // the radio link, never to the From inside its own envelope.
+        const std::string radio_sender = normalizeCallsign(from);
+        const bool sender_allowed = via_link && !radio_sender.empty() && radio_sender != "UNKNOWN" &&
+                                    senderAllowedForGateway(config_, radio_sender);
         const bool gateway_permitted = !away_mode_active_ || config_.away.allow_email_gateway;
         if (!gateway_ready || !sender_allowed || !gateway_permitted) {
             sendMailAck(message_id, false, "Gateway unavailable");
@@ -9444,8 +9647,30 @@ void App::sendBroadcastMail(const std::string& subject, const std::string& body)
     chat_scroll_to_bottom_ = true;
 }
 
-void App::processMailReceived(const std::string& from, const std::vector<uint8_t>& data) {
+void App::processMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool via_link) {
     if (data.size() < 2) return;
+
+    // Legacy packets carry no message id: suppress repeats of the same
+    // packet from the same sender inside a window.
+    {
+        const int64_t now = unixNowSeconds();
+        for (auto it = legacy_mail_seen_.begin(); it != legacy_mail_seen_.end();) {
+            if (now - it->second > LEGACY_MAIL_DEDUP_WINDOW_SEC) {
+                it = legacy_mail_seen_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        const std::string key = normalizeCallsign(from) + "|" +
+            std::to_string(std::hash<std::string>{}(std::string(data.begin(), data.end())));
+        if (legacy_mail_seen_.count(key) > 0) {
+            return;
+        }
+        if (legacy_mail_seen_.size() >= 512) {
+            legacy_mail_seen_.clear();
+        }
+        legacy_mail_seen_[key] = now;
+    }
 
     // Backward-compatible decoder for legacy 0xE2/0xE3 packets.
     const uint8_t mail_type = data[0];
@@ -9478,7 +9703,7 @@ void App::processMailReceived(const std::string& from, const std::vector<uint8_t
             return;
         }
         if (to_email) {
-            if (!isEmailGatewayConfigured(config_) ||
+            if (!via_link || !isEmailGatewayConfigured(config_) ||
                 !senderAllowedForGateway(config_, mail.from) ||
                 (away_mode_active_ && !config_.away.allow_email_gateway)) {
                 return;
@@ -9870,7 +10095,13 @@ void App::processWeatherMessage(const std::string& from, const std::vector<uint8
         if (data.size() > 2) {
             query = std::string(data.begin() + 2, data.end());
         }
-        handleWeatherRequest(wx_type, query);
+        // Requests are answered over the link, so only the linked peer
+        // may make one.
+        const std::string requester = normalizeCallsign(from);
+        if (requester.empty() || requester != linkedPeerCallsign()) {
+            return;
+        }
+        handleWeatherRequest(wx_type, query, requester);
     } else {
         // This is a weather RESPONSE
         // Format: 0xE4 | type | location_len | location | report
@@ -9946,7 +10177,7 @@ void App::processWeatherMessage(const std::string& from, const std::vector<uint8
     }
 }
 
-void App::handleWeatherRequest(uint8_t request_type, const std::string& query) {
+void App::handleWeatherRequest(uint8_t request_type, const std::string& query, const std::string& requester) {
     // Handle incoming weather request from connected station
     // Fetch data from internet asynchronously and send response
 
@@ -9961,7 +10192,8 @@ void App::handleWeatherRequest(uint8_t request_type, const std::string& query) {
 
     ChatMessage msg;
     msg.from = "SYSTEM";
-    msg.text = "Weather " + type_name + " request received for: " + query;
+    msg.text = "Weather " + type_name + " request from " + requester + " for: " +
+               app_detail::sanitizeRemoteText(query, 64);
     msg.is_outgoing = false;
     msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -9969,7 +10201,7 @@ void App::handleWeatherRequest(uint8_t request_type, const std::string& query) {
     chat_scroll_to_bottom_ = true;
 
     // Start async fetch
-    fetchWeatherAsync(request_type, query);
+    fetchWeatherAsync(request_type, query, requester);
 }
 
 void App::sendWeatherResponse(uint8_t type, const std::string& location, const std::string& report) {
@@ -10493,482 +10725,513 @@ std::string App::extractForecastText(const std::string& json) {
 }
 
 // Async weather fetch to avoid blocking UI
-void App::fetchWeatherAsync(uint8_t type, const std::string& query) {
-    // Create pending fetch record
-    {
-        std::lock_guard<std::mutex> lock(weather_fetch_mutex_);
-        pending_weather_fetch_ = std::make_unique<PendingWeatherFetch>();
-        pending_weather_fetch_->type = type;
-        pending_weather_fetch_->query = query;
-        pending_weather_fetch_->complete = false;
-        pending_weather_fetch_->success = false;
-    }
+// Blocking fetch of one weather product. Static: it touches no App state,
+// so a worker thread can run it after the App is gone.
+std::string App::fetchWeatherReport(uint8_t type, const std::string& query) {
+    std::string result;
+    std::string host, path;
 
-    // Launch background thread.
-    // Capture a shared alive flag so the thread can detect App destruction.
-    auto alive = weather_alive_flag_;
-    std::thread([this, type, query, alive]() {
-        std::string result;
-        std::string host, path;
+    auto trim = [](const std::string& s) -> std::string {
+        size_t start = 0;
+        while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+            ++start;
+        }
+        size_t end = s.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+            --end;
+        }
+        return s.substr(start, end - start);
+    };
 
-        auto trim = [](const std::string& s) -> std::string {
-            size_t start = 0;
-            while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
-                ++start;
-            }
-            size_t end = s.size();
-            while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
-                --end;
-            }
-            return s.substr(start, end - start);
-        };
-
-        auto parse_lat_lon = [&trim](const std::string& text, double& lat, double& lon) -> bool {
-            size_t comma = text.find(',');
-            if (comma == std::string::npos) {
-                return false;
-            }
-            std::string lat_str = trim(text.substr(0, comma));
-            std::string lon_str = trim(text.substr(comma + 1));
-            if (lat_str.empty() || lon_str.empty()) {
-                return false;
-            }
-
-            try {
-                size_t lat_used = 0;
-                size_t lon_used = 0;
-                double parsed_lat = std::stod(lat_str, &lat_used);
-                double parsed_lon = std::stod(lon_str, &lon_used);
-                if (lat_used != lat_str.size() || lon_used != lon_str.size()) {
-                    return false;
-                }
-                if (parsed_lat < -90.0 || parsed_lat > 90.0 ||
-                    parsed_lon < -180.0 || parsed_lon > 180.0) {
-                    return false;
-                }
-                lat = parsed_lat;
-                lon = parsed_lon;
-                return true;
-            } catch (...) {
-                return false;
-            }
-        };
-
-        auto url_encode = [](const std::string& value) -> std::string {
-            std::ostringstream escaped;
-            escaped << std::uppercase << std::hex;
-            for (unsigned char c : value) {
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                    (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-                    c == '.' || c == '~') {
-                    escaped << static_cast<char>(c);
-                } else if (c == ' ') {
-                    escaped << "%20";
-                } else {
-                    escaped << '%' << std::setw(2) << std::setfill('0')
-                            << static_cast<int>(c);
-                }
-            }
-            return escaped.str();
-        };
-
-        auto geocode_location = [&](const std::string& text, double& lat, double& lon) -> bool {
-            std::string geo_host = "nominatim.openstreetmap.org";
-            std::string geo_path = "/search?format=jsonv2&limit=1&q=" + url_encode(text);
-            std::string geo_response = httpGet(geo_host, geo_path, true);
-            if (geo_response.empty()) {
-                return false;
-            }
-
-            const std::string lat_key = "\"lat\":\"";
-            const std::string lon_key = "\"lon\":\"";
-            size_t lat_pos = geo_response.find(lat_key);
-            size_t lon_pos = geo_response.find(lon_key);
-            if (lat_pos == std::string::npos || lon_pos == std::string::npos) {
-                return false;
-            }
-
-            size_t lat_start = lat_pos + lat_key.size();
-            size_t lon_start = lon_pos + lon_key.size();
-            size_t lat_end = geo_response.find('"', lat_start);
-            size_t lon_end = geo_response.find('"', lon_start);
-            if (lat_end == std::string::npos || lon_end == std::string::npos) {
-                return false;
-            }
-
-            try {
-                lat = std::stod(geo_response.substr(lat_start, lat_end - lat_start));
-                lon = std::stod(geo_response.substr(lon_start, lon_end - lon_start));
-                return (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0);
-            } catch (...) {
-                return false;
-            }
-        };
-
-        auto format_coords = [](double lat, double lon) -> std::string {
-            // NWS /points endpoint redirects high-precision coordinates (301).
-            // Use 4-decimal precision to request a supported point directly.
-            std::ostringstream oss;
-            oss.setf(std::ios::fixed);
-            oss << std::setprecision(4) << lat << "," << lon;
-            return oss.str();
-        };
-
-        auto extract_json_string = [](const std::string& json, size_t quote_pos,
-                                      std::string& out, size_t* end_quote_pos = nullptr) -> bool {
-            if (quote_pos == std::string::npos || quote_pos >= json.size() || json[quote_pos] != '"') {
-                return false;
-            }
-
-            out.clear();
-            bool escaped = false;
-            for (size_t i = quote_pos + 1; i < json.size(); ++i) {
-                const char c = json[i];
-                if (escaped) {
-                    switch (c) {
-                        case '"': out.push_back('"'); break;
-                        case '\\': out.push_back('\\'); break;
-                        case '/': out.push_back('/'); break;
-                        case 'b': out.push_back('\b'); break;
-                        case 'f': out.push_back('\f'); break;
-                        case 'n': out.push_back('\n'); break;
-                        case 'r': out.push_back('\r'); break;
-                        case 't': out.push_back('\t'); break;
-                        case 'u':
-                            if (i + 4 < json.size()) {
-                                i += 4;
-                            }
-                            out.push_back('?');
-                            break;
-                        default:
-                            out.push_back(c);
-                            break;
-                    }
-                    escaped = false;
-                    continue;
-                }
-
-                if (c == '\\') {
-                    escaped = true;
-                    continue;
-                }
-                if (c == '"') {
-                    if (end_quote_pos) {
-                        *end_quote_pos = i;
-                    }
-                    return true;
-                }
-                out.push_back(c);
-            }
+    auto parse_lat_lon = [&trim](const std::string& text, double& lat, double& lon) -> bool {
+        size_t comma = text.find(',');
+        if (comma == std::string::npos) {
             return false;
-        };
+        }
+        std::string lat_str = trim(text.substr(0, comma));
+        std::string lon_str = trim(text.substr(comma + 1));
+        if (lat_str.empty() || lon_str.empty()) {
+            return false;
+        }
 
-        auto find_json_string_field = [&](const std::string& json, const std::string& key,
-                                          std::string& value) -> bool {
-            const std::string pattern = "\"" + key + "\"";
-            size_t key_pos = json.find(pattern);
-            if (key_pos == std::string::npos) {
+        try {
+            size_t lat_used = 0;
+            size_t lon_used = 0;
+            double parsed_lat = std::stod(lat_str, &lat_used);
+            double parsed_lon = std::stod(lon_str, &lon_used);
+            if (lat_used != lat_str.size() || lon_used != lon_str.size()) {
                 return false;
             }
-            size_t colon = json.find(':', key_pos + pattern.size());
-            if (colon == std::string::npos) {
+            if (parsed_lat < -90.0 || parsed_lat > 90.0 ||
+                parsed_lon < -180.0 || parsed_lon > 180.0) {
                 return false;
+            }
+            lat = parsed_lat;
+            lon = parsed_lon;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    const auto url_encode = [](const std::string& value) { return app_detail::urlEncode(value); };
+
+    auto geocode_location = [&](const std::string& text, double& lat, double& lon) -> bool {
+        std::string geo_host = "nominatim.openstreetmap.org";
+        std::string geo_path = "/search?format=jsonv2&limit=1&q=" + url_encode(text);
+        std::string geo_response = httpGet(geo_host, geo_path, true);
+        if (geo_response.empty()) {
+            return false;
+        }
+
+        const std::string lat_key = "\"lat\":\"";
+        const std::string lon_key = "\"lon\":\"";
+        size_t lat_pos = geo_response.find(lat_key);
+        size_t lon_pos = geo_response.find(lon_key);
+        if (lat_pos == std::string::npos || lon_pos == std::string::npos) {
+            return false;
+        }
+
+        size_t lat_start = lat_pos + lat_key.size();
+        size_t lon_start = lon_pos + lon_key.size();
+        size_t lat_end = geo_response.find('"', lat_start);
+        size_t lon_end = geo_response.find('"', lon_start);
+        if (lat_end == std::string::npos || lon_end == std::string::npos) {
+            return false;
+        }
+
+        try {
+            lat = std::stod(geo_response.substr(lat_start, lat_end - lat_start));
+            lon = std::stod(geo_response.substr(lon_start, lon_end - lon_start));
+            return (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0);
+        } catch (...) {
+            return false;
+        }
+    };
+
+    auto format_coords = [](double lat, double lon) -> std::string {
+        // NWS /points endpoint redirects high-precision coordinates (301).
+        // Use 4-decimal precision to request a supported point directly.
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(4) << lat << "," << lon;
+        return oss.str();
+    };
+
+    auto extract_json_string = [](const std::string& json, size_t quote_pos,
+                                  std::string& out, size_t* end_quote_pos = nullptr) -> bool {
+        if (quote_pos == std::string::npos || quote_pos >= json.size() || json[quote_pos] != '"') {
+            return false;
+        }
+
+        out.clear();
+        bool escaped = false;
+        for (size_t i = quote_pos + 1; i < json.size(); ++i) {
+            const char c = json[i];
+            if (escaped) {
+                switch (c) {
+                    case '"': out.push_back('"'); break;
+                    case '\\': out.push_back('\\'); break;
+                    case '/': out.push_back('/'); break;
+                    case 'b': out.push_back('\b'); break;
+                    case 'f': out.push_back('\f'); break;
+                    case 'n': out.push_back('\n'); break;
+                    case 'r': out.push_back('\r'); break;
+                    case 't': out.push_back('\t'); break;
+                    case 'u':
+                        if (i + 4 < json.size()) {
+                            i += 4;
+                        }
+                        out.push_back('?');
+                        break;
+                    default:
+                        out.push_back(c);
+                        break;
+                }
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (c == '"') {
+                if (end_quote_pos) {
+                    *end_quote_pos = i;
+                }
+                return true;
+            }
+            out.push_back(c);
+        }
+        return false;
+    };
+
+    auto find_json_string_field = [&](const std::string& json, const std::string& key,
+                                      std::string& value) -> bool {
+        const std::string pattern = "\"" + key + "\"";
+        size_t key_pos = json.find(pattern);
+        if (key_pos == std::string::npos) {
+            return false;
+        }
+        size_t colon = json.find(':', key_pos + pattern.size());
+        if (colon == std::string::npos) {
+            return false;
+        }
+        size_t quote = json.find('"', colon + 1);
+        if (quote == std::string::npos) {
+            return false;
+        }
+        return extract_json_string(json, quote, value, nullptr);
+    };
+
+    auto find_first_json_array_string = [&](const std::string& json, const std::string& key,
+                                            std::string& value) -> bool {
+        const std::string pattern = "\"" + key + "\"";
+        size_t key_pos = json.find(pattern);
+        if (key_pos == std::string::npos) {
+            return false;
+        }
+        size_t colon = json.find(':', key_pos + pattern.size());
+        if (colon == std::string::npos) {
+            return false;
+        }
+        size_t array_start = json.find('[', colon + 1);
+        if (array_start == std::string::npos) {
+            return false;
+        }
+        size_t array_end = json.find(']', array_start + 1);
+        if (array_end == std::string::npos) {
+            return false;
+        }
+        size_t quote = json.find('"', array_start + 1);
+        if (quote == std::string::npos || quote > array_end) {
+            return false;
+        }
+        return extract_json_string(json, quote, value, nullptr);
+    };
+
+    auto extract_product_ids = [&](const std::string& json, size_t max_ids) -> std::vector<std::string> {
+        std::vector<std::string> ids;
+        size_t pos = 0;
+        while (ids.size() < max_ids) {
+            pos = json.find("\"id\"", pos);
+            if (pos == std::string::npos) {
+                break;
+            }
+            size_t colon = json.find(':', pos + 4);
+            if (colon == std::string::npos) {
+                break;
             }
             size_t quote = json.find('"', colon + 1);
             if (quote == std::string::npos) {
-                return false;
-            }
-            return extract_json_string(json, quote, value, nullptr);
-        };
-
-        auto find_first_json_array_string = [&](const std::string& json, const std::string& key,
-                                                std::string& value) -> bool {
-            const std::string pattern = "\"" + key + "\"";
-            size_t key_pos = json.find(pattern);
-            if (key_pos == std::string::npos) {
-                return false;
-            }
-            size_t colon = json.find(':', key_pos + pattern.size());
-            if (colon == std::string::npos) {
-                return false;
-            }
-            size_t array_start = json.find('[', colon + 1);
-            if (array_start == std::string::npos) {
-                return false;
-            }
-            size_t array_end = json.find(']', array_start + 1);
-            if (array_end == std::string::npos) {
-                return false;
-            }
-            size_t quote = json.find('"', array_start + 1);
-            if (quote == std::string::npos || quote > array_end) {
-                return false;
-            }
-            return extract_json_string(json, quote, value, nullptr);
-        };
-
-        auto extract_product_ids = [&](const std::string& json, size_t max_ids) -> std::vector<std::string> {
-            std::vector<std::string> ids;
-            size_t pos = 0;
-            while (ids.size() < max_ids) {
-                pos = json.find("\"id\"", pos);
-                if (pos == std::string::npos) {
-                    break;
-                }
-                size_t colon = json.find(':', pos + 4);
-                if (colon == std::string::npos) {
-                    break;
-                }
-                size_t quote = json.find('"', colon + 1);
-                if (quote == std::string::npos) {
-                    break;
-                }
-
-                std::string id;
-                size_t end_quote = quote;
-                if (!extract_json_string(json, quote, id, &end_quote)) {
-                    break;
-                }
-                pos = end_quote + 1;
-
-                // Product IDs are UUID-like and contain dashes.
-                if (id.size() < 20 || id.find('-') == std::string::npos) {
-                    continue;
-                }
-                if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
-                    ids.push_back(id);
-                }
-            }
-            return ids;
-        };
-
-        auto normalize_zone_code = [&](const std::string& zone_text) -> std::string {
-            std::string zone = trim(zone_text);
-            std::transform(zone.begin(), zone.end(), zone.begin(), ::toupper);
-            return zone;
-        };
-
-        auto extract_zone_section = [&](const std::string& product_text, const std::string& zone_code) -> std::string {
-            if (product_text.empty() || zone_code.empty()) {
-                return "";
+                break;
             }
 
-            size_t marker = product_text.find(zone_code + "-");
-            if (marker == std::string::npos) {
-                marker = product_text.find(zone_code);
-                if (marker == std::string::npos) {
-                    return "";
-                }
+            std::string id;
+            size_t end_quote = quote;
+            if (!extract_json_string(json, quote, id, &end_quote)) {
+                break;
             }
+            pos = end_quote + 1;
 
-            size_t section_start = product_text.rfind('\n', marker);
-            section_start = (section_start == std::string::npos) ? 0 : section_start + 1;
-
-            size_t section_end = product_text.find("\n$$", marker);
-            if (section_end == std::string::npos) {
-                section_end = std::min(product_text.size(), section_start + static_cast<size_t>(1800));
+            // Product IDs are UUID-like and contain dashes.
+            if (id.size() < 20 || id.find('-') == std::string::npos) {
+                continue;
             }
-
-            std::string section = trim(product_text.substr(section_start, section_end - section_start));
-            if (section.size() > 1500) {
-                section.resize(1500);
-                section += "...";
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+                ids.push_back(id);
             }
-            return section;
-        };
+        }
+        return ids;
+    };
 
-        auto marine_fallback_from_products = [&](const std::string& zone_code) -> std::string {
-            if (zone_code.size() < 3) {
-                return "";
-            }
+    auto normalize_zone_code = [&](const std::string& zone_text) -> std::string {
+        std::string zone = trim(zone_text);
+        std::transform(zone.begin(), zone.end(), zone.begin(), ::toupper);
+        return zone;
+    };
 
-            const std::string wx_host = "api.weather.gov";
-            std::string zone_meta = httpGet(wx_host, "/zones/forecast/" + zone_code, true);
-            std::string cwa;
-            if (zone_meta.empty() || !find_first_json_array_string(zone_meta, "cwa", cwa) || cwa.empty()) {
-                return "";
-            }
-
-            std::vector<std::string> product_types;
-            const bool great_lakes_zone =
-                zone_code.rfind("LEZ", 0) == 0 || zone_code.rfind("LMZ", 0) == 0 ||
-                zone_code.rfind("LHZ", 0) == 0 || zone_code.rfind("LOZ", 0) == 0 ||
-                zone_code.rfind("LSZ", 0) == 0 || zone_code.rfind("SLZ", 0) == 0;
-            if (great_lakes_zone) {
-                product_types = {"NSH", "MWW", "CWF"};
-            } else {
-                product_types = {"CWF", "MWW", "NSH"};
-            }
-
-            for (const auto& product_type : product_types) {
-                std::string product_list = httpGet(wx_host,
-                                                   "/products?location=" + cwa + "&type=" + product_type,
-                                                   true);
-                if (product_list.empty()) {
-                    continue;
-                }
-
-                auto product_ids = extract_product_ids(product_list, 8);
-                for (const auto& product_id : product_ids) {
-                    std::string product_json = httpGet(wx_host, "/products/" + product_id, true);
-                    if (product_json.empty()) {
-                        continue;
-                    }
-
-                    std::string product_text;
-                    if (!find_json_string_field(product_json, "productText", product_text) ||
-                        product_text.empty()) {
-                        continue;
-                    }
-
-                    std::string section = extract_zone_section(product_text, zone_code);
-                    if (!section.empty()) {
-                        return section;
-                    }
-                }
-            }
-
+    auto extract_zone_section = [&](const std::string& product_text, const std::string& zone_code) -> std::string {
+        if (product_text.empty() || zone_code.empty()) {
             return "";
-        };
-
-        switch (type) {
-            case 0x01: {
-                // Forecast: grid square, numeric lat/lon, or geocoded location text.
-                double lat, lon;
-                std::string coords;
-
-                if (gridSquareToLatLon(query, lat, lon)) {
-                    coords = format_coords(lat, lon);
-                } else if (parse_lat_lon(query, lat, lon)) {
-                    coords = format_coords(lat, lon);
-                } else if (geocode_location(query, lat, lon)) {
-                    coords = format_coords(lat, lon);
-                } else {
-                    result = "Could not resolve location: " + query;
-                    break;
-                }
-
-                // First get the forecast URL from the points API
-                host = "api.weather.gov";
-                path = "/points/" + coords;
-                std::string points_response = httpGet(host, path, true);
-
-                std::string forecast_url;
-                if (find_json_string_field(points_response, "forecast", forecast_url) &&
-                    !forecast_url.empty()) {
-                    size_t scheme_pos = forecast_url.find("://");
-                    size_t path_start = (scheme_pos == std::string::npos)
-                        ? forecast_url.find('/')
-                        : forecast_url.find('/', scheme_pos + 3);
-                    if (path_start != std::string::npos) {
-                        path = forecast_url.substr(path_start);
-                    } else {
-                        path = forecast_url;
-                    }
-
-                    std::string raw = httpGet(host, path, true);
-                    result = parseWeatherResponse(type, raw);
-                }
-
-                if (result.empty()) {
-                    result = "Could not get forecast for " + query;
-                }
-                break;
-            }
-
-            case 0x02: {
-                // METAR
-                host = "aviationweather.gov";
-                path = "/api/data/metar?ids=" + query + "&format=raw";
-                std::string raw = httpGet(host, path, true);
-                result = parseWeatherResponse(type, raw);
-                break;
-            }
-
-            case 0x03: {
-                // TAF
-                host = "aviationweather.gov";
-                path = "/api/data/taf?ids=" + query + "&format=raw";
-                std::string raw = httpGet(host, path, true);
-                result = parseWeatherResponse(type, raw);
-                break;
-            }
-
-            case 0x04: {
-                // Marine
-                std::string zone_code = normalize_zone_code(query);
-                if (zone_code.empty()) {
-                    result = "Marine zone code is required";
-                    break;
-                }
-
-                host = "api.weather.gov";
-                path = "/zones/forecast/" + zone_code + "/forecast";
-                std::string raw = httpGet(host, path, true);
-                result = parseWeatherResponse(type, raw);
-
-                const bool marine_endpoint_unsupported =
-                    raw.empty() ||
-                    raw.find("Marine Forecast Not Supported") != std::string::npos ||
-                    raw.find("Zone Does Not Exist") != std::string::npos ||
-                    result.find("not yet supported by this API") != std::string::npos ||
-                    result.find("Marine Forecast Not Supported") != std::string::npos ||
-                    result == "Could not parse forecast data" ||
-                    result == "Could not extract forecast text";
-
-                if (marine_endpoint_unsupported) {
-                    std::string fallback = marine_fallback_from_products(zone_code);
-                    if (!fallback.empty()) {
-                        result = fallback;
-                    } else if (result.empty() ||
-                               result == "Could not parse forecast data" ||
-                               result == "Could not extract forecast text" ||
-                               result.find("not yet supported by this API") != std::string::npos ||
-                               result.find("Marine Forecast Not Supported") != std::string::npos) {
-                        result = "Marine forecast unavailable for zone " + zone_code;
-                    }
-                }
-                break;
-            }
-
-            default:
-                result = "Unknown weather type";
-                break;
         }
 
-        // Store result only if the App is still alive
-        if (alive->load()) {
-            std::lock_guard<std::mutex> lock(weather_fetch_mutex_);
-            if (pending_weather_fetch_) {
-                pending_weather_fetch_->result = result;
-                pending_weather_fetch_->success = !result.empty();
-                pending_weather_fetch_->complete = true;
+        size_t marker = product_text.find(zone_code + "-");
+        if (marker == std::string::npos) {
+            marker = product_text.find(zone_code);
+            if (marker == std::string::npos) {
+                return "";
+            }
+        }
+
+        size_t section_start = product_text.rfind('\n', marker);
+        section_start = (section_start == std::string::npos) ? 0 : section_start + 1;
+
+        size_t section_end = product_text.find("\n$$", marker);
+        if (section_end == std::string::npos) {
+            section_end = std::min(product_text.size(), section_start + static_cast<size_t>(1800));
+        }
+
+        std::string section = trim(product_text.substr(section_start, section_end - section_start));
+        if (section.size() > 1500) {
+            section.resize(1500);
+            section += "...";
+        }
+        return section;
+    };
+
+    auto marine_fallback_from_products = [&](const std::string& zone_code) -> std::string {
+        if (zone_code.size() < 3) {
+            return "";
+        }
+
+        const std::string wx_host = "api.weather.gov";
+        std::string zone_meta = httpGet(wx_host, "/zones/forecast/" + url_encode(zone_code), true);
+        std::string cwa;
+        if (zone_meta.empty() || !find_first_json_array_string(zone_meta, "cwa", cwa) || cwa.empty()) {
+            return "";
+        }
+
+        std::vector<std::string> product_types;
+        const bool great_lakes_zone =
+            zone_code.rfind("LEZ", 0) == 0 || zone_code.rfind("LMZ", 0) == 0 ||
+            zone_code.rfind("LHZ", 0) == 0 || zone_code.rfind("LOZ", 0) == 0 ||
+            zone_code.rfind("LSZ", 0) == 0 || zone_code.rfind("SLZ", 0) == 0;
+        if (great_lakes_zone) {
+            product_types = {"NSH", "MWW", "CWF"};
+        } else {
+            product_types = {"CWF", "MWW", "NSH"};
+        }
+
+        for (const auto& product_type : product_types) {
+            std::string product_list = httpGet(wx_host,
+                                               "/products?location=" + url_encode(cwa) + "&type=" + product_type,
+                                               true);
+            if (product_list.empty()) {
+                continue;
+            }
+
+            auto product_ids = extract_product_ids(product_list, 8);
+            for (const auto& product_id : product_ids) {
+                std::string product_json = httpGet(wx_host, "/products/" + url_encode(product_id), true);
+                if (product_json.empty()) {
+                    continue;
+                }
+
+                std::string product_text;
+                if (!find_json_string_field(product_json, "productText", product_text) ||
+                    product_text.empty()) {
+                    continue;
+                }
+
+                std::string section = extract_zone_section(product_text, zone_code);
+                if (!section.empty()) {
+                    return section;
+                }
+            }
+        }
+
+        return "";
+    };
+
+    switch (type) {
+        case 0x01: {
+            // Forecast: grid square, numeric lat/lon, or geocoded location text.
+            double lat, lon;
+            std::string coords;
+
+            if (gridSquareToLatLon(query, lat, lon)) {
+                coords = format_coords(lat, lon);
+            } else if (parse_lat_lon(query, lat, lon)) {
+                coords = format_coords(lat, lon);
+            } else if (geocode_location(query, lat, lon)) {
+                coords = format_coords(lat, lon);
+            } else {
+                result = "Could not resolve location: " + query;
+                break;
+            }
+
+            // First get the forecast URL from the points API
+            host = "api.weather.gov";
+            path = "/points/" + coords;
+            std::string points_response = httpGet(host, path, true);
+
+            std::string forecast_url;
+            if (find_json_string_field(points_response, "forecast", forecast_url) &&
+                !forecast_url.empty()) {
+                size_t scheme_pos = forecast_url.find("://");
+                size_t path_start = (scheme_pos == std::string::npos)
+                    ? forecast_url.find('/')
+                    : forecast_url.find('/', scheme_pos + 3);
+                if (path_start != std::string::npos) {
+                    path = forecast_url.substr(path_start);
+                } else {
+                    path = forecast_url;
+                }
+
+                std::string raw = httpGet(host, path, true);
+                result = parseWeatherResponse(type, raw);
+            }
+
+            if (result.empty()) {
+                result = "Could not get forecast for " + query;
+            }
+            break;
+        }
+
+        case 0x02: {
+            // METAR
+            host = "aviationweather.gov";
+            path = "/api/data/metar?ids=" + url_encode(query) + "&format=raw";
+            std::string raw = httpGet(host, path, true);
+            result = parseWeatherResponse(type, raw);
+            break;
+        }
+
+        case 0x03: {
+            // TAF
+            host = "aviationweather.gov";
+            path = "/api/data/taf?ids=" + url_encode(query) + "&format=raw";
+            std::string raw = httpGet(host, path, true);
+            result = parseWeatherResponse(type, raw);
+            break;
+        }
+
+        case 0x04: {
+            // Marine
+            std::string zone_code = normalize_zone_code(query);
+            if (zone_code.empty()) {
+                result = "Marine zone code is required";
+                break;
+            }
+
+            host = "api.weather.gov";
+            path = "/zones/forecast/" + url_encode(zone_code) + "/forecast";
+            std::string raw = httpGet(host, path, true);
+            result = parseWeatherResponse(type, raw);
+
+            const bool marine_endpoint_unsupported =
+                raw.empty() ||
+                raw.find("Marine Forecast Not Supported") != std::string::npos ||
+                raw.find("Zone Does Not Exist") != std::string::npos ||
+                result.find("not yet supported by this API") != std::string::npos ||
+                result.find("Marine Forecast Not Supported") != std::string::npos ||
+                result == "Could not parse forecast data" ||
+                result == "Could not extract forecast text";
+
+            if (marine_endpoint_unsupported) {
+                std::string fallback = marine_fallback_from_products(zone_code);
+                if (!fallback.empty()) {
+                    result = fallback;
+                } else if (result.empty() ||
+                           result == "Could not parse forecast data" ||
+                           result == "Could not extract forecast text" ||
+                           result.find("not yet supported by this API") != std::string::npos ||
+                           result.find("Marine Forecast Not Supported") != std::string::npos) {
+                    result = "Marine forecast unavailable for zone " + zone_code;
+                }
+            }
+            break;
+        }
+
+        default:
+            result = "Unknown weather type";
+            break;
+    }
+
+    return result;
+}
+
+void App::fetchWeatherAsync(uint8_t type, const std::string& query, const std::string& requester) {
+    // Remote queries end up in URLs and HTTP request lines.
+    if (query.empty() || query.size() > 64 || app_detail::containsControlChars(query)) {
+        appendSystemChat("Weather request from " + requester + " rejected: invalid query");
+        return;
+    }
+
+    auto worker = weather_worker_;
+    bool start_thread = false;
+    {
+        std::lock_guard<std::mutex> lock(worker->mutex);
+        // One request in flight (or queued) per requester, bounded overall.
+        const bool requester_busy =
+            worker->active_requester == requester ||
+            std::any_of(worker->queue.begin(), worker->queue.end(),
+                        [&](const WeatherJob& job) { return job.requester == requester; });
+        if (requester_busy || worker->queue.size() >= WeatherWorker::kMaxQueued) {
+            worker->rejected.push_back(requester);
+        } else {
+            WeatherJob job;
+            job.type = type;
+            job.query = query;
+            job.requester = requester;
+            worker->queue.push_back(std::move(job));
+            if (!worker->running) {
+                worker->running = true;
+                start_thread = true;
+            }
+        }
+    }
+
+    if (!start_thread) {
+        return;
+    }
+
+    // The thread owns a reference to the shared worker state, never to the
+    // App, so shutting down while a fetch is in flight is safe.
+    std::thread([worker]() {
+        for (;;) {
+            WeatherJob job;
+            {
+                std::lock_guard<std::mutex> lock(worker->mutex);
+                if (worker->queue.empty()) {
+                    worker->running = false;
+                    worker->active_requester.clear();
+                    return;
+                }
+                job = std::move(worker->queue.front());
+                worker->queue.pop_front();
+                worker->active_requester = job.requester;
+            }
+            job.result = fetchWeatherReport(job.type, job.query);
+            {
+                std::lock_guard<std::mutex> lock(worker->mutex);
+                worker->active_requester.clear();
+                worker->done.push_back(std::move(job));
             }
         }
     }).detach();
 }
 
-// Check for completed async weather fetch and send response
+// Deliver completed weather fetches to the station that asked for them.
 void App::processWeatherFetchResult() {
-    std::lock_guard<std::mutex> lock(weather_fetch_mutex_);
-
-    if (!pending_weather_fetch_ || !pending_weather_fetch_->complete) {
-        return;
+    std::vector<WeatherJob> done;
+    std::vector<std::string> rejected;
+    {
+        std::lock_guard<std::mutex> lock(weather_worker_->mutex);
+        done.swap(weather_worker_->done);
+        rejected.swap(weather_worker_->rejected);
     }
 
-    // Send the response
-    if (pending_weather_fetch_->success) {
-        sendWeatherResponse(pending_weather_fetch_->type,
-                           pending_weather_fetch_->query,
-                           pending_weather_fetch_->result);
-    } else {
-        sendWeatherResponse(pending_weather_fetch_->type,
-                           pending_weather_fetch_->query,
-                           "Weather data not available for " + pending_weather_fetch_->query);
+    for (const auto& requester : rejected) {
+        appendSystemChat("Weather request from " + requester + " dropped: a request is already pending");
     }
 
-    // Clear the pending fetch
-    pending_weather_fetch_.reset();
+    for (const auto& job : done) {
+        // The response goes over the link; only send it if the requester is
+        // still the station on the other end.
+        if (linkedPeerCallsign() != job.requester) {
+            appendSystemChat("Weather result for " + job.requester + " (" + job.query +
+                             ") discarded: station no longer linked");
+            continue;
+        }
+        if (!job.result.empty()) {
+            sendWeatherResponse(job.type, job.query, job.result);
+        } else {
+            sendWeatherResponse(job.type, job.query, "Weather data not available for " + job.query);
+        }
+    }
 }
 
 // ============================================================================

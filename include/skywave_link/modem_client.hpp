@@ -230,6 +230,9 @@ public:
     bool sendText(const std::string& text);
     std::optional<std::vector<uint8_t>> receiveData();
     int64_t millisSinceLastDataSend() const;
+    // Bytes accepted by sendData() but not yet written to the data socket
+    // (flushed by poll()). Messages are queued whole, never truncated.
+    size_t pendingDataBytes() const;
 
     // Query commands
     std::string getVersion();
@@ -303,6 +306,16 @@ private:
     uint32_t voice_tx_sequence_ = 0;
     uint64_t voice_tx_sample_counter_ = 0;
 
+    // Outbound data-port bytes the socket has not accepted yet. Always holds
+    // whole messages/frames (minus a written prefix), see sendData().
+    std::vector<uint8_t> data_tx_pending_;
+    mutable std::mutex data_tx_mutex_;
+    static constexpr size_t kMaxPendingDataBytes = 4u * 1024u * 1024u;
+    // Set while readDataSocket() runs so nested poll() calls from its
+    // callbacks do not re-enter it.
+    bool in_data_read_ = false;
+    static constexpr size_t kMaxQueuedResponses = 64;
+
     // Broadcast fragment chains, one per source of monitor evidence.
 
     // Response queue
@@ -330,6 +343,11 @@ private:
     std::optional<std::string> sendCommandForResponse(const std::string& cmd,
                                                       int timeout_ms = 500);
     void clearResponseQueue();
+    static bool responseMatchesVerb(const std::string& response, const std::string& verb);
+    void resetSessionStream();
+    void onLinkStateChanged(LinkState previous, LinkState next);
+    void flushPendingData();
+    bool flushPendingDataLocked();
     void processCommandResponse(const std::string& line);
     void handleMonitorLine(const std::string& body);
     void handleEventLine(const std::string& body);

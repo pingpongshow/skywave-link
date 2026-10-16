@@ -15,6 +15,11 @@ struct POP3RetrievedMessage {
     std::string subject;
     std::string body;
     std::string raw;  // Full raw message for debugging
+    // True when the message exceeded the size limit and the body is
+    // incomplete. Truncated messages are never DELE'd from the server
+    // (even with delete_after_fetch), so callers should not treat them as
+    // delivered (they will be fetched again on the next poll).
+    bool truncated = false;
 };
 
 // Configuration for POP3 fetch

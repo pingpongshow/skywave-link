@@ -297,14 +297,20 @@ bool ModemClient::connectSocket(socket_t& sock, const std::string& host, uint16_
         return false;
     }
 
-    sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-    if (sock == INVALID_SOCK) {
-        freeaddrinfo(result);
-        return false;
-    }
-
-    if (::connect(sock, result->ai_addr, static_cast<int>(result->ai_addrlen)) != 0) {
+    // Try every resolved address: "localhost" typically yields ::1 first,
+    // while the modem may listen on 127.0.0.1 only.
+    sock = INVALID_SOCK;
+    for (struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+        sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (sock == INVALID_SOCK) {
+            continue;
+        }
+        if (::connect(sock, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
+            break;
+        }
         closeSocket(sock);
+    }
+    if (sock == INVALID_SOCK) {
         freeaddrinfo(result);
         return false;
     }
@@ -371,6 +377,10 @@ bool ModemClient::connect(const std::string& host,
     cmd_buffer_.clear();
     data_buffer_.clear();
     session_rx_.clear();
+    {
+        std::lock_guard<std::mutex> lock(data_tx_mutex_);
+        data_tx_pending_.clear();
+    }
     voice_buffer_.clear();
     {
         std::lock_guard<std::mutex> lock(voice_mutex_);
@@ -427,6 +437,10 @@ void ModemClient::disconnect() {
     cmd_buffer_.clear();
     data_buffer_.clear();
     session_rx_.clear();
+    {
+        std::lock_guard<std::mutex> lock(data_tx_mutex_);
+        data_tx_pending_.clear();
+    }
     voice_buffer_.clear();
     {
         std::lock_guard<std::mutex> lock(voice_mutex_);
@@ -453,9 +467,22 @@ bool ModemClient::hasVoiceMedia() const {
 void ModemClient::poll() {
     if (!isConnected()) return;
 
+    flushPendingData();
+    if (!isConnected()) return;
     readCommandSocket();
-    readDataSocket();
-    if (voice_socket_ != INVALID_SOCK) readVoiceSocket();
+    if (!isConnected()) return;
+    // Callbacks fired from readDataSocket() may re-enter poll() (e.g. via
+    // getResponse()); a nested data read is skipped, and the bytes stay in
+    // the socket for the next poll.
+    if (!in_data_read_) {
+        struct Guard {
+            bool& flag;
+            explicit Guard(bool& f) : flag(f) { flag = true; }
+            ~Guard() { flag = false; }
+        } guard(in_data_read_);
+        readDataSocket();
+    }
+    if (isConnected() && voice_socket_ != INVALID_SOCK) readVoiceSocket();
 }
 
 void ModemClient::readCommandSocket() {
@@ -550,6 +577,11 @@ void ModemClient::readDataSocket() {
         connected_session = (status_.link_state == LinkState::Connected);
     }
 
+    // Everything is parsed into locals and the consumed bytes erased BEFORE
+    // any callback runs: callbacks may re-enter poll()/disconnect() and must
+    // never observe (or mutate) buffers we are still indexing into.
+    std::vector<std::vector<uint8_t>> records;
+    std::vector<std::vector<uint8_t>> messages;
     std::vector<uint8_t> payload;
     while (!data_buffer_.empty()) {
         if (connected_session || data_buffer_.front() != kMonitorRecordTag) {
@@ -577,7 +609,7 @@ void ModemClient::readDataSocket() {
                                     data_buffer_.begin() + static_cast<std::ptrdiff_t>(record_len));
         data_buffer_.erase(data_buffer_.begin(),
                            data_buffer_.begin() + static_cast<std::ptrdiff_t>(record_len));
-        handleMonitorRecord(record);
+        records.push_back(std::move(record));
     }
 
     // A stalled partial record must not pin memory forever if the modem and
@@ -593,30 +625,38 @@ void ModemClient::readDataSocket() {
     const bool framed_start = payload.size() >= 2 && payload[0] == kSessionMagic0 &&
                               payload[1] == kSessionMagic1;
     if (!connected_session && session_rx_.empty() && !framed_start) {
-        if (!payload.empty() && data_callback_) {
-            data_callback_(payload);
+        if (!payload.empty()) {
+            messages.push_back(std::move(payload));
         }
-        return;
+    } else {
+        session_rx_.insert(session_rx_.end(), payload.begin(), payload.end());
+        size_t pos = 0;
+        while (session_rx_.size() - pos >= kSessionHeaderLen) {
+            if (session_rx_[pos] != kSessionMagic0 || session_rx_[pos + 1] != kSessionMagic1) {
+                ++pos;  // resynchronize on the next header
+                continue;
+            }
+            const size_t len = loadU16Be(session_rx_.data() + pos + 2);
+            if (session_rx_.size() - pos < kSessionHeaderLen + len) break;  // need more
+            std::vector<uint8_t> message(
+                session_rx_.begin() + static_cast<std::ptrdiff_t>(pos + kSessionHeaderLen),
+                session_rx_.begin() + static_cast<std::ptrdiff_t>(pos + kSessionHeaderLen + len));
+            pos += kSessionHeaderLen + len;
+            if (!message.empty()) {
+                messages.push_back(std::move(message));
+            }
+        }
+        session_rx_.erase(session_rx_.begin(), session_rx_.begin() + static_cast<std::ptrdiff_t>(pos));
     }
 
-    session_rx_.insert(session_rx_.end(), payload.begin(), payload.end());
-    size_t pos = 0;
-    while (session_rx_.size() - pos >= kSessionHeaderLen) {
-        if (session_rx_[pos] != kSessionMagic0 || session_rx_[pos + 1] != kSessionMagic1) {
-            ++pos;  // resynchronize on the next header
-            continue;
-        }
-        const size_t len = loadU16Be(session_rx_.data() + pos + 2);
-        if (session_rx_.size() - pos < kSessionHeaderLen + len) break;  // need more
-        std::vector<uint8_t> message(
-            session_rx_.begin() + static_cast<std::ptrdiff_t>(pos + kSessionHeaderLen),
-            session_rx_.begin() + static_cast<std::ptrdiff_t>(pos + kSessionHeaderLen + len));
-        pos += kSessionHeaderLen + len;
-        if (!message.empty() && data_callback_) {
+    for (const auto& record : records) {
+        handleMonitorRecord(record);
+    }
+    if (data_callback_) {
+        for (const auto& message : messages) {
             data_callback_(message);
         }
     }
-    session_rx_.erase(session_rx_.begin(), session_rx_.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
 void ModemClient::handleMonitorRecord(const std::vector<uint8_t>& record) {
@@ -764,8 +804,10 @@ void ModemClient::applyStatusLine(const std::string& fields) {
         snapshot.remote_callsign.clear();
     }
 
+    LinkState previous;
     {
         std::lock_guard<std::mutex> lock(status_mutex_);
+        previous = status_.link_state;
         // Preserve the transport-level connection state; STATUS only
         // describes the radio session.
         snapshot.state = status_.state;
@@ -773,6 +815,7 @@ void ModemClient::applyStatusLine(const std::string& fields) {
         snapshot.ptt_active = status_.ptt_active;
         status_ = snapshot;
     }
+    onLinkStateChanged(previous, snapshot.link_state);
 
     // The modem emits no periodic SNR notification, so STATUS polling is
     // where link quality changes surface.
@@ -858,14 +901,19 @@ void ModemClient::handleEventLine(const std::string& body) {
 
     if (name == "STATE") {
         const std::string state = upperCopy(args);
+        LinkState previous;
+        LinkState next;
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
+            previous = status_.link_state;
             status_.link_state = mapStateToLinkState(state);
+            next = status_.link_state;
             status_.listening = (state == "LISTENING");
             if (status_.link_state == LinkState::Idle) {
                 status_.remote_callsign.clear();
             }
         }
+        onLinkStateChanged(previous, next);
         if (state_callback_) state_callback_(state);
     } else if (name == "CONNECTED") {
         // EVT:CONNECTED <remote_call> <family> <initial_mode>
@@ -889,6 +937,7 @@ void ModemClient::handleEventLine(const std::string& body) {
             status_.link_state = LinkState::Idle;
             status_.remote_callsign.clear();
         }
+        resetSessionStream();
         if (disconnected_callback_) disconnected_callback_();
     } else if (name == "MODE") {
         // EVT:MODE <Mx> <net_bps>
@@ -1026,19 +1075,46 @@ void ModemClient::processCommandResponse(const std::string& line) {
         applyStatusLine(line.substr(7));
     } else if (startsWith(line, "STATE ")) {
         const std::string state = upperCopy(trimCopy(line.substr(6)));
+        LinkState previous;
+        LinkState next;
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
+            previous = status_.link_state;
             status_.link_state = mapStateToLinkState(state);
+            next = status_.link_state;
             status_.listening = (state == "LISTENING");
             if (status_.link_state == LinkState::Idle) {
                 status_.remote_callsign.clear();
             }
         }
+        onLinkStateChanged(previous, next);
         if (state_callback_) state_callback_(state);
     }
 
     std::lock_guard<std::mutex> lock(response_mutex_);
     response_queue_.push(line);
+    // Fire-and-forget commands (sendCommand without getResponse) leave
+    // their answers here; bound the queue so it cannot grow forever.
+    while (response_queue_.size() > kMaxQueuedResponses) {
+        response_queue_.pop();
+    }
+}
+
+// A radio session ended: its partial de-framing state must not leak into
+// the next session (or swallow unconnected payloads), and bytes still
+// waiting to be written for it are no longer deliverable.
+void ModemClient::resetSessionStream() {
+    session_rx_.clear();
+    std::lock_guard<std::mutex> lock(data_tx_mutex_);
+    data_tx_pending_.clear();
+}
+
+void ModemClient::onLinkStateChanged(LinkState previous, LinkState next) {
+    if (previous == next) return;
+    if ((previous == LinkState::Connected || previous == LinkState::Disconnecting) &&
+        next != LinkState::Connected && next != LinkState::Disconnecting) {
+        resetSessionStream();
+    }
 }
 
 bool ModemClient::sendCommand(const std::string& cmd) {
@@ -1067,12 +1143,44 @@ bool ModemClient::sendCommandOk(const std::string& cmd, int timeout_ms) {
     return true;
 }
 
+// Responses carry no id, so correlation is by position plus verb: stale
+// answers (to fire-and-forget commands or an earlier command that timed out)
+// are dropped before sending, and any line that arrives while waiting is
+// accepted only if it echoes this command's verb or is an ERROR:.
 std::optional<std::string> ModemClient::sendCommandForResponse(const std::string& cmd,
                                                                int timeout_ms) {
+    const std::string trimmed = trimCopy(cmd);
+    const std::string verb = upperCopy(trimmed.substr(0, trimmed.find(' ')));
+
+    clearResponseQueue();
     if (!sendCommand(cmd)) {
         return std::nullopt;
     }
-    return getResponse(timeout_ms);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        const int remaining = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+        if (remaining <= 0) {
+            return std::nullopt;
+        }
+        auto response = getResponse(remaining);
+        if (!response) {
+            return std::nullopt;
+        }
+        if (responseMatchesVerb(*response, verb)) {
+            return response;
+        }
+        // Late answer to some other command: discard and keep waiting.
+    }
+}
+
+bool ModemClient::responseMatchesVerb(const std::string& response, const std::string& verb) {
+    if (startsWith(response, "ERROR:")) return true;
+    const std::string first = upperCopy(response.substr(0, response.find(' ')));
+    return first == verb;
 }
 
 std::optional<std::string> ModemClient::getResponse(int timeout_ms) {
@@ -1219,56 +1327,87 @@ bool ModemClient::sendData(const std::vector<uint8_t>& message) {
     }
     const std::vector<uint8_t>& data = connected_session ? framed : message;
 
+    // A message is either written whole or queued whole: whatever the
+    // socket does not take now stays in data_tx_pending_ and is flushed by
+    // poll(), so a frame is never cut short on the wire (which would desync
+    // the peer's de-framer).
     bool ok = false;
-    size_t total_sent = 0;
-    int would_block_retries = 0;
-    constexpr int kMaxWouldBlockRetries = 200;  // ~200 ms max wait
-
-    while (total_sent < data.size()) {
-#ifdef _WIN32
-        int sent = send(data_socket_,
-                        reinterpret_cast<const char*>(data.data() + total_sent),
-                        static_cast<int>(data.size() - total_sent), 0);
-        if (sent > 0) {
-            total_sent += static_cast<size_t>(sent);
-            would_block_retries = 0;
-            continue;
+    {
+        std::lock_guard<std::mutex> lock(data_tx_mutex_);
+        if (data_tx_pending_.size() + data.size() > kMaxPendingDataBytes) {
+            std::cerr << "[ModemClient] data send backlog full ("
+                      << data_tx_pending_.size() << " bytes); dropping message\n";
+            return false;
         }
-        int err = WSAGetLastError();
-        if (sent < 0 && err == WSAEWOULDBLOCK) {
-            if (++would_block_retries > kMaxWouldBlockRetries) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        break;
-#else
-        ssize_t sent = send(data_socket_, data.data() + total_sent, data.size() - total_sent, 0);
-        if (sent > 0) {
-            total_sent += static_cast<size_t>(sent);
-            would_block_retries = 0;
-            continue;
-        }
-        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (++would_block_retries > kMaxWouldBlockRetries) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        break;
-#endif
+        data_tx_pending_.insert(data_tx_pending_.end(), data.begin(), data.end());
+        ok = flushPendingDataLocked();
+    }
+    if (!ok) {
+        disconnect();
+        return false;
     }
 
-    ok = (total_sent == data.size());
-
-    if (ok) {
+    {
         auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         last_data_send_ms_.store(static_cast<int64_t>(now_ms), std::memory_order_relaxed);
     }
 
+    return ok;
+}
+
+void ModemClient::flushPendingData() {
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lock(data_tx_mutex_);
+        ok = flushPendingDataLocked();
+    }
+    if (!ok) disconnect();
+}
+
+size_t ModemClient::pendingDataBytes() const {
+    std::lock_guard<std::mutex> lock(data_tx_mutex_);
+    return data_tx_pending_.size();
+}
+
+// Writes as much of data_tx_pending_ as the socket accepts without blocking.
+// Returns false only on a hard socket error.
+bool ModemClient::flushPendingDataLocked() {
+    size_t total_sent = 0;
+    bool ok = true;
+    while (total_sent < data_tx_pending_.size()) {
+#ifdef _WIN32
+        int sent = send(data_socket_,
+                        reinterpret_cast<const char*>(data_tx_pending_.data() + total_sent),
+                        static_cast<int>(data_tx_pending_.size() - total_sent), 0);
+        if (sent > 0) {
+            total_sent += static_cast<size_t>(sent);
+            continue;
+        }
+        if (sent < 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
+            break;  // socket full: keep the rest for the next poll()
+        }
+        ok = false;
+        break;
+#else
+        ssize_t sent = send(data_socket_, data_tx_pending_.data() + total_sent,
+                            data_tx_pending_.size() - total_sent, 0);
+        if (sent > 0) {
+            total_sent += static_cast<size_t>(sent);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;  // socket full: keep the rest for the next poll()
+        }
+        ok = false;
+        break;
+#endif
+    }
+    data_tx_pending_.erase(data_tx_pending_.begin(),
+                           data_tx_pending_.begin() + static_cast<std::ptrdiff_t>(total_sent));
     return ok;
 }
 

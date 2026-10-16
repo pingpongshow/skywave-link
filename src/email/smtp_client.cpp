@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 #include <ctime>
+#include <cctype>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -117,13 +118,20 @@ public:
 #endif
     }
 
-    bool connect(const std::string& host, uint16_t port = 587, bool use_tls = true) {
+    // TLS policy:
+    //   port 465 + use_tls  -> implicit TLS (handshake before the greeting)
+    //   other port + use_tls -> STARTTLS is mandatory; fail closed (never fall
+    //                          back to cleartext) if the server lacks it
+    //   use_tls == false     -> plain connection
+    bool connect(const std::string& host, uint16_t port, bool use_tls,
+                 int timeout_sec, std::string* error) {
         struct addrinfo hints{}, *result = nullptr;
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
 
         std::string port_str = std::to_string(port);
         if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result) != 0) {
+            if (error) *error = "DNS resolution failed for " + host;
             return false;
         }
 
@@ -146,23 +154,55 @@ public:
         }
         freeaddrinfo(result);
         if (!connected) {
+            if (error) *error = "Failed to connect to " + host + ":" + port_str;
             return false;
+        }
+
+        // Socket timeouts so a stalled server cannot hang the caller forever.
+        // They also bound the TLS handshake and every SSL_read/SSL_write,
+        // since OpenSSL runs over this blocking socket.
+        if (timeout_sec <= 0) timeout_sec = 30;
+#ifdef _WIN32
+        DWORD timeout_ms = static_cast<DWORD>(timeout_sec) * 1000;
+        if (setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms)) != 0 ||
+            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms)) != 0) {
+#else
+        struct timeval tv;
+        tv.tv_sec = timeout_sec;
+        tv.tv_usec = 0;
+        if (setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
+            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
+#endif
+            if (error) *error = "Failed to set socket timeouts";
+            disconnect();
+            return false;
+        }
+
+        connected_host_ = host;
+        use_tls_ = use_tls;
+
+        // Implicit TLS (SMTPS) on port 465: handshake before the greeting.
+        if (use_tls && port == 465) {
+            if (!tlsHandshake()) {
+                if (error) *error = "TLS handshake failed";
+                disconnect();
+                return false;
+            }
         }
 
         // Read server greeting
         std::string response = readLine();
         if (response.substr(0, 3) != "220") {
+            if (error) *error = "SMTP server rejected connection: " + response;
             disconnect();
             return false;
         }
 
         connected_ = true;
-        connected_host_ = host;
-        use_tls_ = use_tls;
 
-        // If using TLS on submission port, upgrade connection
-        if (use_tls && port == 587) {
-            if (!startTLS()) {
+        // Any other port with TLS requested: STARTTLS is mandatory.
+        if (use_tls && !tls_active_) {
+            if (!startTLS(error)) {
                 disconnect();
                 return false;
             }
@@ -192,28 +232,54 @@ public:
         connected_host_.clear();
     }
 
-    bool startTLS() {
+    bool startTLS(std::string* error) {
 #ifdef SKYWAVE_LINK_HAS_OPENSSL
         // Send EHLO first
         if (!sendLine("EHLO localhost")) return false;
         std::string response = readLine();
         if (response.substr(0, 3) != "250") {
+            if (error) *error = "EHLO rejected: " + response;
             return false;
         }
 
-        // Skip multiline response
-        while (response.length() >= 4 && response[3] == '-') {
+        // Read the multiline capability list, noting STARTTLS support
+        bool has_starttls = false;
+        while (true) {
+            std::string cap = response.size() > 4 ? response.substr(4) : "";
+            for (auto& ch : cap) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (cap.rfind("STARTTLS", 0) == 0) has_starttls = true;
+            if (!(response.length() >= 4 && response[3] == '-')) break;
             response = readLine();
+            if (response.substr(0, 3) != "250") break;
+        }
+        if (!has_starttls) {
+            // Fail closed: never continue (and send AUTH) in cleartext.
+            if (error) *error = "TLS requested but server does not offer STARTTLS";
+            return false;
         }
 
         // Send STARTTLS
         if (!sendLine("STARTTLS")) return false;
         response = readLine();
         if (response.substr(0, 3) != "220") {
+            if (error) *error = "STARTTLS rejected: " + response;
             return false;
         }
 
-        // Upgrade to TLS
+        if (!tlsHandshake()) {
+            if (error) *error = "TLS handshake failed";
+            return false;
+        }
+        return true;
+#else
+        std::cerr << "[SMTP] TLS not available - OpenSSL not compiled in\n";
+        if (error) *error = "TLS not available - OpenSSL not compiled in";
+        return false;
+#endif
+    }
+
+    bool tlsHandshake() {
+#ifdef SKYWAVE_LINK_HAS_OPENSSL
         if (!ssl_ctx_) return false;
 
         ssl_ = SSL_new(ssl_ctx_);
@@ -253,13 +319,14 @@ public:
         tls_active_ = true;
         return true;
 #else
-        std::cerr << "[SMTP] TLS not available - OpenSSL not compiled in\n";
         return false;
 #endif
     }
 
     bool authenticate(const std::string& username, const std::string& password) {
         if (!connected_) return false;
+        // Never send credentials in cleartext when TLS was requested.
+        if (use_tls_ && !tls_active_) return false;
 
         // Send EHLO (again after TLS)
         if (!sendLine("EHLO localhost")) return false;
@@ -298,8 +365,23 @@ public:
         return true;
     }
 
+    // Servers that relay without credentials (a LAN smarthost): EHLO
+    // only. send() used to demand authenticate(), so such a server could
+    // never be used.
+    bool greet() {
+        if (!connected_) return false;
+        if (!sendLine("EHLO localhost")) return false;
+        std::string response = readLine();
+        if (response.substr(0, 3) != "250") return false;
+        while (response.length() >= 4 && response[3] == '-') {
+            response = readLine();
+        }
+        greeted_ = true;
+        return true;
+    }
+
     bool send(const EmailMessage& message) {
-        if (!connected_ || !authenticated_) {
+        if (!connected_ || !(authenticated_ || greeted_)) {
             return false;
         }
 
@@ -399,6 +481,7 @@ private:
     socket_t socket_ = INVALID_SOCK;
     bool connected_ = false;
     bool authenticated_ = false;
+    bool greeted_ = false;
     bool use_tls_ = true;
     bool tls_active_ = false;
     std::string connected_host_;
@@ -491,8 +574,12 @@ bool sendSMTPDelivery(const SMTPDeliveryRequest& req, std::string* error) {
     }
 
     SMTPClient client;
-    if (!client.connect(req.host, req.port, req.use_tls)) {
-        if (error) *error = "Failed to connect to SMTP server";
+    std::string connect_error;
+    if (!client.connect(req.host, req.port, req.use_tls, req.timeout_sec, &connect_error)) {
+        if (error) {
+            *error = "Failed to connect to SMTP server";
+            if (!connect_error.empty()) *error += ": " + connect_error;
+        }
         return false;
     }
 
@@ -502,6 +589,10 @@ bool sendSMTPDelivery(const SMTPDeliveryRequest& req, std::string* error) {
             client.disconnect();
             return false;
         }
+    } else if (!client.greet()) {
+        if (error) *error = "SMTP server rejected EHLO";
+        client.disconnect();
+        return false;
     }
 
     EmailMessage msg;

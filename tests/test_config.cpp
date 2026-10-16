@@ -254,6 +254,26 @@ TEST(config_all_sections_roundtrip) {
     PASS();
 }
 
+// [bbs] is persisted: serving BBS files is gated on bbs.enabled, which
+// used to be neither loaded nor saved.
+TEST(config_bbs_section_roundtrip) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    cfg.bbs.enabled = true;
+    cfg.bbs.bbs_path = "/tmp/my bbs";
+    cfg.bbs.allow_uploads = true;
+    cfg.bbs.max_upload_size = 12345;
+    ASSERT_TRUE(cfg.save(path));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_TRUE(loaded.bbs.enabled);
+    ASSERT_EQ(loaded.bbs.bbs_path, std::string("/tmp/my bbs"));
+    ASSERT_TRUE(loaded.bbs.allow_uploads);
+    ASSERT_EQ(loaded.bbs.max_upload_size, size_t(12345));
+    std::remove(path.c_str());
+}
+
 TEST(config_partial_load) {
     std::string path = temp_path();
 

@@ -3,6 +3,17 @@
 #include "test_macros.hpp"
 #include "skywave_link/pop3_client.hpp"
 
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+#endif
+
 using namespace skylink;
 
 TEST(parse_simple_message) {
@@ -198,5 +209,157 @@ TEST(fetch_empty_host_fails) {
     ASSERT_TRUE(result.error.find("not configured") != std::string::npos);
     PASS();
 }
+
+#ifndef _WIN32
+// ---------------------------------------------------------------------------
+// Fake POP3 server (plain TCP on loopback) for end-to-end fetch tests.
+// The handler receives each command line and returns what to send back; an
+// empty "close" reply closes the connection.
+namespace {
+
+struct FakePop3 {
+    int listen_fd = -1;
+    uint16_t port = 0;
+    std::thread th;
+    std::vector<std::string> commands;  // commands seen (after the session)
+
+    // big_body: size in bytes of message 2 (0 -> normal); close_mid_retr2:
+    // server drops the connection in the middle of RETR 2.
+    bool start(bool close_mid_retr2, size_t big_body) {
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) return false;
+        int one = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
+        if (listen(listen_fd, 1) != 0) return false;
+        socklen_t len = sizeof(addr);
+        getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
+        port = ntohs(addr.sin_port);
+        th = std::thread([this, close_mid_retr2, big_body]() {
+            int fd = accept(listen_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            auto sendAll = [fd](const std::string& s) {
+                size_t off = 0;
+                while (off < s.size()) {
+                    ssize_t n = send(fd, s.data() + off, s.size() - off, 0);
+                    if (n <= 0) return;
+                    off += static_cast<size_t>(n);
+                }
+            };
+            sendAll("+OK ready\r\n");
+            std::string buf;
+            char ch;
+            while (recv(fd, &ch, 1, 0) == 1) {
+                if (ch != '\n') { buf += ch; continue; }
+                if (!buf.empty() && buf.back() == '\r') buf.pop_back();
+                std::string cmd = buf;
+                buf.clear();
+                commands.push_back(cmd);
+                if (cmd.rfind("USER", 0) == 0 || cmd.rfind("PASS", 0) == 0) {
+                    sendAll("+OK\r\n");
+                } else if (cmd == "STAT") {
+                    sendAll("+OK 3 300\r\n");
+                } else if (cmd == "RETR 1" || cmd == "RETR 3") {
+                    sendAll("+OK\r\nFrom: a@b\r\nSubject: one\r\n\r\nbody\r\n.\r\n");
+                } else if (cmd == "RETR 2") {
+                    if (close_mid_retr2) {
+                        sendAll("+OK\r\nFrom: a@b\r\nSubject: two\r\n\r\npartial bo");
+                        break;  // drop the connection mid-message
+                    }
+                    std::string msg = "+OK\r\nFrom: a@b\r\nSubject: big\r\n\r\n";
+                    std::string line(1000, 'x');
+                    for (size_t n = 0; n < big_body; n += line.size() + 2) {
+                        msg += line + "\r\n";
+                    }
+                    msg += ".\r\n";
+                    sendAll(msg);
+                } else if (cmd.rfind("DELE", 0) == 0) {
+                    sendAll("+OK\r\n");
+                } else if (cmd == "QUIT") {
+                    sendAll("+OK bye\r\n");
+                    break;
+                } else {
+                    sendAll("-ERR\r\n");
+                }
+            }
+            close(fd);
+        });
+        return true;
+    }
+
+    void finish() {
+        if (th.joinable()) th.join();
+        if (listen_fd >= 0) close(listen_fd);
+        listen_fd = -1;
+    }
+
+    bool saw(const std::string& cmd) const {
+        for (const auto& c : commands) if (c == cmd) return true;
+        return false;
+    }
+};
+
+POP3FetchRequest localRequest(uint16_t port) {
+    POP3FetchRequest req;
+    req.host = "127.0.0.1";
+    req.port = port;
+    req.use_tls = false;
+    req.username = "u";
+    req.password = "p";
+    req.delete_after_fetch = true;
+    req.max_messages = 10;
+    return req;
+}
+
+} // namespace
+
+TEST(fetch_server_close_mid_retr_terminates_and_skips_dele) {
+    FakePop3 srv;
+    ASSERT_TRUE(srv.start(/*close_mid_retr2=*/true, 0));
+    std::atomic<bool> done{false};
+    POP3FetchResult result;
+    std::thread worker([&]() {
+        result = fetchPOP3Messages(localRequest(srv.port));
+        done = true;
+    });
+    for (int i = 0; i < 100 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!done) {
+        // Would spin forever before the fix; fail loudly rather than hang.
+        std::cerr << "  FAIL fetch did not terminate after server EOF\n";
+        std::_Exit(1);
+    }
+    worker.join();
+    srv.finish();
+    ASSERT_EQ(result.messages.size(), size_t(1));
+    ASSERT_EQ(result.messages[0].subject, std::string("one"));
+    ASSERT_FALSE(result.messages[0].truncated);
+    ASSERT_TRUE(srv.saw("DELE 1"));
+    ASSERT_FALSE(srv.saw("DELE 2"));
+    ASSERT_FALSE(srv.saw("RETR 3"));
+    ASSERT_CONTAINS(result.error, "msg 2");
+    PASS();
+}
+
+TEST(fetch_oversized_message_not_deleted) {
+    FakePop3 srv;
+    ASSERT_TRUE(srv.start(false, 1100 * 1024));  // > 1 MB cap
+    auto result = fetchPOP3Messages(localRequest(srv.port));
+    srv.finish();
+    ASSERT_EQ(result.messages.size(), size_t(3));
+    ASSERT_FALSE(result.messages[0].truncated);
+    ASSERT_TRUE(result.messages[1].truncated);
+    ASSERT_FALSE(result.messages[2].truncated);
+    ASSERT_TRUE(srv.saw("DELE 1"));
+    ASSERT_FALSE(srv.saw("DELE 2"));
+    ASSERT_TRUE(srv.saw("DELE 3"));  // protocol stayed in sync after the cap
+    PASS();
+}
+#endif
 
 TEST_MAIN()

@@ -116,6 +116,12 @@ public:
     static std::string formatLongitude(double lon);  // DDDMM.hhW
     static std::string formatPosition(const APRSPosition& pos);
 
+    // Input hardening (exposed for testing). Text from radio packets must go
+    // through sanitizeText before reaching the APRS-IS line protocol.
+    static std::string sanitizeText(const std::string& text);  // strips CR/LF/control chars
+    static bool isValidCallsign(const std::string& callsign);   // [A-Za-z0-9-]{1,9}
+    static bool isValidCoordinate(double lat, double lon);      // finite, in range
+
 private:
     // Socket handle
 #ifdef _WIN32

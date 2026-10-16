@@ -53,6 +53,7 @@ struct RelayStats {
     uint64_t packets_dropped_loop = 0;
     uint64_t packets_dropped_dedup = 0;
     uint64_t packets_dropped_queue_full = 0;  // #8: new counter
+    uint64_t packets_dropped_nested = 0;      // payload was itself a relay packet
 };
 
 class MeshRelay {

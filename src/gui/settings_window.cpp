@@ -915,8 +915,22 @@ void SettingsWindow::render() {
                 config_.aprs.enabled = aprs_enabled;
             }
 
+            // Apply-gated fields keep their edits across frames; they are
+            // reloaded from config only when config itself changes (load,
+            // Apply), the same pattern as the Files tab's download path.
             static char server[256] = "";
-            std::strncpy(server, config_.aprs.server.c_str(), sizeof(server) - 1);
+            static int beacon_interval = 0;
+            static std::string aprs_loaded_key;
+            {
+                const std::string key = config_.aprs.server + '\x1f' +
+                                        std::to_string(config_.aprs.beacon_interval_sec);
+                if (key != aprs_loaded_key) {
+                    std::strncpy(server, config_.aprs.server.c_str(), sizeof(server) - 1);
+                    server[sizeof(server) - 1] = '\0';
+                    beacon_interval = config_.aprs.beacon_interval_sec;
+                    aprs_loaded_key = key;
+                }
+            }
             ImGui::InputText("Server", server, sizeof(server));
 
             // Auto-generated passcode from callsign (APRS-IS standard hash)
@@ -929,7 +943,6 @@ void SettingsWindow::render() {
                                    "Passcode: set callsign first");
             }
 
-            int beacon_interval = config_.aprs.beacon_interval_sec;
             ImGui::InputInt("Beacon Interval (sec)", &beacon_interval);
 
             ImGui::Separator();
@@ -1029,15 +1042,76 @@ void SettingsWindow::render() {
         }
 
         if (ImGui::BeginTabItem("Email")) {
-            static char smtp_host[256] = "";
-            std::strncpy(smtp_host, config_.email.smtp_host.c_str(), sizeof(smtp_host) - 1);
+            // Working copies of the Apply-gated fields. They persist across
+            // frames and are reloaded from config only when config changes
+            // (load or Apply), so edits are not reverted every frame.
+            struct EmailEdit {
+                char smtp_host[256] = "";
+                int smtp_port = 0;
+                char smtp_user[128] = "";
+                char winlink_host[256] = "";
+                int winlink_port = 0;
+                char winlink_call[32] = "";
+                int sf_ttl = 0;
+                int sf_hop_limit = 0;
+                int sf_dedup_window = 0;
+                int pop3_poll_interval_sec = 0;
+                int pop3_max_messages = 0;
+                int winlink_fetch_interval_sec = 0;
+                int winlink_fetch_max_messages = 0;
+            };
+            static EmailEdit email_edit;
+            static std::string email_loaded_key;
+            {
+                const auto& e = config_.email;
+                const char sep = '\x1f';
+                const std::string key =
+                    e.smtp_host + sep + std::to_string(e.smtp_port) + sep + e.smtp_username + sep +
+                    e.winlink_telnet_host + sep + std::to_string(e.winlink_telnet_port) + sep +
+                    e.winlink_telnet_callsign + sep + std::to_string(e.hf_store_forward_ttl) + sep +
+                    std::to_string(e.hf_store_forward_hop_limit) + sep +
+                    std::to_string(e.hf_store_forward_dedup_window_sec) + sep +
+                    std::to_string(e.pop3_poll_interval_sec) + sep +
+                    std::to_string(e.pop3_max_messages) + sep +
+                    std::to_string(e.winlink_fetch_interval_sec) + sep +
+                    std::to_string(e.winlink_fetch_max_messages);
+                if (key != email_loaded_key) {
+                    auto copyField = [](char* dst, size_t size, const std::string& src) {
+                        std::strncpy(dst, src.c_str(), size - 1);
+                        dst[size - 1] = '\0';
+                    };
+                    copyField(email_edit.smtp_host, sizeof(email_edit.smtp_host), e.smtp_host);
+                    email_edit.smtp_port = e.smtp_port;
+                    copyField(email_edit.smtp_user, sizeof(email_edit.smtp_user), e.smtp_username);
+                    copyField(email_edit.winlink_host, sizeof(email_edit.winlink_host), e.winlink_telnet_host);
+                    email_edit.winlink_port = e.winlink_telnet_port;
+                    copyField(email_edit.winlink_call, sizeof(email_edit.winlink_call), e.winlink_telnet_callsign);
+                    email_edit.sf_ttl = e.hf_store_forward_ttl;
+                    email_edit.sf_hop_limit = e.hf_store_forward_hop_limit;
+                    email_edit.sf_dedup_window = e.hf_store_forward_dedup_window_sec;
+                    email_edit.pop3_poll_interval_sec = e.pop3_poll_interval_sec;
+                    email_edit.pop3_max_messages = e.pop3_max_messages;
+                    email_edit.winlink_fetch_interval_sec = e.winlink_fetch_interval_sec;
+                    email_edit.winlink_fetch_max_messages = e.winlink_fetch_max_messages;
+                    email_loaded_key = key;
+                }
+            }
+            auto& smtp_host = email_edit.smtp_host;
+            int& smtp_port = email_edit.smtp_port;
+            auto& smtp_user = email_edit.smtp_user;
+            auto& winlink_host = email_edit.winlink_host;
+            int& winlink_port = email_edit.winlink_port;
+            auto& winlink_call = email_edit.winlink_call;
+            int& sf_ttl = email_edit.sf_ttl;
+            int& sf_hop_limit = email_edit.sf_hop_limit;
+            int& sf_dedup_window = email_edit.sf_dedup_window;
+            int& pop3_poll_interval_sec = email_edit.pop3_poll_interval_sec;
+            int& pop3_max_messages = email_edit.pop3_max_messages;
+            int& winlink_fetch_interval_sec = email_edit.winlink_fetch_interval_sec;
+            int& winlink_fetch_max_messages = email_edit.winlink_fetch_max_messages;
+
             ImGui::InputText("SMTP Host", smtp_host, sizeof(smtp_host));
-
-            int smtp_port = config_.email.smtp_port;
             ImGui::InputInt("SMTP Port", &smtp_port);
-
-            static char smtp_user[128] = "";
-            std::strncpy(smtp_user, config_.email.smtp_username.c_str(), sizeof(smtp_user) - 1);
             ImGui::InputText("SMTP Username", smtp_user, sizeof(smtp_user));
 
             static char smtp_pass[128] = "";
@@ -1054,15 +1128,8 @@ void SettingsWindow::render() {
             }
 
             if (!winlink_telnet_enabled) ImGui::BeginDisabled();
-            static char winlink_host[256] = "";
-            std::strncpy(winlink_host, config_.email.winlink_telnet_host.c_str(), sizeof(winlink_host) - 1);
             ImGui::InputText("Winlink Host", winlink_host, sizeof(winlink_host));
-
-            int winlink_port = config_.email.winlink_telnet_port;
             ImGui::InputInt("Winlink Port", &winlink_port);
-
-            static char winlink_call[32] = "";
-            std::strncpy(winlink_call, config_.email.winlink_telnet_callsign.c_str(), sizeof(winlink_call) - 1);
             ImGui::InputText("Winlink Callsign", winlink_call, sizeof(winlink_call));
 
             static char winlink_pass[128] = "";
@@ -1113,22 +1180,15 @@ void SettingsWindow::render() {
             if (ImGui::Checkbox("Enable HF mesh forwarding", &sf_enabled)) {
                 config_.email.hf_store_forward_enabled = sf_enabled;
             }
-            int sf_ttl = config_.email.hf_store_forward_ttl;
             ImGui::InputInt("Relay TTL", &sf_ttl);
-            int sf_hop_limit = config_.email.hf_store_forward_hop_limit;
             ImGui::InputInt("Relay Hop Limit", &sf_hop_limit);
-            int sf_dedup_window = config_.email.hf_store_forward_dedup_window_sec;
             ImGui::InputInt("Relay Dedup Window (sec)", &sf_dedup_window);
 
             ImGui::Separator();
             ImGui::Text("Inbound Polling");
-            int pop3_poll_interval_sec = config_.email.pop3_poll_interval_sec;
             ImGui::InputInt("POP3 Poll Interval (sec)", &pop3_poll_interval_sec);
-            int pop3_max_messages = config_.email.pop3_max_messages;
             ImGui::InputInt("POP3 Max Messages", &pop3_max_messages);
-            int winlink_fetch_interval_sec = config_.email.winlink_fetch_interval_sec;
             ImGui::InputInt("Winlink Fetch Interval (sec)", &winlink_fetch_interval_sec);
-            int winlink_fetch_max_messages = config_.email.winlink_fetch_max_messages;
             ImGui::InputInt("Winlink Max Messages", &winlink_fetch_max_messages);
 
             ImGui::Separator();
@@ -1186,7 +1246,7 @@ void SettingsWindow::render() {
 
             if (ImGui::Button("Apply Email Settings")) {
                 config_.email.smtp_host = smtp_host;
-                config_.email.smtp_port = static_cast<uint16_t>(smtp_port);
+                config_.email.smtp_port = static_cast<uint16_t>(std::clamp(smtp_port, 1, 65535));
                 config_.email.smtp_username = smtp_user;
                 if (std::strlen(smtp_pass) > 0) {
                     config_.email.smtp_password = smtp_pass;

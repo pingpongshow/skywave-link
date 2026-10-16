@@ -93,6 +93,9 @@ private:
     int ptt_listener_fd_ = -1;
     std::thread ptt_server_thread_;
     std::vector<std::thread> ptt_client_threads_;
+    std::vector<int> ptt_client_fds_;  // open client sockets (for shutdown on stop)
+    std::mutex ptt_clients_mutex_;     // guards ptt_client_threads_ / ptt_client_fds_
+    std::mutex ptt_lifecycle_mutex_;   // serializes start/stop; taken before mutex_
 
     mutable std::mutex mutex_;
 };

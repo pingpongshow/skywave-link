@@ -373,6 +373,14 @@ bool AppConfig::save(const std::string& path) const {
     file << "\n";
 
     // Beacon section
+    file << "[bbs]\n";
+    file << "enabled = " << (bbs.enabled ? "true" : "false") << "\n";
+    file << "bbs_path = \"" << escapeToml(bbs.bbs_path) << "\"\n";
+    file << "welcome_message = \"" << escapeToml(bbs.welcome_message) << "\"\n";
+    file << "allow_uploads = " << (bbs.allow_uploads ? "true" : "false") << "\n";
+    file << "max_upload_size = " << bbs.max_upload_size << "\n";
+    file << "\n";
+
     file << "[beacon]\n";
     file << "enabled = " << (beacon.enabled ? "true" : "false") << "\n";
     file << "interval_sec = " << beacon.interval_sec << "\n";
@@ -555,6 +563,16 @@ bool AppConfig::load(const std::string& path) {
             if (key == "max_file_size") files.max_file_size = safeStoull(value, 50 * 1024);
             else if (key == "download_path") files.download_path = value;
             else if (key == "auto_accept") files.auto_accept = (value == "true");
+        }
+        else if (current_section == "bbs") {
+            // Persisted since the BBS-enabled check became real: it used to
+            // be neither loaded nor saved, so serving files (now gated on
+            // it) could never survive a restart.
+            if (key == "enabled") bbs.enabled = (value == "true");
+            else if (key == "bbs_path") bbs.bbs_path = value;
+            else if (key == "welcome_message") bbs.welcome_message = value;
+            else if (key == "allow_uploads") bbs.allow_uploads = (value == "true");
+            else if (key == "max_upload_size") bbs.max_upload_size = size_t(safeStoi(value, 50 * 1024));
         }
         else if (current_section == "beacon") {
             if (key == "enabled") beacon.enabled = (value == "true");

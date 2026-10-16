@@ -16,6 +16,8 @@
 #include "window_base.hpp"
 
 #include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +35,210 @@ typedef struct SDL_KeyboardEvent SDL_KeyboardEvent;
 typedef void* SDL_GLContext;
 
 namespace skylink {
+
+// Pure receive-path policy helpers used by App (header-only so they can be
+// unit tested without the GUI).
+namespace app_detail {
+
+// Payload types a station may send while unlinked (BCAST_DATA path). The
+// sender is the broadcast's source as reported by the modem.
+inline bool isDisconnectedBroadcastPayload(uint8_t msg_type) {
+    switch (msg_type) {
+        case 0xFB:  // Text broadcast
+        case 0xFC:  // CQ
+        case 0xFA:  // Advanced beacon
+        case 0xF4:  // Position beacon
+        case 0xF9:  // Pending-message notification
+        case 0xE3:  // Legacy broadcast mail
+        case 0xE0:  // Ping request (addressed broadcast)
+        case 0xE1:  // Ping response (addressed broadcast)
+        case 0xE5:  // Mesh relay packet
+        case 0xE7:  // Reliable broadcast mail
+        case 0xD0:  // BBS announce
+        case 0xD1:  // BBS remove
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Payload types that act on the current session and are honoured only
+// when they arrive over the link from the connected peer.
+inline bool isSessionOnlyPayload(uint8_t msg_type) {
+    if (msg_type >= 0x10 && msg_type <= 0x18) {  // File transfer
+        return true;
+    }
+    switch (msg_type) {
+        case 0xD2:  // BBS file request
+        case 0xF1:  // QSY confirm
+        case 0xF2:  // QSY suggestion
+        case 0xF5:  // Position relay request (relayed to APRS-IS)
+        case 0xF6:  // Away-mode request
+        case 0xE8:  // Mail ACK/NACK
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Inner payloads a mesh relay packet addressed to us may deliver: chat
+// text and mail only. Never another relay packet or a control type.
+inline bool isMeshDeliverablePayload(uint8_t msg_type) {
+    switch (msg_type) {
+        case 0xE2:  // Legacy private mail
+        case 0xE3:  // Legacy broadcast mail
+        case 0xE6:  // Reliable private mail
+        case 0xE7:  // Reliable broadcast mail
+        case 0xFB:  // Text broadcast
+            return true;
+        default:
+            // Plain chat text starts with a printable ASCII character.
+            return (msg_type >= 0x20 && msg_type < 0x7F) ||
+                   msg_type == '\t' || msg_type == '\n' || msg_type == '\r';
+    }
+}
+
+inline bool isValidLatLon(double lat, double lon) {
+    return std::isfinite(lat) && std::isfinite(lon) &&
+           lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+}
+
+// Remote text headed for a line-oriented service (APRS-IS): drop CR/LF and
+// every other control character, then bound the length.
+inline std::string sanitizeRemoteText(const std::string& text, size_t max_len) {
+    std::string out;
+    out.reserve(std::min(text.size(), max_len));
+    for (unsigned char c : text) {
+        if (out.size() >= max_len) {
+            break;
+        }
+        if (c < 0x20 || c == 0x7F) {
+            continue;
+        }
+        out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+inline bool containsControlChars(const std::string& text) {
+    for (unsigned char c : text) {
+        if (c < 0x20 || c == 0x7F) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// RFC 3986 percent-encoding of everything outside the unreserved set.
+inline std::string urlEncode(const std::string& text) {
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(text.size() * 3);
+    for (unsigned char c : text) {
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                                c == '.' || c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+// Per-sender reassembly of 0xFD chat fragments. A message is identified by
+// its total fragment count and starts afresh whenever fragment 0 arrives
+// again or the count changes; incomplete messages expire.
+class ChatFragmentAssembler {
+public:
+    static constexpr int64_t kTimeoutSec = 120;
+    static constexpr size_t kMaxSenders = 32;
+
+    // Returns true and fills *complete when `from`'s message is finished.
+    bool add(const std::string& from, uint8_t frag_idx, uint8_t total_frags,
+             const std::string& data, int64_t now_sec, std::string* complete) {
+        if (from.empty() || from == "UNKNOWN" || total_frags == 0 || frag_idx >= total_frags) {
+            return false;
+        }
+        expire(now_sec);
+        auto it = partial_.find(from);
+        if (it != partial_.end()) {
+            Partial& p = it->second;
+            const bool restart = p.total != total_frags ||
+                                 (frag_idx == 0 && p.frags.count(0) > 0);
+            if (restart) {
+                partial_.erase(it);
+                it = partial_.end();
+            }
+        }
+        if (it == partial_.end()) {
+            if (partial_.size() >= kMaxSenders) {
+                evictOldest();
+            }
+            Partial fresh;
+            fresh.total = total_frags;
+            fresh.started = now_sec;
+            it = partial_.emplace(from, std::move(fresh)).first;
+        }
+        Partial& p = it->second;
+        p.last = now_sec;
+        if (p.frags.count(frag_idx) > 0) {
+            return false;  // Duplicate fragment
+        }
+        p.frags[frag_idx] = data;
+        if (p.frags.size() < p.total) {
+            return false;
+        }
+        std::string full;
+        for (const auto& frag : p.frags) {
+            full += frag.second;
+        }
+        partial_.erase(it);
+        if (complete) {
+            *complete = std::move(full);
+        }
+        return true;
+    }
+
+    void expire(int64_t now_sec) {
+        for (auto it = partial_.begin(); it != partial_.end();) {
+            if (now_sec - it->second.last > kTimeoutSec) {
+                it = partial_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    size_t pendingSenders() const { return partial_.size(); }
+
+private:
+    struct Partial {
+        uint8_t total = 0;
+        int64_t started = 0;
+        int64_t last = 0;
+        std::map<uint8_t, std::string> frags;
+    };
+
+    void evictOldest() {
+        auto oldest = partial_.begin();
+        for (auto it = partial_.begin(); it != partial_.end(); ++it) {
+            if (it->second.last < oldest->second.last) {
+                oldest = it;
+            }
+        }
+        if (oldest != partial_.end()) {
+            partial_.erase(oldest);
+        }
+    }
+
+    std::map<std::string, Partial> partial_;
+};
+
+}  // namespace app_detail
 
 // Forward declarations for modular windows
 class ChatWindow;
@@ -123,9 +329,11 @@ private:
     static constexpr int TYPING_INDICATOR_TIMEOUT_MS = 3000;
     static constexpr int TYPING_INDICATOR_INTERVAL_MS = 1500;
 
+    static constexpr size_t MAX_CHAT_HISTORY = 2000;
+
     // Message fragmentation
     static constexpr size_t MAX_CHAT_FRAGMENT_SIZE = 200;
-    std::map<std::string, std::vector<std::pair<int, std::string>>> fragment_buffer_;
+    app_detail::ChatFragmentAssembler fragment_assembler_;
     int outgoing_fragment_counter_ = 0;
 
     // File transfer state
@@ -223,6 +431,7 @@ private:
     };
     std::vector<BBSFile> bbs_files_;
     std::unordered_map<std::string, BBSFile> remote_bbs_files_;
+    static constexpr size_t MAX_REMOTE_BBS_FILES = 500;
     std::unordered_map<std::string, PendingRemoteBbsDownload> pending_remote_bbs_downloads_;
     std::vector<PendingBbsDownload> pending_bbs_downloads_ui_;
     static constexpr int64_t REMOTE_BBS_DOWNLOAD_REQUEST_TTL_SEC = 180;
@@ -304,6 +513,9 @@ private:
     // Mail state
     std::vector<MailMessage> mail_inbox_;
     std::vector<MailMessage> mail_outbox_;
+    // Legacy 0xE2/0xE3 mail has no id: sender|content-hash -> first seen.
+    std::unordered_map<std::string, int64_t> legacy_mail_seen_;
+    static constexpr int64_t LEGACY_MAIL_DEDUP_WINDOW_SEC = 600;
     char mail_to_input_[256] = {0};
     char mail_subject_input_[128] = {0};
     char mail_body_input_[2048] = {0};
@@ -371,6 +583,11 @@ private:
     void renderPositionTab();
     void renderSettingsTab();
 
+    // Where a received payload came from. Only Link traffic is from the
+    // connected peer; Broadcast carries the modem-reported source; Mesh is
+    // an inner payload delivered by a relay packet.
+    enum class RxOrigin { Link, Broadcast, Mesh };
+
     // Event handlers
     void onModemStateChange(const std::string& state);
     void onDataReceived(const std::vector<uint8_t>& data);
@@ -413,7 +630,12 @@ private:
     // Message handling
     void refreshMessages();
     void sendPendingMessages();
-    void processIncomingMessage(const std::vector<uint8_t>& data, const std::string& from_override = "");
+    void processIncomingMessage(const std::vector<uint8_t>& data, const std::string& from_override = "",
+                                RxOrigin origin = RxOrigin::Link, int relay_depth = 0);
+    bool isLinkConnected() const;
+    std::string linkedPeerCallsign() const;
+    void appendSystemChat(const std::string& text);
+    void pruneFragmentBuffers();
     void gracefulDisconnectModem();
 
     // Chat typing and fragmentation
@@ -421,7 +643,6 @@ private:
     void processTypingIndicator(const std::string& from);
     void sendFragmentedMessage(const std::string& text);
     void processMessageFragment(const std::string& from, const std::vector<uint8_t>& data);
-    void reassembleFragments(const std::string& from);
 
     // CQ and broadcast
     void startCQ();
@@ -437,6 +658,7 @@ private:
     void updateQsyWorkflow();
     void resetQsyWorkflow(bool clear_peer);
     bool executeQsyTarget(const std::string& band, int slot, uint32_t frequency_hz);
+    bool qsyTargetInBand(const std::string& band, int slot, uint32_t frequency_hz) const;
     void returnToCallingFrequency(const std::string& reason);
     bool buildAutoQsyTarget(std::string* band_out, int* slot_out, uint32_t* freq_hz_out) const;
     void addHeardStation(const std::string& callsign);
@@ -460,6 +682,8 @@ private:
     void updateEmailGateway();
     void processIncomingEmail();
     void relayEmailToRadio(const Message& email);
+    void keepInboundLocally(const std::string& from, const std::string& to, const std::string& subject,
+                            const std::string& body, const std::string& message_id);
     void relayRadioToEmail(const Message& msg);
     void checkPOP3Inbox(bool poll_pop3 = true, bool poll_winlink = true);
     void sendQueuedEmails();
@@ -507,8 +731,9 @@ private:
     // Mail
     void sendMail(const std::string& to, const std::string& subject, const std::string& body);
     void sendBroadcastMail(const std::string& subject, const std::string& body);
-    void processMailReceived(const std::string& from, const std::vector<uint8_t>& data);
-    void processReliableMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool is_broadcast);
+    void processMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool via_link);
+    void processReliableMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool is_broadcast,
+                                     bool via_link);
     void processMailAck(const std::string& from, const std::vector<uint8_t>& data);
     void sendMailAck(const std::string& message_id, bool ack, const std::string& reason = "");
     void updateReliableMail();
@@ -540,9 +765,10 @@ private:
     void requestMarineWeather(const std::string& zone);
     bool isStationLinkConnected(bool refresh = false);
     void processWeatherMessage(const std::string& from, const std::vector<uint8_t>& data);
-    void handleWeatherRequest(uint8_t request_type, const std::string& query);
+    void handleWeatherRequest(uint8_t request_type, const std::string& query, const std::string& requester);
     void sendWeatherResponse(uint8_t type, const std::string& location, const std::string& report);
-    void fetchWeatherAsync(uint8_t type, const std::string& query);
+    void fetchWeatherAsync(uint8_t type, const std::string& query, const std::string& requester);
+    static std::string fetchWeatherReport(uint8_t type, const std::string& query);
     void processWeatherFetchResult();
 
     // Weather helpers
@@ -560,10 +786,30 @@ private:
     std::chrono::steady_clock::time_point weather_request_time_;
     static constexpr int WEATHER_TIMEOUT_MS = 30000;
 
-    // Async weather fetch state
+    // Async weather fetch state (exposed to SharedAppState; unused by the
+    // remote-request worker below).
     std::mutex weather_fetch_mutex_;
     std::unique_ptr<PendingWeatherFetch> pending_weather_fetch_;
-    std::shared_ptr<std::atomic<bool>> weather_alive_flag_ = std::make_shared<std::atomic<bool>>(true);
+
+    // Remote weather requests: one worker thread drains a bounded queue,
+    // one job per requester. The thread holds a shared_ptr to this state,
+    // never to App, so shutdown with a fetch in flight is safe.
+    struct WeatherJob {
+        uint8_t type = 0;
+        std::string query;
+        std::string requester;
+        std::string result;
+    };
+    struct WeatherWorker {
+        static constexpr size_t kMaxQueued = 4;
+        std::mutex mutex;
+        std::deque<WeatherJob> queue;
+        std::vector<WeatherJob> done;
+        std::vector<std::string> rejected;
+        std::string active_requester;
+        bool running = false;
+    };
+    std::shared_ptr<WeatherWorker> weather_worker_ = std::make_shared<WeatherWorker>();
 
     // PSK Reporter state
     std::vector<PSKReporterSpot> psk_reporter_queue_;

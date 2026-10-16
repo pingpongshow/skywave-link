@@ -115,6 +115,14 @@ public:
     std::vector<TransferProgress> getCompletedTransfers() const;
     TransferProgress getTransfer(const std::string& transfer_id) const;
 
+    // Filename helpers (exposed for testing)
+    // Truncate to at most max_bytes (the wire length field is one byte),
+    // keeping a short extension and never splitting a UTF-8 sequence.
+    static std::string truncateFilename(const std::string& name, size_t max_bytes = 255);
+    // dir/name if free, else dir/"stem (1).ext", "stem (2).ext", ...; never
+    // returns an existing path. Empty string if no free name was found.
+    static std::string uniqueDownloadPath(const std::string& dir, const std::string& name);
+
     // Callbacks
     void onProgress(TransferProgressCallback cb) { progress_callback_ = std::move(cb); }
     void onComplete(TransferCompleteCallback cb) { complete_callback_ = std::move(cb); }

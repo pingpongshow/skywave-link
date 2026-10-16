@@ -6,6 +6,37 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed - full bug review (2026-10-16)
+
+- POP3 no longer spins forever when the server closes mid-message, and
+  never DELEs a truncated or interrupted message
+- SMTP: implicit TLS on 465, STARTTLS required whenever TLS is requested
+  (fails closed - never AUTH in cleartext), socket timeouts
+- PTT server: a client that keys then drops is unkeyed; stopping the
+  server can no longer deadlock or hang
+- Sender trust: link traffic is attributed to the linked peer (the
+  payload-supplied 0xFA sender unwrap is gone); session-only messages
+  (file transfer, BBS requests, QSY, away mode, mail ACKs) are accepted
+  only from the linked peer; broadcast envelopes obey the broadcast
+  whitelist; mesh relay payloads are limited to chat/mail, one level deep
+- APRS-IS: remote text is stripped of CR/LF/control characters and
+  positions are validated before relaying (no line injection); server
+  close is detected
+- Gateway relay allowlist checks the radio sender; inbound internet mail
+  for non-radio addresses is kept locally instead of dropped
+- Files are accepted only with auto-accept, from a trusted callsign, or as
+  a requested BBS download (a refused offer is reported in chat);
+  downloads never overwrite an existing file
+- BBS serves files only when enabled; BBS owner is the broadcast sender;
+  filesystem errors are reported instead of crashing the app
+- Modem client: session buffer cleared when a radio session ends; command
+  responses matched to their command; frames never sent truncated;
+  re-entrant reads safe; every resolved address tried
+- Chat fragment reassembly restarts/times out per sender; weather requests
+  URL-encoded, queued and attributed correctly; QSY only from the linked
+  peer and within band edges; mail ACKs only from the recipient; settings
+  edits persist until Apply; memory growth from remote peers capped
+
 ### Fixed - found by the two-station end-to-end test
 
 - Session data is framed (`A5 5A | len | message`): the modem's connected

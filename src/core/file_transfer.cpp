@@ -165,7 +165,9 @@ std::string FileTransferManager::sendFile(ModemClient& modem, const std::string&
     // Create transfer
     Transfer t;
     t.progress.transfer_id = generateTransferId();
-    t.progress.filename = std::filesystem::path(filepath).filename().string();
+    // The offer carries a one-byte length: truncate long names here so the
+    // length byte and the bytes actually sent always agree.
+    t.progress.filename = truncateFilename(std::filesystem::path(filepath).filename().string());
     t.progress.remote_callsign = remote_callsign;
     t.progress.direction = TransferDirection::Upload;
     t.progress.state = TransferState::Negotiating;
@@ -348,8 +350,9 @@ std::vector<uint8_t> FileTransferManager::buildFileOffer(const Transfer& t) {
     msg.push_back(static_cast<uint8_t>(FileMessageType::FileOffer));
     msg.push_back(static_cast<uint8_t>(t.progress.transfer_id.size()));
     msg.insert(msg.end(), t.progress.transfer_id.begin(), t.progress.transfer_id.end());
-    msg.push_back(static_cast<uint8_t>(t.progress.filename.size()));
-    msg.insert(msg.end(), t.progress.filename.begin(), t.progress.filename.end());
+    const std::string name = truncateFilename(t.progress.filename);
+    msg.push_back(static_cast<uint8_t>(name.size()));
+    msg.insert(msg.end(), name.begin(), name.end());
 
     uint32_t size = static_cast<uint32_t>(t.progress.total_bytes);
     msg.push_back(size & 0xFF);
@@ -845,10 +848,15 @@ void FileTransferManager::completeDownload(Transfer& t) {
         return;
     }
 
-    std::filesystem::create_directories(download_path_);
-    std::filesystem::path out = std::filesystem::path(download_path_) / t.progress.filename;
+    std::error_code dir_ec;
+    std::filesystem::create_directories(download_path_, dir_ec);
+    // Never overwrite an existing file: pick "name (1).ext" etc.
+    const std::filesystem::path out = uniqueDownloadPath(download_path_, t.progress.filename);
 
-    std::ofstream file(out, std::ios::binary);
+    std::ofstream file;
+    if (!out.empty()) {
+        file.open(out, std::ios::binary);
+    }
     if (!file) {
         t.progress.state = TransferState::Failed;
         t.progress.error_message = "Cannot write file";
@@ -869,6 +877,47 @@ void FileTransferManager::completeDownload(Transfer& t) {
         complete_callback_(t.progress.transfer_id, true, t.local_path);
     }
 
+}
+
+std::string FileTransferManager::truncateFilename(const std::string& name, size_t max_bytes) {
+    if (name.size() <= max_bytes) return name;
+
+    // Keep a short extension (".jpg", ".tar.gz" tail) when it fits.
+    std::string ext;
+    const size_t dot = name.rfind('.');
+    if (dot != std::string::npos && dot > 0 && name.size() - dot <= 16 &&
+        name.size() - dot < max_bytes) {
+        ext = name.substr(dot);
+    }
+    size_t keep = max_bytes - ext.size();
+    // Back off to a UTF-8 character boundary (continuation bytes are 10xxxxxx).
+    while (keep > 0 && (static_cast<unsigned char>(name[keep]) & 0xC0u) == 0x80u) {
+        --keep;
+    }
+    return name.substr(0, keep) + ext;
+}
+
+std::string FileTransferManager::uniqueDownloadPath(const std::string& dir, const std::string& name) {
+    const std::filesystem::path base = std::filesystem::path(dir) / name;
+    std::error_code ec;
+    if (!std::filesystem::exists(base, ec) && !ec) {
+        return base.string();
+    }
+    const std::filesystem::path p(name);
+    const std::string stem = p.stem().string();
+    const std::string ext = p.extension().string();
+    for (int n = 1; n < 10000; ++n) {
+        const std::string suffix = " (" + std::to_string(n) + ")" + ext;
+        // Stay within the 255-byte filename limit after adding the suffix.
+        const size_t room = suffix.size() < 255 ? 255 - suffix.size() : 0;
+        const std::filesystem::path candidate =
+            std::filesystem::path(dir) / (truncateFilename(stem, room) + suffix);
+        ec.clear();
+        if (!std::filesystem::exists(candidate, ec) && !ec) {
+            return candidate.string();
+        }
+    }
+    return "";
 }
 
 void FileTransferManager::notifyProgress(const Transfer& t) {
