@@ -194,6 +194,11 @@ void MailWindow::render() {
                         if (*state_.selected_mail == static_cast<int>(i)) {
                             ImGui::Indent();
                             const std::string& body = mail.display_body.empty() ? mail.body : mail.display_body;
+                            if (!mail.via.empty()) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                                   "Relayed by %s; sender %s is not verified",
+                                                   mail.via.c_str(), mail.from.c_str());
+                            }
                             ImGui::TextWrapped("%s", body.c_str());
                             if (!mail.message_id.empty()) {
                                 ImGui::TextDisabled("MID: %s", mail.message_id.c_str());

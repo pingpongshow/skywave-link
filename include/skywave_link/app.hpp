@@ -98,6 +98,16 @@ inline bool isMeshDeliverablePayload(uint8_t msg_type) {
     }
 }
 
+// Prefix for chat/mail a mesh relay delivered to us. The source callsign
+// comes from the relay header, which the relaying station can set freely,
+// so it is shown as unverified alongside the station that relayed it.
+inline std::string relayAttributionMarker(const std::string& relayed_by) {
+    if (relayed_by.empty()) {
+        return "";
+    }
+    return "[relayed via " + relayed_by + ", sender unverified] ";
+}
+
 inline bool isValidLatLon(double lat, double lon) {
     return std::isfinite(lat) && std::isfinite(lon) &&
            lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
@@ -631,10 +641,16 @@ private:
     void refreshMessages();
     void sendPendingMessages();
     void processIncomingMessage(const std::vector<uint8_t>& data, const std::string& from_override = "",
-                                RxOrigin origin = RxOrigin::Link, int relay_depth = 0);
+                                RxOrigin origin = RxOrigin::Link, int relay_depth = 0,
+                                const std::string& relayed_by = "");
     bool isLinkConnected() const;
     std::string linkedPeerCallsign() const;
     void appendSystemChat(const std::string& text);
+    // Deferred incoming file offers (Incoming File prompt, test hook).
+    bool decidePendingFileOffer(const std::string& transfer_id, bool accept);
+    bool decideNewestPendingFileOffer(bool accept);
+    void dropPendingFileOffers();
+    void renderPendingFileOffers();
     void pruneFragmentBuffers();
     void gracefulDisconnectModem();
 
@@ -731,9 +747,11 @@ private:
     // Mail
     void sendMail(const std::string& to, const std::string& subject, const std::string& body);
     void sendBroadcastMail(const std::string& subject, const std::string& body);
-    void processMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool via_link);
+    void processMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool via_link,
+                             const std::string& relayed_by = "");
     void processReliableMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool is_broadcast,
-                                     bool via_link);
+                                     bool via_link,
+                                     const std::string& relayed_by = "");
     void processMailAck(const std::string& from, const std::vector<uint8_t>& data);
     void sendMailAck(const std::string& message_id, bool ack, const std::string& reason = "");
     void updateReliableMail();

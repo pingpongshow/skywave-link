@@ -80,7 +80,27 @@ enum class FileMessageType : uint8_t {
 // Callbacks
 using TransferProgressCallback = std::function<void(const TransferProgress&)>;
 using TransferCompleteCallback = std::function<void(const std::string& transfer_id, bool success, const std::string& path)>;
-using FileOfferCallback = std::function<bool(const std::string& from, const std::string& filename, size_t size)>;
+// What the app decides about an incoming offer. Defer keeps the offer open
+// (no reply sent) until acceptPendingOffer()/rejectPendingOffer(), the
+// pending-offer timeout, or the end of the radio session.
+enum class FileOfferDecision { Accept, Reject, Defer };
+using FileOfferCallback = std::function<FileOfferDecision(const std::string& transfer_id,
+                                                          const std::string& from,
+                                                          const std::string& filename, size_t size)>;
+
+// An offer waiting for the operator's decision.
+struct PendingFileOffer {
+    std::string transfer_id;
+    std::string from;
+    std::string filename;
+    size_t size = 0;
+    int64_t offered_at = 0;      // Unix seconds
+};
+
+// Deferred offers left unanswered this long are rejected.
+constexpr int DEFAULT_PENDING_OFFER_TIMEOUT_SEC = 120;
+// At most this many offers wait at once; further deferred offers are rejected.
+constexpr size_t MAX_PENDING_OFFERS = 8;
 
 class FileTransferManager {
 public:
@@ -100,6 +120,15 @@ public:
     // Handle incoming file offer
     void acceptTransfer(ModemClient& modem, const std::string& transfer_id);
     void rejectTransfer(ModemClient& modem, const std::string& transfer_id);
+
+    // Deferred offers (see FileOfferDecision::Defer). Accept/reject send the
+    // same packets as an immediate decision; false if the id is not pending.
+    bool acceptPendingOffer(ModemClient& modem, const std::string& transfer_id);
+    bool rejectPendingOffer(ModemClient& modem, const std::string& transfer_id);
+    // Radio session ended: forget pending offers without replying.
+    void dropPendingOffers();
+    std::vector<PendingFileOffer> getPendingOffers() const;  // oldest first
+    void setPendingOfferTimeout(std::chrono::seconds timeout) { pending_offer_timeout_ = timeout; }
 
     // Cancel active transfer
     void cancelTransfer(ModemClient& modem, const std::string& transfer_id);
@@ -145,6 +174,10 @@ private:
     std::string download_path_;
     bool auto_accept_ = false;
     std::vector<std::string> trusted_callsigns_;
+    // Deferred offers: transfer id -> time offered. The offer itself lives in
+    // transfers_ in state Negotiating.
+    std::map<std::string, std::chrono::steady_clock::time_point> pending_offers_;
+    std::chrono::seconds pending_offer_timeout_{DEFAULT_PENDING_OFFER_TIMEOUT_SEC};
 
     TransferProgressCallback progress_callback_;
     TransferCompleteCallback complete_callback_;
@@ -179,6 +212,7 @@ private:
     void notifyProgress(const Transfer& t);
     uint32_t calculateCRC32(const std::vector<uint8_t>& data);
     bool isTrusted(const std::string& callsign) const;
+    void failPendingOffer(const std::string& transfer_id, const std::string& reason);
 };
 
 } // namespace skylink

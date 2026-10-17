@@ -1,6 +1,6 @@
 // App receive-path policy helpers (app_detail): broadcast whitelist,
 // session-only and mesh-deliverable types, APRS text sanitising, URL
-// encoding and chat fragment reassembly.
+// encoding, chat fragment reassembly and the relayed-sender marker.
 
 #include "test_macros.hpp"
 #include "skywave_link/app.hpp"
@@ -44,6 +44,14 @@ TEST(mesh_delivers_only_chat_and_mail) {
     ASSERT_FALSE(isMeshDeliverablePayload(0xFA));
     ASSERT_FALSE(isMeshDeliverablePayload(0xF4));
     ASSERT_FALSE(isMeshDeliverablePayload(0xD0));
+    PASS();
+}
+
+TEST(relay_attribution_marker) {
+    ASSERT_EQ(relayAttributionMarker(""), std::string());
+    const std::string m = relayAttributionMarker("K1ABC");
+    ASSERT_CONTAINS(m, "via K1ABC");
+    ASSERT_CONTAINS(m, "unverified");
     PASS();
 }
 

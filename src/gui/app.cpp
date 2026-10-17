@@ -1258,10 +1258,11 @@ bool App::initialize() {
         chat_scroll_to_bottom_ = true;
         syncTransfersFromManager();
     });
-    file_transfer_mgr_->onFileOffer([this](const std::string& from, const std::string& filename, size_t size) {
-        // Accept only by policy: auto-accept, a trusted callsign, or a BBS
-        // download this station asked for. Being the linked peer is not
-        // consent; anything else is refused and the operator is told.
+    file_transfer_mgr_->onFileOffer([this](const std::string& /*transfer_id*/, const std::string& from,
+                                           const std::string& filename, size_t size) {
+        // Accept by policy: auto-accept, a trusted callsign, or a BBS download
+        // this station asked for. Being the linked peer is not consent;
+        // anything else waits for the operator (Incoming File prompt).
         bool accept = config_.files.auto_accept;
         const std::string normalized_from = normalizeCallsign(from);
         if (!accept && !normalized_from.empty()) {
@@ -1274,17 +1275,13 @@ bool App::initialize() {
         if (!accept) {
             accept = shouldAcceptRemoteBbsOffer(normalized_from, filename);
         }
-        if (!accept) {
-            appendSystemChat("File offer refused. To receive files from " +
-                             (normalized_from.empty() ? std::string("this station") : normalized_from) +
-                             ", enable auto-accept or add it to trusted callsigns in Settings.");
-        }
+        const char* verdict = accept ? " [accepted]" : " [awaiting your decision]";
 
         ChatMessage msg;
         msg.from = "SYSTEM";
         msg.text = "Incoming file offer from " + (normalized_from.empty() ? std::string("UNKNOWN") : normalized_from) +
                    ": " + filename + " (" +
-                   std::to_string(size) + " bytes)" + (accept ? " [accepted]" : " [rejected]");
+                   std::to_string(size) + " bytes compressed)" + verdict;
         msg.is_outgoing = false;
         msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1293,12 +1290,12 @@ bool App::initialize() {
         visible.from = normalized_from.empty() ? std::string("UNKNOWN") : normalized_from;
         visible.to = normalizeCallsign(config_.station.callsign);
         visible.text = "[FILE OFFER] " + filename + " (" + std::to_string(size) +
-                       " bytes)" + (accept ? " [accepted]" : " [rejected]");
+                       " bytes compressed)" + verdict;
         visible.is_outgoing = false;
         visible.timestamp = msg.timestamp;
         chat_history_.push_back(visible);
         chat_scroll_to_bottom_ = true;
-        return accept;
+        return accept ? FileOfferDecision::Accept : FileOfferDecision::Defer;
     });
 
     // Open message store relative to the active config directory when configured path is relative.
@@ -2459,6 +2456,11 @@ void App::update() {
     // Mail ACK/NACK timeout and retry handling.
     updateReliableMail();
 
+    // Offers waiting for the operator belong to the radio session.
+    if (file_transfer_mgr_ && !isLinkConnected()) {
+        dropPendingFileOffers();
+    }
+
     // File transfer state machine (offer/ack/chunk/retry).
     if (file_transfer_mgr_ && modem_ && modem_->isConnected()) {
         file_transfer_mgr_->setDownloadPath(config_.files.download_path);
@@ -2595,6 +2597,8 @@ void App::render() {
         ImGui::End();
         if (!show_files) current_tab_ = AppTab::Chat;
     }
+
+    renderPendingFileOffers();
 
     // Weather window
     static bool show_weather = false;
@@ -4962,6 +4966,84 @@ void App::renderSettingsTab() {
     }
 }
 
+bool App::decidePendingFileOffer(const std::string& transfer_id, bool accept) {
+    if (!file_transfer_mgr_ || !modem_) {
+        return false;
+    }
+    PendingFileOffer offer;
+    bool found = false;
+    for (const auto& o : file_transfer_mgr_->getPendingOffers()) {
+        if (o.transfer_id == transfer_id) {
+            offer = o;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    const bool ok = accept ? file_transfer_mgr_->acceptPendingOffer(*modem_, transfer_id)
+                           : file_transfer_mgr_->rejectPendingOffer(*modem_, transfer_id);
+    if (ok) {
+        const std::string from = normalizeCallsign(offer.from);
+        appendSystemChat(std::string(accept ? "Accepted" : "Declined") + " file offer " + offer.filename +
+                         " from " + (from.empty() ? std::string("UNKNOWN") : from));
+        syncTransfersFromManager();
+    }
+    return ok;
+}
+
+bool App::decideNewestPendingFileOffer(bool accept) {
+    if (!file_transfer_mgr_) {
+        return false;
+    }
+    const auto offers = file_transfer_mgr_->getPendingOffers();
+    return !offers.empty() && decidePendingFileOffer(offers.back().transfer_id, accept);
+}
+
+void App::dropPendingFileOffers() {
+    if (!file_transfer_mgr_ || file_transfer_mgr_->getPendingOffers().empty()) {
+        return;
+    }
+    file_transfer_mgr_->dropPendingOffers();
+    appendSystemChat("Pending file offers dropped: the link ended before you answered");
+    syncTransfersFromManager();
+}
+
+void App::renderPendingFileOffers() {
+    if (!file_transfer_mgr_) {
+        return;
+    }
+    const auto offers = file_transfer_mgr_->getPendingOffers();
+    if (offers.empty()) {
+        return;
+    }
+    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Incoming File", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const int64_t now = unixNowSeconds();
+        for (const auto& offer : offers) {
+            const std::string from = normalizeCallsign(offer.from);
+            ImGui::PushID(offer.transfer_id.c_str());
+            ImGui::Text("%s offers %s (%zu bytes compressed)",
+                        from.empty() ? "UNKNOWN" : from.c_str(),
+                        offer.filename.c_str(), offer.size);
+            const int64_t left = std::max<int64_t>(
+                0, DEFAULT_PENDING_OFFER_TIMEOUT_SEC - (now - offer.offered_at));
+            ImGui::TextDisabled("Declined automatically in %lld s", static_cast<long long>(left));
+            if (ImGui::Button("Accept")) {
+                decidePendingFileOffer(offer.transfer_id, true);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Decline")) {
+                decidePendingFileOffer(offer.transfer_id, false);
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+    }
+    ImGui::End();
+}
+
 void App::appendSystemChat(const std::string& text) {
     ChatMessage msg;
     msg.from = "SYSTEM";
@@ -5228,6 +5310,7 @@ void App::onConnected(const std::string& callsign) {
 }
 
 void App::onDisconnected() {
+    dropPendingFileOffers();
     voice_local_ptt_ = false;
     voice_auto_started_ = false;
     voice_start_pending_ = false;
@@ -5636,7 +5719,7 @@ std::string App::linkedPeerCallsign() const {
 }
 
 void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::string& from_override,
-                                 RxOrigin origin, int relay_depth) {
+                                 RxOrigin origin, int relay_depth, const std::string& relayed_by) {
     if (data.empty()) return;
 
     std::string sender = normalizeCallsign(from_override.empty() ? current_chat_partner_ : from_override);
@@ -5679,7 +5762,9 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         const auto relay_result = mesh_relay_->processRelayPacket(data, relay_payload);
         if (relay_result == RelayResult::ForUs && !relay_payload.empty() &&
             app_detail::isMeshDeliverablePayload(relay_payload[0])) {
-            processIncomingMessage(relay_payload, relay_source, RxOrigin::Mesh, relay_depth + 1);
+            // Attributed to the header's source, which cannot be verified;
+            // the station that relayed it (sender) is recorded alongside.
+            processIncomingMessage(relay_payload, relay_source, RxOrigin::Mesh, relay_depth + 1, sender);
         }
         flushMeshRelayQueue();
         return;
@@ -5733,12 +5818,15 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     // Broadcast message (0xFB prefix: 0xFB | message...)
     if (msg_type == 0xFB && data.size() > 1) {
         std::string broadcast_text(data.begin() + 1, data.end());
-        addHeardStation(sender);
+        if (relayed_by.empty()) {
+            addHeardStation(sender);  // a relayed source was not heard
+        }
 
         ChatMessage msg;
         msg.from = sender;
         msg.to = kMailBroadcastTarget;
-        msg.text = "[BROADCAST] " + broadcast_text;
+        msg.via = relayed_by;
+        msg.text = app_detail::relayAttributionMarker(relayed_by) + "[BROADCAST] " + broadcast_text;
         msg.is_outgoing = false;
         msg.is_broadcast = true;
         msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -6066,25 +6154,25 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
 
     // Reliable private mail (0xE6)
     if (msg_type == kMailPrivateReliableMarker && data.size() >= 6) {
-        processReliableMailReceived(sender, data, false, from_linked_peer);
+        processReliableMailReceived(sender, data, false, from_linked_peer, relayed_by);
         return;
     }
 
     // Reliable broadcast mail (0xE7)
     if (msg_type == kMailBroadcastReliableMarker && data.size() >= 5) {
-        processReliableMailReceived(sender, data, true, from_linked_peer);
+        processReliableMailReceived(sender, data, true, from_linked_peer, relayed_by);
         return;
     }
 
     // Private mail (0xE2 prefix)
     if (msg_type == 0xE2 && data.size() >= 4) {
-        processMailReceived(sender, data, from_linked_peer);
+        processMailReceived(sender, data, from_linked_peer, relayed_by);
         return;
     }
 
     // Broadcast mail (0xE3 prefix)
     if (msg_type == 0xE3 && data.size() >= 2) {
-        processMailReceived(sender, data, from_linked_peer);
+        processMailReceived(sender, data, from_linked_peer, relayed_by);
         return;
     }
 
@@ -6115,7 +6203,8 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     ChatMessage msg;
     msg.from = sender;
     msg.to = config_.station.callsign;
-    msg.text = text;
+    msg.via = relayed_by;
+    msg.text = app_detail::relayAttributionMarker(relayed_by) + text;
     msg.is_outgoing = false;
     msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -9240,7 +9329,7 @@ void App::updateReliableMail() {
 }
 
 void App::processReliableMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool is_broadcast,
-                                      bool via_link) {
+                                      bool via_link, const std::string& relayed_by) {
     if (data.size() < 5) return;
 
     size_t pos = 1;
@@ -9430,6 +9519,9 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
         return;
     }
 
+    // Relayed mail: the subject carries the marker so it survives the store.
+    mail.via = relayed_by;
+    mail.subject = app_detail::relayAttributionMarker(relayed_by) + mail.subject;
     mail_inbox_.push_back(mail);
     if (store_ && store_->isOpen()) {
         const int64_t id = store_->createMessage(makeStoreMailMessage(mail, config_.station.callsign, false));
@@ -9444,7 +9536,7 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
 
     ChatMessage msg;
     msg.from = "SYSTEM";
-    msg.text = "New mail from " + from + ": " + mail.subject;
+    msg.text = "New mail from " + from + ": " + mail.subject;  // subject carries any relay marker
     if (mail.is_broadcast) {
         msg.text += " [BROADCAST]";
     }
@@ -9647,7 +9739,8 @@ void App::sendBroadcastMail(const std::string& subject, const std::string& body)
     chat_scroll_to_bottom_ = true;
 }
 
-void App::processMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool via_link) {
+void App::processMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool via_link,
+                              const std::string& relayed_by) {
     if (data.size() < 2) return;
 
     // Legacy packets carry no message id: suppress repeats of the same
@@ -9740,6 +9833,9 @@ void App::processMailReceived(const std::string& from, const std::vector<uint8_t
     }
 
     decodeTrafficTemplatePayload(mail.body, mail.template_name, mail.display_body);
+    // Relayed mail: the subject carries the marker so it survives the store.
+    mail.via = relayed_by;
+    mail.subject = app_detail::relayAttributionMarker(relayed_by) + mail.subject;
     mail_inbox_.push_back(mail);
     if (store_ && store_->isOpen()) {
         const int64_t id = store_->createMessage(makeStoreMailMessage(mail, config_.station.callsign, false));
@@ -9751,7 +9847,7 @@ void App::processMailReceived(const std::string& from, const std::vector<uint8_t
 
     ChatMessage msg;
     msg.from = "SYSTEM";
-    msg.text = "New mail from " + from + ": " + mail.subject;
+    msg.text = "New mail from " + from + ": " + mail.subject;  // subject carries any relay marker
     if (mail.is_broadcast) {
         msg.text += " [BROADCAST]";
     }
@@ -11642,6 +11738,8 @@ void skylink::App::runTestScript() {
         if (test_wait_cond_ == "modem") met = modem_ && modem_->isConnected();
         else if (test_wait_cond_ == "connected") met = isStationLinkConnected(false);
         else if (test_wait_cond_ == "disconnected") met = !isStationLinkConnected(false);
+        else if (test_wait_cond_ == "file_offer")
+            met = file_transfer_mgr_ && !file_transfer_mgr_->getPendingOffers().empty();
         if (!met && now < test_cond_deadline_) return;
         testLog(std::string("wait ") + test_wait_cond_ + (met ? " -> ok" : " -> TIMEOUT"));
         test_wait_cond_.clear();
@@ -11653,7 +11751,8 @@ void skylink::App::runTestScript() {
     testLog("> " + line);
     if (cmd == "wait") {
         test_wait_until_ = now + std::chrono::milliseconds(int64_t(std::atof(arg.c_str()) * 1000.0));
-    } else if (cmd == "wait_modem" || cmd == "wait_connected" || cmd == "wait_disconnected") {
+    } else if (cmd == "wait_modem" || cmd == "wait_connected" || cmd == "wait_disconnected" ||
+               cmd == "wait_file_offer") {
         test_wait_cond_ = cmd.substr(5);
         test_cond_deadline_ = now + std::chrono::seconds(arg.empty() ? 60 : std::atoi(arg.c_str()));
     } else if (cmd == "connect_modem") {
@@ -11668,6 +11767,8 @@ void skylink::App::runTestScript() {
         sendChatMessage(arg);
     } else if (cmd == "file") {
         sendFile(arg);
+    } else if (cmd == "file_accept" || cmd == "file_decline") {
+        if (!decideNewestPendingFileOffer(cmd == "file_accept")) testLog("no pending file offer");
     } else if (cmd == "ping") {
         sendPing(arg);
     } else if (cmd == "cq_start") {

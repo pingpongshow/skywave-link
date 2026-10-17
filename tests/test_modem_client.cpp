@@ -215,11 +215,14 @@ TEST(send_data_never_truncates_frames) {
     pump(c, 100);
 
     // The fake modem does not read the data port yet, so the socket fills.
+    // Send until the client is actually holding bytes back: macOS loopback
+    // auto-tunes its buffers, and a fixed 2.4 MB sometimes fit entirely.
     const size_t kMsg = 60000;
-    const int kCount = 40;  // ~2.4 MB, well past socket buffers
-    for (int i = 0; i < kCount; ++i) {
-        std::vector<uint8_t> msg(kMsg, static_cast<uint8_t>('A' + (i % 26)));
+    int kCount = 0;
+    while (kCount < 40 || (c.pendingDataBytes() == 0 && kCount < 400)) {
+        std::vector<uint8_t> msg(kMsg, static_cast<uint8_t>('A' + (kCount % 26)));
         ASSERT_TRUE(c.sendData(msg));
+        ++kCount;
     }
     ASSERT_GT(c.pendingDataBytes(), size_t(0));
 
@@ -230,7 +233,7 @@ TEST(send_data_never_truncates_frames) {
         timeval tv{0, 100000};
         setsockopt(m.data, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         char buf[65536];
-        const size_t want = kCount * (kMsg + 4);
+        const size_t want = size_t(kCount) * (kMsg + 4);
         while (rx.size() < want) {
             ssize_t n = recv(m.data, buf, sizeof(buf), 0);
             if (n > 0) rx.append(buf, static_cast<size_t>(n));
@@ -238,13 +241,13 @@ TEST(send_data_never_truncates_frames) {
         }
         done = true;
     });
-    for (int i = 0; i < 1000 && !done; ++i) {
+    for (int i = 0; i < 6000 && !done; ++i) {  // <= 30 s
         c.poll();
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     reader.join();
     ASSERT_EQ(c.pendingDataBytes(), size_t(0));
-    ASSERT_EQ(rx.size(), kCount * (kMsg + 4));
+    ASSERT_EQ(rx.size(), size_t(kCount) * (kMsg + 4));
     size_t pos = 0;
     for (int i = 0; i < kCount; ++i) {
         ASSERT_EQ(static_cast<uint8_t>(rx[pos]), uint8_t(0xA5));

@@ -288,6 +288,21 @@ void FileTransferManager::processIncomingData(ModemClient& modem, const std::vec
 void FileTransferManager::update(ModemClient& modem) {
     auto now = std::chrono::steady_clock::now();
 
+    // Deferred offers nobody answered are rejected.
+    for (auto pit = pending_offers_.begin(); pit != pending_offers_.end();) {
+        if (now - pit->second >= pending_offer_timeout_) {
+            const std::string id = pit->first;
+            pit = pending_offers_.erase(pit);
+            auto it = transfers_.find(id);
+            if (it != transfers_.end() && it->second.progress.state == TransferState::Negotiating) {
+                modem.sendData(buildFileReject(id));
+                failPendingOffer(id, "Offer timed out");
+            }
+        } else {
+            ++pit;
+        }
+    }
+
     for (auto& [id, t] : transfers_) {
         if (t.progress.state == TransferState::Transferring &&
             t.progress.direction == TransferDirection::Upload) {
@@ -516,6 +531,11 @@ void FileTransferManager::handleFileOffer(ModemClient& modem, const std::vector<
         return;
     }
 
+    // A repeated offer for an id already awaiting the operator changes nothing.
+    if (pending_offers_.count(transfer_id) > 0) {
+        return;
+    }
+
     // Get remote callsign from modem status
     std::string remote = modem.getStatus().remote_callsign;
 
@@ -542,20 +562,93 @@ void FileTransferManager::handleFileOffer(ModemClient& modem, const std::vector<
 
     transfers_[transfer_id] = std::move(t);
 
-    // Auto-accept or ask user
-    bool accept = auto_accept_ || isTrusted(remote);
-    const bool trusted = isTrusted(remote);
-    const bool accepted_by_policy = accept;
-
-    if (offer_callback_ && !accept) {
-        accept = offer_callback_(remote, filename, size);
+    // Auto-accept or ask the app, which may defer to the operator.
+    FileOfferDecision decision = (auto_accept_ || isTrusted(remote))
+        ? FileOfferDecision::Accept : FileOfferDecision::Reject;
+    if (offer_callback_ && decision != FileOfferDecision::Accept) {
+        decision = offer_callback_(transfer_id, remote, filename, size);
     }
 
-    if (accept) {
+    if (decision == FileOfferDecision::Defer) {
+        if (pending_offers_.size() < MAX_PENDING_OFFERS) {
+            pending_offers_[transfer_id] = std::chrono::steady_clock::now();
+            notifyProgress(transfers_[transfer_id]);
+            return;
+        }
+        decision = FileOfferDecision::Reject;
+    }
+
+    if (decision == FileOfferDecision::Accept) {
         acceptTransfer(modem, transfer_id);
     } else {
         rejectTransfer(modem, transfer_id);
     }
+}
+
+bool FileTransferManager::acceptPendingOffer(ModemClient& modem, const std::string& transfer_id) {
+    if (pending_offers_.erase(transfer_id) == 0) {
+        return false;
+    }
+    auto it = transfers_.find(transfer_id);
+    if (it == transfers_.end() || it->second.progress.state != TransferState::Negotiating) {
+        return false;
+    }
+    acceptTransfer(modem, transfer_id);
+    notifyProgress(it->second);
+    return true;
+}
+
+bool FileTransferManager::rejectPendingOffer(ModemClient& modem, const std::string& transfer_id) {
+    if (pending_offers_.erase(transfer_id) == 0) {
+        return false;
+    }
+    auto it = transfers_.find(transfer_id);
+    if (it == transfers_.end() || it->second.progress.state != TransferState::Negotiating) {
+        return false;
+    }
+    rejectTransfer(modem, transfer_id);
+    notifyProgress(it->second);
+    return true;
+}
+
+void FileTransferManager::dropPendingOffers() {
+    auto pending = std::move(pending_offers_);
+    pending_offers_.clear();
+    for (const auto& [id, offered] : pending) {
+        (void)offered;
+        failPendingOffer(id, "Offer dropped: session ended");
+    }
+}
+
+std::vector<PendingFileOffer> FileTransferManager::getPendingOffers() const {
+    std::vector<PendingFileOffer> result;
+    for (const auto& [id, offered] : pending_offers_) {
+        (void)offered;
+        auto it = transfers_.find(id);
+        if (it == transfers_.end()) continue;
+        PendingFileOffer o;
+        o.transfer_id = id;
+        o.from = it->second.progress.remote_callsign;
+        o.filename = it->second.progress.filename;
+        o.size = it->second.progress.total_bytes;
+        o.offered_at = it->second.progress.started_at;
+        result.push_back(std::move(o));
+    }
+    std::stable_sort(result.begin(), result.end(),
+                     [](const PendingFileOffer& a, const PendingFileOffer& b) {
+                         return a.offered_at < b.offered_at;
+                     });
+    return result;
+}
+
+void FileTransferManager::failPendingOffer(const std::string& transfer_id, const std::string& reason) {
+    auto it = transfers_.find(transfer_id);
+    if (it == transfers_.end() || it->second.progress.state != TransferState::Negotiating) {
+        return;
+    }
+    it->second.progress.state = TransferState::Failed;
+    it->second.progress.error_message = reason;
+    notifyProgress(it->second);
 }
 
 void FileTransferManager::handleFileAccept(ModemClient& modem, const std::vector<uint8_t>& data) {
@@ -802,6 +895,7 @@ void FileTransferManager::handleFileCancel(const std::vector<uint8_t>& data) {
     auto it = transfers_.find(transfer_id);
     if (it == transfers_.end()) return;
 
+    pending_offers_.erase(transfer_id);
     it->second.progress.state = TransferState::Cancelled;
     it->second.progress.error_message = "Cancelled by remote";
     notifyProgress(it->second);

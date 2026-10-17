@@ -29,6 +29,7 @@ struct ChatMessage {
     bool is_outgoing = false;
     bool is_broadcast = false;
     bool delivered = false;
+    std::string via;             // Mesh relay that delivered it ("" = heard directly)
 };
 
 // File transfer state
@@ -149,6 +150,7 @@ struct MailMessage {
     MailPriority priority = MailPriority::Routine;
     int retry_count = 0;
     MessageStatus status = MessageStatus::Draft;
+    std::string via;             // Mesh relay that delivered it ("" = heard directly)
 };
 
 // Weather report

@@ -6,6 +6,20 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed (2026-10-17)
+
+- File offers that are not auto-accepted (no auto-accept, untrusted
+  callsign) open an "Incoming File" accept/decline prompt instead of being
+  refused; undecided offers time out after 120 s, at most 8 pending.
+  Test hook: `file_accept`, `file_decline`, `wait_file_offer`
+- The offer prompt labels its size as compressed (the sender reports the
+  original size)
+- Relayed mesh chat and mail are marked "[relayed via X, sender
+  unverified]", and the mail view shows the relay
+- `test_modem_client`: the send-buffer test no longer assumes 2.4 MB
+  fills the loopback socket (macOS auto-tuning sometimes absorbed it all
+  and the test failed under parallel load)
+
 ### Fixed - full bug review (2026-10-16)
 
 - POP3 no longer spins forever when the server closes mid-message, and

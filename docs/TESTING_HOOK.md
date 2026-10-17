@@ -32,6 +32,8 @@ SKYLINK_TEST_LOG=scriptA.log \
 | `connect <CALL>`, `disconnect` | `connectToStation()`, modem `DISCONNECT` |
 | `chat <text>` | `sendChatMessage()` (long text is fragmented) |
 | `file <path>` | `sendFile()` |
+| `wait_file_offer [timeout]` | until an incoming file offer is waiting for a decision (default 60 s) |
+| `file_accept`, `file_decline` | accept / decline the newest offer waiting in the Incoming File prompt (`decidePendingFileOffer()`); offers not answered within 120 s are declined automatically |
 | `ping <CALL>` | `sendPing()` |
 | `cq_start`, `cq_stop` | `startCQ()`, `stopCQ()` |
 | `broadcast <text>` | `sendBroadcast()` |
