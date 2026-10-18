@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <limits>
 #include <algorithm>
+#include <cctype>
 
 namespace skylink {
 
@@ -190,6 +191,35 @@ void AppConfig::setDefaults() {
     ui.window_height = 768;
 }
 
+std::vector<std::string> parseCallsignList(const std::string& text) {
+    std::vector<std::string> out;
+    std::string cur;
+    auto flush = [&]() {
+        if (!cur.empty() && std::find(out.begin(), out.end(), cur) == out.end()) {
+            out.push_back(cur);
+        }
+        cur.clear();
+    };
+    for (char c : text) {
+        if (c == ',' || c == ';' || std::isspace(static_cast<unsigned char>(c))) {
+            flush();
+        } else {
+            cur += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+    }
+    flush();
+    return out;
+}
+
+std::string joinCallsignList(const std::vector<std::string>& calls) {
+    std::string out;
+    for (const auto& c : calls) {
+        if (!out.empty()) out += ", ";
+        out += c;
+    }
+    return out;
+}
+
 std::string AppConfig::getDefaultConfigPath() {
     std::string home;
 
@@ -370,6 +400,7 @@ bool AppConfig::save(const std::string& path) const {
     file << "max_file_size = " << files.max_file_size << "\n";
     file << "download_path = \"" << escapeToml(files.download_path) << "\"\n";
     file << "auto_accept = " << (files.auto_accept ? "true" : "false") << "\n";
+    file << "trusted_callsigns = \"" << escapeToml(joinCallsignList(files.trusted_callsigns)) << "\"\n";
     file << "\n";
 
     // Beacon section
@@ -563,6 +594,9 @@ bool AppConfig::load(const std::string& path) {
             if (key == "max_file_size") files.max_file_size = safeStoull(value, 50 * 1024);
             else if (key == "download_path") files.download_path = value;
             else if (key == "auto_accept") files.auto_accept = (value == "true");
+            // Was consulted but never loaded or saved, so the list was
+            // always empty.
+            else if (key == "trusted_callsigns") files.trusted_callsigns = parseCallsignList(value);
         }
         else if (current_section == "bbs") {
             // Persisted since the BBS-enabled check became real: it used to

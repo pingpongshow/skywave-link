@@ -110,6 +110,9 @@ public:
     // Configuration
     void setDownloadPath(const std::string& path) { download_path_ = path; }
     void setAutoAccept(bool auto_accept) { auto_accept_ = auto_accept; }
+    // Replace the whole list (config / settings sync). Callsigns compare
+    // trimmed and case-insensitively.
+    void setTrustedCallsigns(const std::vector<std::string>& callsigns);
     void addTrustedCallsign(const std::string& callsign);
     void removeTrustedCallsign(const std::string& callsign);
 

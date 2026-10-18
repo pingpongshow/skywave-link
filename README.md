@@ -265,6 +265,7 @@ hf_store_forward_enabled = true
 download_path = "downloads"
 max_file_size = 51200
 auto_accept = false        # false: offers open the Incoming File prompt
+trusted_callsigns = ""     # e.g. "W1AW, K6XYZ-2": accepted without the prompt
 
 [bbs]
 enabled = false
@@ -293,9 +294,6 @@ show_timestamps = true
 
 ## Known Gaps
 
-- The file-transfer **trusted callsigns** list is consulted but cannot be
-  set yet: neither `config.toml` nor the Settings window carries it, so
-  it is always empty. Use `auto_accept` or the Incoming File prompt.
 - The emulator has no voice endpoint and no waveform behaviour (above).
 
 ## Band Coverage

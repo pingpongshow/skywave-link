@@ -1197,9 +1197,7 @@ bool App::initialize() {
 
     file_transfer_mgr_->setDownloadPath(config_.files.download_path);
     file_transfer_mgr_->setAutoAccept(config_.files.auto_accept);
-    for (const auto& trusted : config_.files.trusted_callsigns) {
-        file_transfer_mgr_->addTrustedCallsign(trusted);
-    }
+    file_transfer_mgr_->setTrustedCallsigns(config_.files.trusted_callsigns);
     file_transfer_mgr_->onProgress([this](const TransferProgress&) {
         syncTransfersFromManager();
     });
@@ -2465,6 +2463,7 @@ void App::update() {
     if (file_transfer_mgr_ && modem_ && modem_->isConnected()) {
         file_transfer_mgr_->setDownloadPath(config_.files.download_path);
         file_transfer_mgr_->setAutoAccept(config_.files.auto_accept);
+        file_transfer_mgr_->setTrustedCallsigns(config_.files.trusted_callsigns);
         file_transfer_mgr_->update(*modem_);
     }
 

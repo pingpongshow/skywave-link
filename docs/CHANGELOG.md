@@ -6,6 +6,14 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed (2026-10-18)
+
+- File-transfer **trusted callsigns** can be set: `[files]
+  trusted_callsigns` in `config.toml` and a Trusted Callsigns field in
+  Settings -> Files. The list was consulted but never loaded, saved or
+  editable, so it was always empty. Matching ignores case and spaces;
+  changes apply immediately
+
 ### Fixed (2026-10-17)
 
 - File offers that are not auto-accepted (no auto-accept, untrusted

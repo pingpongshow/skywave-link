@@ -432,4 +432,30 @@ TEST(config_numeric_overflow_fixed) {
     PASS();
 }
 
+// [files] trusted_callsigns is persisted (it was consulted but never
+// loaded or saved, so it was always empty).
+TEST(config_trusted_callsigns_roundtrip) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    cfg.files.trusted_callsigns = skylink::parseCallsignList(" w1aw, K6XYZ-2;;W1AW  n0call ");
+    ASSERT_EQ(cfg.files.trusted_callsigns.size(), size_t(3));
+    ASSERT_EQ(cfg.files.trusted_callsigns[0], std::string("W1AW"));
+    ASSERT_EQ(cfg.files.trusted_callsigns[1], std::string("K6XYZ-2"));
+    ASSERT_EQ(cfg.files.trusted_callsigns[2], std::string("N0CALL"));
+    ASSERT_EQ(skylink::joinCallsignList(cfg.files.trusted_callsigns),
+              std::string("W1AW, K6XYZ-2, N0CALL"));
+    ASSERT_TRUE(cfg.save(path));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_TRUE(loaded.files.trusted_callsigns == cfg.files.trusted_callsigns);
+    // An empty list round-trips empty.
+    cfg.files.trusted_callsigns.clear();
+    ASSERT_TRUE(cfg.save(path));
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_TRUE(loaded.files.trusted_callsigns.empty());
+    std::remove(path.c_str());
+    PASS();
+}
+
 TEST_MAIN()

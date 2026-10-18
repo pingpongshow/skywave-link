@@ -888,6 +888,26 @@ void SettingsWindow::render() {
                 config_.files.auto_accept = auto_accept;
             }
 
+            static char trusted_buf[512] = "";
+            static std::vector<std::string> last_loaded_trusted;
+            static bool trusted_initialised = false;
+            if (!trusted_initialised || last_loaded_trusted != config_.files.trusted_callsigns) {
+                const std::string joined = joinCallsignList(config_.files.trusted_callsigns);
+                std::strncpy(trusted_buf, joined.c_str(), sizeof(trusted_buf) - 1);
+                trusted_buf[sizeof(trusted_buf) - 1] = '\0';
+                last_loaded_trusted = config_.files.trusted_callsigns;
+                trusted_initialised = true;
+            }
+            ImGui::BeginDisabled(auto_accept);
+            if (ImGui::InputText("Trusted Callsigns", trusted_buf, sizeof(trusted_buf))) {
+                config_.files.trusted_callsigns = parseCallsignList(trusted_buf);
+                last_loaded_trusted = config_.files.trusted_callsigns;
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled(auto_accept
+                ? "Auto-accept is on: every offer is accepted."
+                : "Offers from these stations (comma-separated) skip the Incoming File prompt.");
+
             if (ImGui::Button("Apply File Settings")) {
                 config_.files.download_path = download_path;
                 if (config_.files.download_path.empty()) {

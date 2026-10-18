@@ -396,6 +396,28 @@ TEST(deferred_offers_are_bounded_and_size_checked) {
     ASSERT_TRUE(sawFrame(fx.m, idMsg(FileMessageType::FileReject, "BIG")));
     PASS();
 }
+// Trusted callsigns used to be consulted but never set (not in the config,
+// not in Settings). A trusted peer's offer is accepted with no prompt;
+// matching ignores case and surrounding space; anyone else still asks.
+TEST(trusted_callsign_offer_is_accepted_without_prompt) {
+    DeferFixture fx;
+    ASSERT_TRUE(fx.ok);
+    const WireFile f = makeFile();
+    fx.ftm.setTrustedCallsigns({" w1aw "});
+    fx.ftm.processIncomingData(fx.c, offerMsg("T7", "t.txt", f));
+    pump(fx.c, 100);
+    ASSERT_TRUE(fx.offered_ids.empty());
+    ASSERT_TRUE(fx.ftm.getPendingOffers().empty());
+    ASSERT_TRUE(sawFrame(fx.m, idMsg(FileMessageType::FileAccept, "T7")));
+
+    fx.ftm.setTrustedCallsigns({"K6XYZ"});  // replaces the list
+    fx.ftm.processIncomingData(fx.c, offerMsg("T8", "u.txt", f));
+    pump(fx.c, 100);
+    ASSERT_EQ(fx.offered_ids.size(), size_t(1));
+    ASSERT_EQ(fx.ftm.getPendingOffers().size(), size_t(1));
+    ASSERT_FALSE(sawFrame(fx.m, idMsg(FileMessageType::FileAccept, "T8")));
+    PASS();
+}
 #endif
 
 TEST_MAIN()

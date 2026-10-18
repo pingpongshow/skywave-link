@@ -8,6 +8,7 @@
 #include <random>
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <sstream>
 #include <exception>
@@ -31,23 +32,43 @@ FileTransferManager::FileTransferManager() {
 
 FileTransferManager::~FileTransferManager() = default;
 
+namespace {
+std::string trustKey(const std::string& callsign) {
+    const size_t a = callsign.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    const size_t b = callsign.find_last_not_of(" \t\r\n");
+    std::string out = callsign.substr(a, b - a + 1);
+    for (auto& c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return out;
+}
+}  // namespace
+
+void FileTransferManager::setTrustedCallsigns(const std::vector<std::string>& callsigns) {
+    trusted_callsigns_.clear();
+    for (const auto& c : callsigns) addTrustedCallsign(c);
+}
+
 void FileTransferManager::addTrustedCallsign(const std::string& callsign) {
-    if (std::find(trusted_callsigns_.begin(), trusted_callsigns_.end(), callsign)
-        == trusted_callsigns_.end()) {
-        trusted_callsigns_.push_back(callsign);
+    const std::string key = trustKey(callsign);
+    if (!key.empty() &&
+        std::find(trusted_callsigns_.begin(), trusted_callsigns_.end(), key)
+            == trusted_callsigns_.end()) {
+        trusted_callsigns_.push_back(key);
     }
 }
 
 void FileTransferManager::removeTrustedCallsign(const std::string& callsign) {
-    auto it = std::find(trusted_callsigns_.begin(), trusted_callsigns_.end(), callsign);
+    auto it = std::find(trusted_callsigns_.begin(), trusted_callsigns_.end(), trustKey(callsign));
     if (it != trusted_callsigns_.end()) {
         trusted_callsigns_.erase(it);
     }
 }
 
 bool FileTransferManager::isTrusted(const std::string& callsign) const {
-    return std::find(trusted_callsigns_.begin(), trusted_callsigns_.end(), callsign)
-           != trusted_callsigns_.end();
+    const std::string key = trustKey(callsign);
+    return !key.empty() &&
+           std::find(trusted_callsigns_.begin(), trusted_callsigns_.end(), key)
+               != trusted_callsigns_.end();
 }
 
 std::string FileTransferManager::generateTransferId() {

@@ -36,7 +36,7 @@ This document reflects the current codebase, not the original roadmap.
 - 50 KiB transfer cap
 - Chunked transfer, ACK/NACK, retry, and resume handling
 - CRC32 integrity verification
-- Download-path and auto-accept settings; offers that are not
+- Download-path, auto-accept and trusted-callsign settings; offers that are not
   auto-accepted open an **Incoming File** accept/decline prompt (120 s
   timeout, at most 8 waiting)
 - File-type labeling for images, PDFs, text, audio, archives, and `.c2v` voice-message files

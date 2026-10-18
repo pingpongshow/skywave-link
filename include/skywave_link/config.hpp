@@ -140,9 +140,16 @@ struct StoreConfig {
 struct FileConfig {
     size_t max_file_size = 50 * 1024;  // 50 KB
     std::string download_path = "downloads";
-    bool auto_accept = false;       // Auto-accept from known stations
+    bool auto_accept = false;       // Accept every offer without asking
+    // Offers from these stations are accepted without the Incoming File
+    // prompt. Stored uppercase; `trusted_callsigns = "W1AW, K6XYZ-2"`.
     std::vector<std::string> trusted_callsigns;
 };
+
+// Callsign lists in config and settings fields: split on commas and
+// whitespace, trimmed, uppercased, duplicates and empties dropped.
+std::vector<std::string> parseCallsignList(const std::string& text);
+std::string joinCallsignList(const std::vector<std::string>& calls);
 
 // BBS configuration
 struct BBSConfig {
