@@ -12,23 +12,28 @@ It is the "companion app" half of the split described in
 sessions, timing, audio and PTT keying; this app owns rig CAT control,
 frequency planning, the operator UI, and everything above the byte stream.
 
+The modem lives in its own repository (`skywave`). Links of the form
+`../skywave/...` in this README assume the two are checked out side by
+side, as `Modem/skywave` and `Modem/skywave-link`. This app is written
+against modem **v1.2.6**; both stations' modems must run the same release.
+
 ## Current Scope
 
 - GUI application: `skywave_link`
 - Core static library: `skywave_link_core`
 - No-RF/no-modem test bridge: `skywave_link_emulator`
 - Control-protocol probe: `skywave_link_probe`
-- Optional unit/integration-style test suite: 11 tests when `SKYWAVE_LINK_BUILD_TESTS=ON`
+- Optional unit/integration-style test suite: 16 tests when `SKYWAVE_LINK_BUILD_TESTS=ON`
 
 ALE support has been removed from the codebase, UI, and configuration.
 
 ## Feature Summary
 
 - Live station-to-station chat with typing indicator, fragmentation/reassembly, CQ, broadcast, ping, and QSO timing
-- File transfer up to 50 KiB with CRC validation, resume/cancel support, and file-type detection
+- File transfer up to 50 KiB with CRC validation, resume/cancel support, and file-type detection. Offers are accepted automatically only with `auto_accept`, from a trusted callsign, or as a requested BBS download; any other offer opens an **Incoming File** accept/decline prompt (declined automatically after 120 s, at most 8 waiting)
 - Radio mail with inbox/sent views, broadcast mail, message priority, and compose templates for free text, ICS-213, and radiogram traffic
 - Email relay support through SMTP, POP3 polling, and Winlink CMS Telnet
-- HF store-and-forward mesh relay controls with deduplication, TTL, hop limits, and relay diagnostics
+- HF store-and-forward mesh relay controls with deduplication, TTL, hop limits, and relay diagnostics. Relayed chat and mail are limited to one hop, can trigger no session-only action, and are shown as "[relayed via X, sender unverified]"
 - APRS-IS direct reporting, APRS relay via connected stations, GPS serial input, and station map display
 - BBS file hosting, remote listing sync, and remote file fetch workflow
 - Frequency/channel management with slot grid, channel sniffer, QSY suggestion/accept flow, and recommendation scoring from beacon/ping history
@@ -259,7 +264,7 @@ hf_store_forward_enabled = true
 [files]
 download_path = "downloads"
 max_file_size = 51200
-auto_accept = false
+auto_accept = false        # false: offers open the Incoming File prompt
 
 [bbs]
 enabled = false
@@ -285,6 +290,13 @@ dark_mode = true
 font_size = 14
 show_timestamps = true
 ```
+
+## Known Gaps
+
+- The file-transfer **trusted callsigns** list is consulted but cannot be
+  set yet: neither `config.toml` nor the Settings window carries it, so
+  it is always empty. Use `auto_accept` or the Incoming File prompt.
+- The emulator has no voice endpoint and no waveform behaviour (above).
 
 ## Band Coverage
 
@@ -320,7 +332,8 @@ assets/maps/        station-map basemap assets
 
 - `docs/FEATURES.md`: current feature inventory
 - `docs/IMPLEMENTATION_STRATEGY.md`: current architecture and module layout
-- `docs/CHANGELOG.md`: current unreleased changes
+- `docs/CHANGELOG.md`: changes, newest first
+- `docs/TESTING_HOOK.md`: the scripted test hook (`SKYLINK_TEST_SCRIPT`) used for two-station end-to-end runs
 - `docs/SKYWAVE_PORT.md`: what changed when this app was adapted from its
   ancestor to the Skywave modem
 

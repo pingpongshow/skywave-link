@@ -120,7 +120,7 @@ src/protocol/
   lzh
 
 tests/
-  currently 14 test executables when enabled
+  currently 16 test executables when enabled
 ```
 
 ## Subsystem Notes
@@ -198,15 +198,26 @@ The application also normalizes legacy configs that still use the old swapped mo
 
 Tests are build-time optional and currently cover:
 
-- `test_lzh`
-- `test_freq_manager`
-- `test_config`
+- `test_app_helpers` (GUI-independent app logic)
+- `test_aprs`
 - `test_b2f`
-- `test_message_store`
-- `test_pop3`
+- `test_config`
+- `test_file_transfer`
+- `test_freq_manager`
 - `test_image_preview`
+- `test_lzh`
 - `test_mesh_relay`
+- `test_message_store`
+- `test_modem_client`
+- `test_pop3`
+- `test_radio_controller`
+- `test_skywave_protocol`
+- `test_smtp`
 - `test_winlink_telnet`
+
+Two-station end-to-end runs (two modems over a virtual audio cable, two
+app instances driven by `SKYLINK_TEST_SCRIPT`) cover the GUI flows; see
+`docs/TESTING_HOOK.md`.
 
 This gives good coverage of the core library, but GUI behavior is still primarily exercised through manual runs and the link emulator.
 
