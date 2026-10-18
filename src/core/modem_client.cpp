@@ -1038,6 +1038,10 @@ void ModemClient::processCommandResponse(const std::string& line) {
             std::lock_guard<std::mutex> lock(status_mutex_);
             snapshot = status_.voice;
         }
+        // Optional fields: absent means off / not applicable.
+        snapshot.broadcast_rx = false;
+        snapshot.real_time = true;
+        snapshot.unit_sec = 0.0;
         for (const auto& [key, value] : splitFields(line.substr(12))) {
             if (key == "MODE") {
                 snapshot.mode = parseVoiceMode(value);
@@ -1062,6 +1066,12 @@ void ModemClient::processCommandResponse(const std::string& line) {
                 snapshot.rx_queued = static_cast<int>(parseIntOr(value, 0));
             } else if (key == "TRANSPORT") {
                 snapshot.transport_mode = parseModeIndex(value);
+            } else if (key == "BCASTRX") {
+                snapshot.broadcast_rx = parseBoolToken(value);
+            } else if (key == "RT") {
+                snapshot.real_time = parseBoolToken(value);
+            } else if (key == "UNIT") {
+                snapshot.unit_sec = std::atof(value.c_str());
             }
         }
         {

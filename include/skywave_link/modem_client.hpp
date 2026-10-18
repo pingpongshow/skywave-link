@@ -89,6 +89,12 @@ struct VoiceStatus {
     int tx_queued = 0;             // TXQ: queued encoder samples
     int rx_queued = 0;             // RXQ: jitter-buffer samples
     int transport_mode = -1;       // ladder index carrying the voice stream
+    // Modem v1.2.7+: a broadcast is playing out here (BCASTRX=ON), and the
+    // open voice service's unit length / whether it keeps up with real
+    // time (UNIT=, RT=; a manual codec the mode cannot stream says NO).
+    bool broadcast_rx = false;
+    bool real_time = true;
+    double unit_sec = 0.0;
     std::string last_event = "IDLE";
 };
 

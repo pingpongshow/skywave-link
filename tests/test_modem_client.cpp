@@ -271,6 +271,97 @@ TEST(connect_tries_all_addresses) {
     ASSERT_TRUE(c.isConnected());
     PASS();
 }
+// Voice media on the voice port (INTERFACES.md records): nothing tested
+// the app's half of it. Uplink PCM must leave as framed uplink records;
+// downlink records - split across socket reads - must come back as PCM;
+// a wrong-direction record is ignored.
+TEST(voice_port_records_both_ways) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    pump(c, 50);
+
+    std::vector<int16_t> up(320);
+    for (size_t i = 0; i < up.size(); ++i) up[i] = static_cast<int16_t>(int(i) * 97 - 15000);
+    ASSERT_TRUE(c.sendVoicePcm(up.data(), up.size()));
+    ASSERT_TRUE(c.sendVoicePcm(up.data(), 160));
+    std::vector<uint8_t> rx;
+    timeval tv{0, 200000};
+    setsockopt(m.voice, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    for (int i = 0; i < 20 && rx.size() < 16 + 640 + 16 + 320; ++i) {
+        uint8_t b[4096];
+        ssize_t n = recv(m.voice, b, sizeof(b), 0);
+        if (n > 0) rx.insert(rx.end(), b, b + n);
+    }
+    ASSERT_EQ(rx.size(), size_t(16 + 640 + 16 + 320));
+    ASSERT_EQ(rx[0], uint8_t(1));                       // version
+    ASSERT_EQ(rx[1], uint8_t(1));                       // uplink
+    ASSERT_EQ((size_t(rx[2]) << 8) | rx[3], size_t(640));
+    ASSERT_EQ(uint32_t(rx[4] << 24 | rx[5] << 16 | rx[6] << 8 | rx[7]), uint32_t(0));
+    for (size_t i = 0; i < up.size(); ++i) {
+        const int16_t v = int16_t(uint16_t(rx[16 + 2 * i]) | uint16_t(rx[17 + 2 * i]) << 8);
+        ASSERT_EQ(v, up[i]);                            // PCM16LE
+    }
+    const size_t r2 = 16 + 640;
+    ASSERT_EQ(uint32_t(rx[r2 + 7]), uint32_t(1));       // sequence advances
+    ASSERT_EQ(uint32_t(rx[r2 + 14]), uint32_t(0x01));   // sample counter = 320
+    ASSERT_EQ(uint32_t(rx[r2 + 15]), uint32_t(0x40));
+
+    // Downlink: one record split across two sends, plus an uplink-typed
+    // record from the modem, which is not playable.
+    auto rec = [](uint8_t type, uint32_t seq, const std::vector<int16_t>& pcm) {
+        std::string out;
+        out += char(1); out += char(type);
+        const size_t n = pcm.size() * 2;
+        out += char(n >> 8); out += char(n & 0xFF);
+        for (int k = 3; k >= 0; --k) out += char((seq >> (8 * k)) & 0xFF);
+        for (int k = 0; k < 8; ++k) out += char(0);
+        for (int16_t v : pcm) { out += char(uint16_t(v) & 0xFF); out += char(uint16_t(v) >> 8); }
+        return out;
+    };
+    std::vector<int16_t> down(480);
+    for (size_t i = 0; i < down.size(); ++i) down[i] = static_cast<int16_t>(int(i) * 31 - 7000);
+    const std::string d = rec(2, 7, down) + rec(1, 8, {1, 2, 3});
+    sendAll(m.voice, d.substr(0, 101));
+    pump(c, 60);
+    sendAll(m.voice, d.substr(101));
+    pump(c, 120);
+    auto got = c.receiveVoicePcm(4000);
+    ASSERT_EQ(got.size(), down.size());
+    ASSERT_TRUE(got == down);
+    PASS();
+}
+
+// VOICESTATUS: the fields modem v1.2.7 adds (broadcast playout, unit
+// length, real-time flag) reach the app, and reset when absent.
+TEST(voice_status_fields_parse) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    m.reply("VOICESTATUS", 0,
+            "VOICESTATUS MODE=BROADCAST CODEC=AUTO(1300) STATE=OPEN PTT=OFF GRANTED=OFF "
+            "TXQ=0 RXQ=0 TRANSPORT=M9 BCASTRX=ON UNIT=3.0s RT=NO");
+    auto v = c.queryVoiceStatus();
+    ASSERT_TRUE(v.has_value());
+    ASSERT_TRUE(v->mode == VoiceMode::Broadcast);
+    ASSERT_TRUE(v->broadcast_rx);
+    ASSERT_FALSE(v->real_time);
+    ASSERT_TRUE(v->unit_sec > 2.9 && v->unit_sec < 3.1);
+    ASSERT_EQ(v->transport_mode, 9);
+    m.reply("VOICESTATUS", 0,
+            "VOICESTATUS MODE=CONNECTED CODEC=AUTO(1300) STATE=CLOSED PTT=OFF GRANTED=OFF "
+            "TXQ=0 RXQ=0 TRANSPORT=M9");
+    v = c.queryVoiceStatus();
+    ASSERT_TRUE(v.has_value());
+    ASSERT_FALSE(v->broadcast_rx);
+    ASSERT_TRUE(v->real_time);
+    PASS();
+}
+
 #endif
 
 TEST_MAIN()
