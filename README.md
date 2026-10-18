@@ -15,7 +15,7 @@ frequency planning, the operator UI, and everything above the byte stream.
 The modem lives in its own repository (`skywave`). Links of the form
 `../skywave/...` in this README assume the two are checked out side by
 side, as `Modem/skywave` and `Modem/skywave-link`. This app is written
-against modem **v1.2.6**; both stations' modems must run the same release.
+against modem **v1.2.7**; both stations' modems must run the same release.
 
 ## Current Scope
 
