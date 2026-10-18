@@ -339,3 +339,19 @@ The modem's own design documentation lives in `../skywave/docs/`; the ones
 this app is written against are `INTERFACES.md` (ports and commands),
 `PROTOCOL.md` (link frames), `WAVEFORM.md` (families and the mode ladder) and
 `VOICE.md` (codec selection).
+
+## License
+
+Copyright (C) 2026 The Skywave authors.
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your
+option) any later version. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE)
+for the full text (GPL-3.0-or-later).
+
+Bundled components keep their own licenses, all compatible with GPL-3.0:
+Dear ImGui (MIT), nlohmann/json (MIT), stb_image (MIT / public domain);
+linked SDL2 (zlib), SQLite (public domain) and OpenSSL 3 (Apache-2.0).
