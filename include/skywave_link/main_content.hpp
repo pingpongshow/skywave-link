@@ -27,7 +27,8 @@ public:
     std::function<void(const std::string&)> onSendChatMessage;
     std::function<void()> onSendTypingIndicator;
     std::function<void(const std::string&)> onSendBroadcast;
-    std::function<void(const std::vector<uint8_t>&)> onSendData;
+    // BCAST while idle, session data while linked (App::sendBroadcastPayload).
+    std::function<bool(const std::vector<uint8_t>&)> onSendBroadcastPayload;
     std::function<void(uint64_t)> onSetFrequency;
 };
 

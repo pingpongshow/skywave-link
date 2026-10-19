@@ -233,7 +233,9 @@ void SettingsWindow::render() {
     auto& gps_fix_valid_ = *state_.gps_fix_valid;
     auto& email_gateway_active_ = *state_.email_gateway_active;
 
-    if (ImGui::BeginTabBar("SettingsTabs")) {
+    // Eleven tabs do not fit the window side by side; scroll instead of
+    // squeezing every label down to "Away M...".
+    if (ImGui::BeginTabBar("SettingsTabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
         if (ImGui::BeginTabItem("Station")) {
             ImGui::InputText("Callsign", callsign_input_, state_.callsign_input_size);
 
@@ -250,9 +252,10 @@ void SettingsWindow::render() {
             }
 
             if (ImGui::Button("Apply")) {
-                config_.station.callsign = callsign_input_;
-                if (modem_) {
-                    modem_->setCallsign(config_.station.callsign);
+                if (onApplyCallsign) {
+                    onApplyCallsign(callsign_input_);
+                } else {
+                    config_.station.callsign = callsign_input_;
                 }
             }
             ImGui::EndTabItem();
@@ -263,8 +266,8 @@ void SettingsWindow::render() {
                 const char* value;
                 const char* display;
             };
-            // ULTRA additionally requires modem.ultra_enable in the modem's
-            // own INI; the modem rejects it otherwise.
+            // ULTRA is opt-in on the modem: choosing it sends ULTRA ON, then
+            // FAMILY ULTRA (App::setModemFamily).
             static const ModemFamilyChoice kFamilyChoices[] = {
                 {"WIDE", "WIDE (2.4 kHz)"},
                 {"MID", "MID (1 kHz)"},
@@ -302,14 +305,25 @@ void SettingsWindow::render() {
                     const bool selected = (family_idx == i);
                     std::string item_label = std::string(kFamilyChoices[i].display) +
                                              "##modem_family_" + kFamilyChoices[i].value;
-                    if (ImGui::Selectable(item_label.c_str(), selected)) {
-                        config_.modem.family = kFamilyChoices[i].value;
+                    if (ImGui::Selectable(item_label.c_str(), selected) && !selected) {
+                        // Applied to the modem at once; a refusal reverts
+                        // the choice and says why in the log.
+                        if (onSetModemFamily) {
+                            onSetModemFamily(kFamilyChoices[i].value);
+                        } else {
+                            config_.modem.family = kFamilyChoices[i].value;
+                        }
                     }
                 }
                 ImGui::EndCombo();
             }
-            ImGui::TextDisabled("Family is fixed per session; the modem accepts "
-                                "a change only while idle.");
+            if (modem_ && modem_->isConnected()) {
+                const ModemStatus ms = modem_->getStatus();
+                ImGui::TextDisabled("Modem is running %s, mode %s.", ms.family.c_str(),
+                                    ms.mode.c_str());
+            }
+            ImGui::TextDisabled("The modem saves its family and accepts a change "
+                                "only while idle.");
 
             bool auto_connect = config_.modem.auto_connect;
             if (ImGui::Checkbox("Auto-connect on startup", &auto_connect)) {

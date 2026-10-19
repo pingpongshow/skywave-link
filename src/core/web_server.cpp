@@ -765,7 +765,6 @@ void WebServer::handleWebSocketConnection(int client_fd, int client_id) {
     std::vector<uint8_t> accum_buf;  // Accumulation buffer for partial frame reads
 
     // Per-connection fragmentation state
-    uint8_t frag_opcode = 0;              // Original opcode of fragmented message
     std::vector<uint8_t> frag_payload;    // Accumulated payload across fragments
     bool in_fragmented_msg = false;       // Whether we're accumulating fragments
 
@@ -866,7 +865,6 @@ void WebServer::handleWebSocketConnection(int client_fd, int client_id) {
                 } else {
                     // First fragment of a multi-frame message
                     in_fragmented_msg = true;
-                    frag_opcode = frame.opcode;
                     frag_payload = std::move(frame.payload);
                 }
             } else if (frame.opcode == 0) {

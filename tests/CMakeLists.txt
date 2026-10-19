@@ -8,6 +8,7 @@ macro(add_skywave_link_test name)
         ${CMAKE_SOURCE_DIR}/include
     )
     target_link_libraries(${name} PRIVATE skywave_link_core)
+    target_compile_options(${name} PRIVATE ${SKYWAVE_LINK_WARNINGS})
     add_test(NAME ${name} COMMAND ${name})
 endmacro()
 

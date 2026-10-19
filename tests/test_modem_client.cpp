@@ -67,6 +67,7 @@ struct FakeModem {
     std::atomic<bool> stop{false};
     std::mutex mu;
     std::map<std::string, std::pair<int, std::string>> replies;
+    std::vector<std::string> received;  // command lines, in arrival order
 
     bool listen() {
         lcmd = makeListener(&pcmd);
@@ -89,13 +90,16 @@ struct FakeModem {
                 if (n < 0) continue;
                 if (ch != '\n') { buf += ch; continue; }
                 std::string verb = buf.substr(0, buf.find(' '));
-                buf.clear();
                 std::pair<int, std::string> r{0, verb};
                 {
                     std::lock_guard<std::mutex> lock(mu);
-                    auto it = replies.find(verb);
+                    received.push_back(buf);
+                    // A reply keyed by the whole line wins over one keyed by verb.
+                    auto it = replies.find(buf);
+                    if (it == replies.end()) it = replies.find(verb);
                     if (it != replies.end()) r = it->second;
                 }
+                buf.clear();
                 if (r.first > 0) std::this_thread::sleep_for(std::chrono::milliseconds(r.first));
                 sendAll(cmd, r.second + "\r");
             }
@@ -106,6 +110,10 @@ struct FakeModem {
         replies[verb] = {delay_ms, line};
     }
     void event(const std::string& line) { sendAll(cmd, line + "\r"); }
+    std::vector<std::string> commands() {
+        std::lock_guard<std::mutex> lock(mu);
+        return received;
+    }
     ~FakeModem() {
         stop = true;
         if (responder.joinable()) responder.join();
@@ -448,6 +456,147 @@ TEST(background_connect_reports_once) {
     e.disconnect();
     ASSERT_FALSE(e.isConnecting());
     ASSERT_FALSE(e.isConnected());
+    PASS();
+}
+
+// ULTRA is opt-in on the modem: FAMILY ULTRA is refused until ULTRA ON,
+// and ULTRA OFF is refused while ULTRA is the family. Choosing ULTRA sends
+// ULTRA ON first; leaving it is a plain FAMILY change.
+TEST(family_change_sequencing) {
+    ASSERT_EQ(familyChangeCommands("ultra").size(), size_t(2));
+    ASSERT_EQ(familyChangeCommands("ULTRA")[0], std::string("ULTRA ON"));
+    ASSERT_EQ(familyChangeCommands("ULTRA")[1], std::string("FAMILY ULTRA"));
+    ASSERT_EQ(familyChangeCommands(" wide ").size(), size_t(1));
+    ASSERT_EQ(familyChangeCommands("WIDE")[0], std::string("FAMILY WIDE"));
+    ASSERT_TRUE(familyChangeCommands("HUGE").empty());
+
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    c.setNonBlockingCommands(true);
+    m.reply("ULTRA ON", 0, "ULTRA ON");
+    m.reply("FAMILY ULTRA", 0, "FAMILY ULTRA");
+
+    std::vector<std::string> results;
+    auto record = [&results](bool ok, const std::string& resp) {
+        results.push_back((ok ? "ok:" : "fail:") + resp);
+    };
+    ASSERT_TRUE(c.setFamily("ULTRA", record));
+    pump(c, 200);
+    ASSERT_EQ(results.size(), size_t(1));
+    ASSERT_EQ(results[0], std::string("ok:FAMILY ULTRA"));
+    auto cmds = m.commands();
+    ASSERT_EQ(cmds.size(), size_t(2));
+    ASSERT_EQ(cmds[0], std::string("ULTRA ON"));
+    ASSERT_EQ(cmds[1], std::string("FAMILY ULTRA"));
+
+    // Leaving ULTRA: FAMILY only, never ULTRA OFF.
+    m.reply("FAMILY MID", 0, "FAMILY MID");
+    ASSERT_TRUE(c.setFamily("MID", record));
+    pump(c, 200);
+    ASSERT_EQ(results.back(), std::string("ok:FAMILY MID"));
+    cmds = m.commands();
+    ASSERT_EQ(cmds.size(), size_t(3));
+    ASSERT_EQ(cmds[2], std::string("FAMILY MID"));
+
+    // A refused ULTRA ON stops the chain: FAMILY ULTRA is never sent and
+    // the caller sees the refusal.
+    m.reply("ULTRA ON", 0, "ERROR:STATE");
+    ASSERT_TRUE(c.setFamily("ULTRA", record));
+    pump(c, 200);
+    ASSERT_EQ(results.back(), std::string("fail:ERROR:STATE"));
+    cmds = m.commands();
+    ASSERT_EQ(cmds.size(), size_t(4));
+    ASSERT_EQ(cmds[3], std::string("ULTRA ON"));
+    ASSERT_CONTAINS(describeCommandError("FAMILY ULTRA", "ERROR:STATE"), "ULTRA");
+    ASSERT_CONTAINS(describeCommandError("CONNECT K1BBB", "ERROR:STATE"), "busy");
+    ASSERT_CONTAINS(describeCommandError("CQ", ""), "did not answer");
+    PASS();
+}
+
+// Failed and refused calls: the reason reaches the app, the raw FSM state
+// (CALLING) is visible, and the reason reads as plain words.
+TEST(disconnect_reason_and_fsm_state) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    std::vector<std::string> reasons;
+    c.onDisconnected([&](const std::string& reason) { reasons.push_back(reason); });
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+
+    m.event("EVT:STATE CALLING");
+    pump(c, 100);
+    ASSERT_EQ(c.getStatus().fsm_state, std::string("CALLING"));
+    ASSERT_TRUE(c.getStatus().link_state == LinkState::Connecting);
+    m.event("EVT:DISCONNECTED NO_ANSWER");
+    m.event("EVT:STATE IDLE");
+    pump(c, 100);
+    ASSERT_EQ(reasons.size(), size_t(1));
+    ASSERT_EQ(reasons[0], std::string("NO_ANSWER"));
+    ASSERT_EQ(c.getStatus().fsm_state, std::string("IDLE"));
+
+    m.reply("STATUS", 0, "STATUS STATE=LISTENING CALL=K1AAA REMOTE=- FAMILY=MID MODE=AUTO(M6)");
+    ASSERT_TRUE(c.refreshStatus());
+    ASSERT_EQ(c.getStatus().fsm_state, std::string("LISTENING"));
+    ASSERT_EQ(c.getStatus().family, std::string("MID"));
+    ASSERT_EQ(c.getStatus().mode, std::string("AUTO(M6)"));
+
+    ASSERT_CONTAINS(describeDisconnectReason("NO_ANSWER"), "No answer");
+    ASSERT_CONTAINS(describeDisconnectReason("REFUSED"), "refused");
+    ASSERT_CONTAINS(describeDisconnectReason("TIMEOUT"), "timed out");
+    ASSERT_CONTAINS(describeDisconnectReason("LINK"), "Link lost");
+    PASS();
+}
+
+// EVT:SNR carries both ends: `<local> <remote|->`.
+TEST(snr_event_sets_local_and_remote) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    m.event("EVT:CONNECTED K1BBB WIDE M8");
+    m.event("EVT:SNR 12.5 -3.0");
+    pump(c, 100);
+    ModemStatus st = c.getStatus();
+    ASSERT_TRUE(st.snr_db > 12.4f && st.snr_db < 12.6f);
+    ASSERT_TRUE(st.remote_snr_valid);
+    ASSERT_TRUE(st.remote_snr_db > -3.1f && st.remote_snr_db < -2.9f);
+    m.event("EVT:SNR 9 -");
+    pump(c, 100);
+    st = c.getStatus();
+    ASSERT_FALSE(st.remote_snr_valid);
+    PASS();
+}
+
+// Outside a session, data-port bytes would wait in the modem's TX queue
+// and go to whoever connects next: sendData refuses them.
+TEST(send_data_refused_without_session) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    pump(c, 50);
+    ASSERT_FALSE(c.sendData({0xF4, 1, 2, 3}));
+    ASSERT_FALSE(c.sendText("hello"));
+    m.event("EVT:CONNECTED K1BBB WIDE M8");
+    pump(c, 100);
+    ASSERT_TRUE(c.sendData({0x01, 0x02}));
+    m.event("EVT:DISCONNECTED NORMAL");
+    pump(c, 100);
+    ASSERT_FALSE(c.sendData({0x03}));
+
+    timeval tv{0, 100000};
+    setsockopt(m.data, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::string rx;
+    char buf[256];
+    ssize_t n;
+    while ((n = recv(m.data, buf, sizeof(buf), 0)) > 0) rx.append(buf, static_cast<size_t>(n));
+    ASSERT_EQ(rx, frame(std::string("\x01\x02")));  // only the in-session message
     PASS();
 }
 

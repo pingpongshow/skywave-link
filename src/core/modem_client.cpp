@@ -547,6 +547,7 @@ void ModemClient::resetSessionState() {
         std::lock_guard<std::mutex> lock(status_mutex_);
         status_.state = ModemState::Connecting;
         status_.link_state = LinkState::Idle;
+        status_.fsm_state = "IDLE";
         status_.remote_callsign.clear();
         status_.busy_detected = false;
         status_.ptt_active = false;
@@ -581,6 +582,7 @@ void ModemClient::disconnect() {
         std::lock_guard<std::mutex> lock(status_mutex_);
         status_.state = ModemState::Disconnected;
         status_.link_state = LinkState::Idle;
+        status_.fsm_state = "IDLE";
         status_.remote_callsign.clear();
         status_.voice = VoiceStatus{};
     }
@@ -621,9 +623,11 @@ void ModemClient::poll() {
     expireAsyncCommands();
     if (!isConnected()) return;
 
-    flushPendingData();
-    if (!isConnected()) return;
+    // Events first, so a session that just ended is known before any
+    // queued session data is flushed toward the modem.
     readCommandSocket();
+    if (!isConnected()) return;
+    flushPendingData();
     if (!isConnected()) return;
     // Callbacks fired from readDataSocket() may re-enter poll() (e.g. via
     // getResponse()); a nested data read is skipped, and the bytes stay in
@@ -907,6 +911,7 @@ void ModemClient::applyStatusLine(const std::string& fields) {
     for (const auto& [key, value] : splitFields(fields)) {
         if (key == "STATE") {
             state_name = upperCopy(value);
+            snapshot.fsm_state = state_name;
             snapshot.link_state = mapStateToLinkState(state_name);
         } else if (key == "CALL") {
             snapshot.my_callsign = value;
@@ -971,8 +976,8 @@ void ModemClient::applyStatusLine(const std::string& fields) {
     }
     onLinkStateChanged(previous, snapshot.link_state);
 
-    // The modem emits no periodic SNR notification, so STATUS polling is
-    // where link quality changes surface.
+    // EVT:SNR reports changes while connected; STATUS keeps the value
+    // current otherwise (and after a missed event).
     if (snr_callback_ && snapshot.snr_db != snr_before) {
         snr_callback_(snapshot.snr_db);
     }
@@ -1060,6 +1065,7 @@ void ModemClient::handleEventLine(const std::string& body) {
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             previous = status_.link_state;
+            status_.fsm_state = state;
             status_.link_state = mapStateToLinkState(state);
             next = status_.link_state;
             status_.listening = (state == "LISTENING");
@@ -1077,6 +1083,7 @@ void ModemClient::handleEventLine(const std::string& body) {
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.link_state = LinkState::Connected;
+            status_.fsm_state = "CONNECTED";
             status_.remote_callsign = call;
             if (!family.empty()) status_.family = upperCopy(family);
             if (!mode.empty()) {
@@ -1086,13 +1093,15 @@ void ModemClient::handleEventLine(const std::string& body) {
         }
         if (connected_callback_) connected_callback_(call);
     } else if (name == "DISCONNECTED") {
+        // EVT:DISCONNECTED <reason>; also ends a call that never connected.
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.link_state = LinkState::Idle;
+            if (status_.fsm_state != "LISTENING") status_.fsm_state = "IDLE";
             status_.remote_callsign.clear();
         }
         resetSessionStream();
-        if (disconnected_callback_) disconnected_callback_();
+        if (disconnected_callback_) disconnected_callback_(upperCopy(args));
     } else if (name == "MODE") {
         // EVT:MODE <Mx> <net_bps>
         std::istringstream tokens(args);
@@ -1106,15 +1115,20 @@ void ModemClient::handleEventLine(const std::string& body) {
         }
         status_.net_bps = net;
     } else if (name == "SNR") {
-        // Documented but not currently emitted by the modem; handled so a
-        // future firmware that does emit it needs no client change.
+        // `EVT:SNR <local_db> <remote_db|->`, sent while connected whenever
+        // the link SNR moves by >= 1 dB.
         std::istringstream tokens(args);
-        std::string local;
-        tokens >> local;
+        std::string local, remote;
+        tokens >> local >> remote;
         const float snr = parseFloatOr(local, 0.0f);
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.snr_db = snr;
+            if (!remote.empty()) {
+                status_.remote_snr_valid = (remote != "-");
+                status_.remote_snr_db =
+                    status_.remote_snr_valid ? parseFloatOr(remote, 0.0f) : 0.0f;
+            }
         }
         if (snr_callback_) snr_callback_(snr);
     } else if (name == "BUSY") {
@@ -1237,6 +1251,9 @@ void ModemClient::processCommandResponse(const std::string& line) {
 
     if (startsWith(line, "STATUS ")) {
         applyStatusLine(line.substr(7));
+    } else if (startsWith(line, "BUFFER ")) {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.tx_buffer_bytes = static_cast<size_t>(parseIntOr(trimCopy(line.substr(7)), 0));
     } else if (startsWith(line, "STATE ")) {
         const std::string state = upperCopy(trimCopy(line.substr(6)));
         LinkState previous;
@@ -1244,6 +1261,7 @@ void ModemClient::processCommandResponse(const std::string& line) {
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             previous = status_.link_state;
+            status_.fsm_state = state;
             status_.link_state = mapStateToLinkState(state);
             next = status_.link_state;
             status_.listening = (state == "LISTENING");
@@ -1312,17 +1330,37 @@ bool ModemClient::writeCommandLine(const std::string& cmd) {
 
 // Skywave answers a command by echoing its verb (`LISTEN ON`, `CONNECT W1AW`)
 // or with `ERROR:<reason>`. There is no `OK`.
-bool ModemClient::sendCommandOk(const std::string& cmd, int timeout_ms) {
+// In non-blocking mode the result is only "sent"; `cb` reports the answer.
+bool ModemClient::sendCommandOk(const std::string& cmd, int timeout_ms,
+                                CommandResultCallback cb) {
     if (nonblocking_commands_) {
-        return sendCommandAsync(cmd, {}, std::max(timeout_ms, 3000));
+        return sendCommandAsync(cmd, std::move(cb), std::max(timeout_ms, 3000));
     }
     const auto response = sendCommandForResponse(cmd, timeout_ms);
-    if (!response) return false;
-    if (startsWith(*response, "ERROR:")) {
+    const bool ok = response && !startsWith(*response, "ERROR:");
+    if (response && !ok) {
         std::cerr << "[ModemClient] '" << cmd << "' -> " << *response << "\n";
-        return false;
     }
-    return true;
+    if (cb) cb(ok, response.value_or(std::string()));
+    return ok;
+}
+
+// Sends `cmds` one after another, each only once the previous succeeded.
+void ModemClient::sendCommandChain(std::vector<std::string> cmds, CommandResultCallback cb) {
+    if (cmds.empty()) {
+        if (cb) cb(true, "");
+        return;
+    }
+    const std::string first = cmds.front();
+    cmds.erase(cmds.begin());
+    sendCommandAsync(first, [this, rest = std::move(cmds), cb = std::move(cb)](
+                                bool ok, const std::string& response) mutable {
+        if (!ok || rest.empty()) {
+            if (cb) cb(ok, response);
+            return;
+        }
+        sendCommandChain(std::move(rest), std::move(cb));
+    });
 }
 
 bool ModemClient::sendCommandAsync(const std::string& cmd,
@@ -1471,14 +1509,62 @@ std::optional<std::string> ModemClient::getResponse(int timeout_ms) {
     }
 }
 
-// --- high-level commands ---------------------------------------------------
+// --- operator-facing wording -----------------------------------------------
 
-bool ModemClient::setCallsign(const std::string& callsign) {
-    return sendCommandOk("MYCALL " + upperCopy(trimCopy(callsign)));
+std::string describeDisconnectReason(const std::string& reason) {
+    const std::string r = upperCopy(trimCopy(reason));
+    if (r == "NORMAL") return "Disconnected normally";
+    if (r == "LINK") return "Link lost (the session dropped)";
+    if (r == "NO_ANSWER") return "No answer from the called station";
+    if (r == "NO_START_ACK") return "The station answered but the link could not be set up";
+    if (r == "REFUSED") return "The called station refused the connection";
+    if (r == "TIMEOUT") return "Incoming call timed out before the link was set up";
+    if (r.empty()) return "Disconnected";
+    return "Disconnected (" + r + ")";
 }
 
-bool ModemClient::connectToStation(const std::string& callsign) {
-    return sendCommandOk("CONNECT " + upperCopy(trimCopy(callsign)));
+std::string describeCommandError(const std::string& cmd, const std::string& response) {
+    const std::string trimmed = upperCopy(trimCopy(cmd));
+    const std::string verb = trimmed.substr(0, trimmed.find(' '));
+    if (response.empty()) {
+        return "the modem did not answer";
+    }
+    if (!startsWith(response, "ERROR:")) {
+        return response;
+    }
+    const std::string reason = upperCopy(trimCopy(std::string_view(response).substr(6)));
+    if (reason == "STATE") {
+        if (verb == "CONNECT") return "the modem is busy (already calling or in a session)";
+        if (verb == "FAMILY") {
+            return trimmed == "FAMILY ULTRA"
+                       ? "ULTRA is not permitted on the modem, or it is not idle"
+                       : "the family can only change while the modem is idle";
+        }
+        if (verb == "ULTRA") return "the modem refused to change the ULTRA setting now";
+        if (verb == "CQ" || verb == "BEACON" || verb == "TXTEST") {
+            return "the modem can only do that while idle";
+        }
+        if (verb == "DISCONNECT") return "there is no session to disconnect";
+        return "the modem cannot do that in its current state";
+    }
+    if (reason == "BADARG") {
+        if (verb == "MYCALL") return "the modem rejected the callsign";
+        if (verb == "BCAST") return "the broadcast payload was rejected";
+        return "the modem rejected the value";
+    }
+    if (reason == "UNSUPPORTED") return "this modem build does not support that";
+    if (reason == "UNKNOWN") return "the modem does not know that command";
+    return "the modem answered " + response;
+}
+
+// --- high-level commands ---------------------------------------------------
+
+bool ModemClient::setCallsign(const std::string& callsign, CommandResultCallback cb) {
+    return sendCommandOk("MYCALL " + upperCopy(trimCopy(callsign)), 500, std::move(cb));
+}
+
+bool ModemClient::connectToStation(const std::string& callsign, CommandResultCallback cb) {
+    return sendCommandOk("CONNECT " + upperCopy(trimCopy(callsign)), 500, std::move(cb));
 }
 
 bool ModemClient::disconnectStation() {
@@ -1511,21 +1597,22 @@ bool ModemClient::setMonitorMode(bool enabled) {
     return sendCommandOk(std::string("MONITOR ") + (enabled ? "ON" : "OFF"));
 }
 
-bool ModemClient::sendBeacon() {
-    return sendCommandOk("BEACON");
+bool ModemClient::sendBeacon(CommandResultCallback cb) {
+    return sendCommandOk("BEACON", 500, std::move(cb));
 }
 
 // Application-level broadcast: Skywave's BCAST carries arbitrary bytes as a
 // fragment chain (<= 16 fragments x 256 B). BEACON itself is telemetry-only.
-bool ModemClient::sendBroadcastData(const std::vector<uint8_t>& data) {
+bool ModemClient::sendBroadcastData(const std::vector<uint8_t>& data, CommandResultCallback cb) {
     if (data.empty() || data.size() > 16u * 256u) {
+        if (cb) cb(false, "ERROR:BADARG");
         return false;
     }
-    return sendCommandOk("BCAST " + bytesToHex(data), 1000);
+    return sendCommandOk("BCAST " + bytesToHex(data), 1000, std::move(cb));
 }
 
-bool ModemClient::sendCq() {
-    return sendCommandOk("CQ");
+bool ModemClient::sendCq(CommandResultCallback cb) {
+    return sendCommandOk("CQ", 500, std::move(cb));
 }
 
 bool ModemClient::setCwId(bool enabled) {
@@ -1534,15 +1621,27 @@ bool ModemClient::setCwId(bool enabled) {
 
 // --- waveform / ladder control ---------------------------------------------
 
-bool ModemClient::setFamily(const std::string& family) {
+std::vector<std::string> familyChangeCommands(const std::string& family) {
     const std::string upper = upperCopy(trimCopy(family));
-    if (upper != "WIDE" && upper != "MID" && upper != "NARROW" &&
-        upper != "ULTRA") {
+    if (upper == "ULTRA") {
+        return {"ULTRA ON", "FAMILY ULTRA"};
+    }
+    if (upper == "WIDE" || upper == "MID" || upper == "NARROW") {
+        return {"FAMILY " + upper};
+    }
+    return {};
+}
+
+bool ModemClient::setFamily(const std::string& family, CommandResultCallback cb) {
+    std::vector<std::string> cmds = familyChangeCommands(family);
+    if (cmds.empty() || !isConnected()) {
+        if (cb) cb(false, cmds.empty() ? "ERROR:BADARG" : "");
         return false;
     }
     // Accepted only while IDLE/LISTENING; the modem answers ERROR:STATE
     // during a session.
-    return sendCommandOk("FAMILY " + upper);
+    sendCommandChain(std::move(cmds), std::move(cb));
+    return true;
 }
 
 bool ModemClient::setMode(const std::string& mode) {
@@ -1575,22 +1674,21 @@ bool ModemClient::sendData(const std::vector<uint8_t>& message) {
     if (!isConnected()) return false;
     if (message.empty()) return true;
 
-    bool connected_session;
+    // Outside a session the modem would hold these bytes in its TX queue
+    // and send them, unframed, to whoever connects next. Broadcasts go
+    // through BCAST (sendBroadcastData) instead.
     {
         std::lock_guard<std::mutex> lock(status_mutex_);
-        connected_session = (status_.link_state == LinkState::Connected);
+        if (status_.link_state != LinkState::Connected) return false;
     }
-    std::vector<uint8_t> framed;
-    if (connected_session) {
-        if (message.size() > kSessionMaxMessage) return false;
-        framed.reserve(kSessionHeaderLen + message.size());
-        framed.push_back(kSessionMagic0);
-        framed.push_back(kSessionMagic1);
-        framed.push_back(static_cast<uint8_t>(message.size() >> 8));
-        framed.push_back(static_cast<uint8_t>(message.size() & 0xFFu));
-        framed.insert(framed.end(), message.begin(), message.end());
-    }
-    const std::vector<uint8_t>& data = connected_session ? framed : message;
+    if (message.size() > kSessionMaxMessage) return false;
+    std::vector<uint8_t> data;
+    data.reserve(kSessionHeaderLen + message.size());
+    data.push_back(kSessionMagic0);
+    data.push_back(kSessionMagic1);
+    data.push_back(static_cast<uint8_t>(message.size() >> 8));
+    data.push_back(static_cast<uint8_t>(message.size() & 0xFFu));
+    data.insert(data.end(), message.begin(), message.end());
 
     // A message is either written whole or queued whole: whatever the
     // socket does not take now stays in data_tx_pending_ and is flushed by
@@ -1622,9 +1720,18 @@ bool ModemClient::sendData(const std::vector<uint8_t>& message) {
 }
 
 void ModemClient::flushPendingData() {
+    bool linked;
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        linked = (status_.link_state == LinkState::Connected);
+    }
     bool ok;
     {
         std::lock_guard<std::mutex> lock(data_tx_mutex_);
+        if (!linked) {
+            data_tx_pending_.clear();  // session data for a session that is gone
+            return;
+        }
         ok = flushPendingDataLocked();
     }
     if (!ok) disconnect();
@@ -1761,11 +1868,11 @@ std::optional<FrequencyInfo> ModemClient::getFrequencyInfo() {
     return info;
 }
 
-bool ModemClient::reportDialFrequency(double hz) {
+bool ModemClient::reportDialFrequency(double hz, CommandResultCallback cb) {
     if (hz < 0.0) return false;
     char buf[64];
     std::snprintf(buf, sizeof(buf), "FREQINFO %.0f", hz);
-    return sendCommandOk(buf);
+    return sendCommandOk(buf, 500, std::move(cb));
 }
 
 // --- voice -----------------------------------------------------------------

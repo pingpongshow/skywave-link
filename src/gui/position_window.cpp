@@ -154,9 +154,7 @@ void PositionWindow::render() {
             }
             packet.insert(packet.end(), msg_text.begin(), msg_text.end());
 
-            if (state_.modem) {
-                state_.modem->sendBeacon();
-                state_.modem->sendData(packet);
+            if (onSendBroadcastPayload && onSendBroadcastPayload(packet)) {
 
                 // Add to chat history
                 ChatMessage chat_msg;

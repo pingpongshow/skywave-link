@@ -127,45 +127,6 @@ bool parseEndpoint(const std::string& endpoint, std::string* host_out, uint16_t*
     return true;
 }
 
-socket_handle_t connectTcpEndpoint(const std::string& endpoint) {
-    if (!ensureSocketRuntime()) {
-        return kInvalidSocket;
-    }
-
-    std::string host;
-    uint16_t port = 0;
-    if (!parseEndpoint(endpoint, &host, &port)) {
-        return kInvalidSocket;
-    }
-
-    struct addrinfo hints;
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-
-    struct addrinfo* result = nullptr;
-    const std::string port_str = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result) != 0) {
-        return kInvalidSocket;
-    }
-
-    socket_handle_t fd = kInvalidSocket;
-    for (struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd == kInvalidSocket) {
-            continue;
-        }
-        if (connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
-            break;
-        }
-        closeSocket(fd);
-        fd = kInvalidSocket;
-    }
-
-    freeaddrinfo(result);
-    return fd;
-}
-
 bool sendAll(socket_handle_t fd, const char* data, size_t len) {
     while (len > 0) {
 #ifdef _WIN32

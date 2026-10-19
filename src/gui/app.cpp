@@ -240,35 +240,6 @@ const char* voiceStateLabel(VoiceState state) {
     }
 }
 
-void renderVoiceActivityIndicator(const VoiceStatus& voice) {
-    const ImVec4 base_button = ImGui::GetStyleColorVec4(ImGuiCol_Button);
-
-    const bool tx_active = (voice.state == VoiceState::TxActive);
-    const bool rx_active = (voice.state == VoiceState::RxActive);
-    const bool flash_on = (static_cast<int>(ImGui::GetTime() * 4.0) % 2) == 0;
-
-    ImVec4 button_color = base_button;
-    const char* label = "VOICE";
-
-    if (tx_active) {
-        label = "VOICE TX";
-        if (flash_on) {
-            button_color = ImVec4(0.84f, 0.26f, 0.24f, 1.0f);
-        }
-    } else if (rx_active) {
-        label = "VOICE RX";
-        if (flash_on) {
-            button_color = ImVec4(0.20f, 0.70f, 0.28f, 1.0f);
-        }
-    }
-
-    ImGui::PushStyleColor(ImGuiCol_Button, button_color);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, button_color);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, button_color);
-    ImGui::Button(label, ImVec2(-1, 0));
-    ImGui::PopStyleColor(3);
-}
-
 SDL_Scancode configuredVoiceHotkeyScancode(const std::string& hotkey) {
     constexpr char kScancodePrefix[] = "SCANCODE:";
     const std::string trimmed = trimSpaces(hotkey);
@@ -421,19 +392,7 @@ std::string resolveStorePath(const std::string& config_path, const std::string& 
     return (base_dir / path).string();
 }
 
-// Endian-safe serialization of IEEE 754 doubles.
-// Writes/reads in little-endian byte order regardless of host endianness.
-void writeDoubleLE(std::vector<uint8_t>& vec, double value) {
-    uint8_t bytes[sizeof(double)];
-    std::memcpy(bytes, &value, sizeof(double));
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    for (size_t i = 0; i < sizeof(double) / 2; ++i) {
-        std::swap(bytes[i], bytes[sizeof(double) - 1 - i]);
-    }
-#endif
-    vec.insert(vec.end(), bytes, bytes + sizeof(double));
-}
-
+// Little-endian IEEE 754 double, regardless of host byte order.
 double readDoubleLE(const uint8_t* data, size_t offset) {
     uint8_t bytes[sizeof(double)];
     std::memcpy(bytes, data + offset, sizeof(double));
@@ -459,40 +418,6 @@ uint32_t readUint32LE(const uint8_t* data, size_t offset) {
            (static_cast<uint32_t>(data[offset + 1]) << 8) |
            (static_cast<uint32_t>(data[offset + 2]) << 16) |
            (static_cast<uint32_t>(data[offset + 3]) << 24);
-}
-
-std::vector<std::string> enumerateSerialPorts() {
-    std::vector<std::string> ports;
-#ifdef _WIN32
-    for (int i = 1; i <= 256; ++i) {
-        std::string name = "COM" + std::to_string(i);
-        HANDLE h = CreateFileA(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                               nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            ports.push_back(name);
-            CloseHandle(h);
-        }
-    }
-#elif defined(__APPLE__)
-    for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("cu.", 0) == 0 || name.rfind("tty.usb", 0) == 0 ||
-            name.rfind("tty.Bluetooth", 0) == 0) {
-            ports.push_back(entry.path().string());
-        }
-    }
-#else
-    // Linux: /dev/ttyUSB*, /dev/ttyACM*, /dev/ttyS*
-    for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("ttyUSB", 0) == 0 || name.rfind("ttyACM", 0) == 0 ||
-            name.rfind("ttyS", 0) == 0) {
-            ports.push_back(entry.path().string());
-        }
-    }
-#endif
-    std::sort(ports.begin(), ports.end());
-    return ports;
 }
 
 std::string bbsRemoteKey(const std::string& from, const std::string& filename) {
@@ -659,15 +584,6 @@ MailPriority decodeMailPriorityFlag(uint8_t flags) {
     return MailPriority::Routine;
 }
 
-const char* mailPriorityLabel(MailPriority priority) {
-    switch (priority) {
-        case MailPriority::Emergency: return "Emergency";
-        case MailPriority::Priority: return "Priority";
-        case MailPriority::Routine:
-        default: return "Routine";
-    }
-}
-
 std::vector<std::string> splitEscapedFields(const std::string& input) {
     std::vector<std::string> fields;
     std::string cur;
@@ -759,29 +675,6 @@ std::string utcDateTimeStringFromUnix(int64_t unix_seconds) {
 
 std::string utcDateTimeString() {
     return utcDateTimeStringFromUnix(unixNowSeconds());
-}
-
-std::string formatFrequencyLabel(uint64_t freq_hz) {
-    char buffer[32];
-    std::snprintf(buffer, sizeof(buffer), "%.3f MHz", static_cast<double>(freq_hz) / 1000000.0);
-    return std::string(buffer);
-}
-
-float scoreAleObservation(const NoiseFloorReading& reading, bool measurement_valid) {
-    if (!measurement_valid) {
-        return -1000.0f;
-    }
-
-    // Skywave's NOISEFLOOR reports the min-tracked floor plus a busy flag
-    // (worker.cpp); there is no per-channel bandwidth or threshold field.
-    const float noise_component = std::clamp((-reading.noise_dbfs) - 55.0f, 0.0f, 100.0f);
-    const float busy_penalty = reading.busy ? 35.0f : 0.0f;
-    return noise_component - busy_penalty;
-}
-
-int aleLqaFromScore(float score) {
-    const float normalized = std::clamp((score + 5.0f) / 70.0f, 0.0f, 1.0f);
-    return static_cast<int>(std::lround(normalized * 100.0f));
 }
 
 std::pair<std::string, std::string> splitEmailAddress(const std::string& addr) {
@@ -1222,7 +1115,7 @@ bool App::initialize() {
             }
         }
         std::string completed_name = std::filesystem::path(path).filename().string();
-        if (!completed_name.empty()) {
+        if (success && !completed_name.empty()) {
             for (auto it = pending_remote_bbs_downloads_.begin();
                  it != pending_remote_bbs_downloads_.end();) {
                 if (it->second.filename == completed_name) {
@@ -1239,8 +1132,13 @@ bool App::initialize() {
 
         ChatMessage msg;
         msg.from = "SYSTEM";
-        msg.text = success ? ("File transfer complete: " + path)
-                           : ("File transfer failed: " + path);
+        if (success) {
+            msg.text = "File transfer complete: " + path;
+        } else {
+            const TransferProgress t = file_transfer_mgr_->getTransfer(transfer_id);
+            msg.text = "File transfer failed: " + path +
+                       (t.error_message.empty() ? std::string() : " (" + t.error_message + ")");
+        }
         msg.is_outgoing = false;
         msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1328,8 +1226,11 @@ bool App::initialize() {
     modem_->onConnected([this](const std::string& callsign) {
         onConnected(callsign);
     });
-    modem_->onDisconnected([this]() {
-        onDisconnected();
+    modem_->onDisconnected([this](const std::string& reason) {
+        onDisconnected(reason);
+    });
+    modem_->onEvent([this](const std::string& name, const std::string& args) {
+        onModemEvent(name, args);
     });
     modem_->onVoiceStatus([this](const VoiceStatus& status) {
         voice_status_generation_++;
@@ -1367,9 +1268,7 @@ bool App::initialize() {
     seedStationLocationsFromHistory();
     last_voice_status_poll_ = last_poll_;
 
-    if (!initVoiceAudio()) {
-        std::cerr << "[App] Voice audio initialization failed\n";
-    }
+    // Voice devices are opened on demand (updateVoiceAudioDevices).
 
     // Auto-connect to modem if configured
     if (config_.modem.auto_connect) {
@@ -1485,45 +1384,76 @@ bool App::initSDL() {
 }
 
 bool App::openVoiceAudioDevices() {
-    closeVoiceAudioDevices();
+    // Asynchronous: start opening (if not already) and report whether the
+    // devices are ready now. updateVoiceAudioDevices() completes the open.
+    if (voice_audio_ready_) return true;
+    if (voice_open_job_ || !voiceLocalAudioEnabled(config_.voice)) return false;
+    auto job = std::make_shared<VoiceOpenJob>();
+    voice_open_job_ = job;
+    const std::string capture_name = config_.voice.capture_device;
+    const std::string playback_name = config_.voice.playback_device;
+    std::thread([job, capture_name, playback_name]() {
+        SDL_AudioSpec desired{};
+        SDL_AudioSpec obtained{};
+        desired.freq = 8000;
+        desired.format = AUDIO_S16LSB;
+        desired.channels = 1;
+        desired.samples = 160;
+        desired.callback = nullptr;
+        job->capture = SDL_OpenAudioDevice(capture_name.empty() ? nullptr : capture_name.c_str(),
+                                           SDL_TRUE, &desired, &obtained, 0);
+        if (job->capture == 0) {
+            job->error = std::string("microphone: ") + SDL_GetError();
+        } else {
+            job->playback =
+                SDL_OpenAudioDevice(playback_name.empty() ? nullptr : playback_name.c_str(),
+                                    SDL_FALSE, &desired, &obtained, 0);
+            if (job->playback == 0) job->error = std::string("speaker: ") + SDL_GetError();
+        }
+        job->done = true;
+    }).detach();
+    return false;
+}
 
-    if (!voiceLocalAudioEnabled(config_.voice)) {
-        voice_audio_ready_ = false;
-        return true;
-    }
-
-    SDL_AudioSpec desired{};
-    SDL_AudioSpec obtained{};
-    desired.freq = 8000;
-    desired.format = AUDIO_S16LSB;
-    desired.channels = 1;
-    desired.samples = 160;
-    desired.callback = nullptr;
-
-    const char* capture_name =
-        config_.voice.capture_device.empty() ? nullptr : config_.voice.capture_device.c_str();
-    const char* playback_name =
-        config_.voice.playback_device.empty() ? nullptr : config_.voice.playback_device.c_str();
-
-    voice_capture_device_id_ = SDL_OpenAudioDevice(capture_name, SDL_TRUE, &desired, &obtained, 0);
-    if (voice_capture_device_id_ == 0) {
-        std::cerr << "[App] Failed to open voice capture device: " << SDL_GetError() << "\n";
-        closeVoiceAudioDevices();
+bool App::voiceAudioWanted() {
+    if (!voiceLocalAudioEnabled(config_.voice) || !modem_ || !modem_->isConnected()) {
         return false;
     }
+    const VoiceStatus v = modem_->getVoiceStatus();
+    // A session that can carry voice, voice already moving, or broadcast
+    // voice that may arrive at any time while listening.
+    return modem_->getStatus().link_state == LinkState::Connected ||
+           v.state != VoiceState::Idle || voice_start_pending_ ||
+           configVoiceMode(config_.voice.mode) == VoiceMode::Broadcast;
+}
 
-    voice_playback_device_id_ =
-        SDL_OpenAudioDevice(playback_name, SDL_FALSE, &desired, &obtained, 0);
-    if (voice_playback_device_id_ == 0) {
-        std::cerr << "[App] Failed to open voice playback device: " << SDL_GetError() << "\n";
-        closeVoiceAudioDevices();
-        return false;
+void App::updateVoiceAudioDevices() {
+    const bool wanted = voiceAudioWanted();
+    if (voice_open_job_ && voice_open_job_->done) {
+        auto job = std::move(voice_open_job_);
+        voice_open_job_.reset();
+        if (job->capture != 0 && job->playback != 0 && wanted) {
+            voice_capture_device_id_ = job->capture;
+            voice_playback_device_id_ = job->playback;
+            SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(voice_capture_device_id_), 0);
+            SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(voice_playback_device_id_), 0);
+            voice_audio_ready_ = true;
+        } else {
+            if (job->capture != 0) SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(job->capture));
+            if (job->playback != 0) SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(job->playback));
+            if (!job->error.empty()) {
+                shared_state_.addSystemMessage("Voice audio unavailable (" + job->error +
+                                               "); retrying in 30 s");
+                voice_open_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            }
+        }
     }
-
-    SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(voice_capture_device_id_), 0);
-    SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(voice_playback_device_id_), 0);
-    voice_audio_ready_ = true;
-    return true;
+    if (wanted && !voice_audio_ready_ && !voice_open_job_ &&
+        std::chrono::steady_clock::now() >= voice_open_retry_at_) {
+        (void)openVoiceAudioDevices();
+    } else if (!wanted && voice_audio_ready_) {
+        closeVoiceAudioDevices();
+    }
 }
 
 void App::closeVoiceAudioDevices() {
@@ -1540,10 +1470,6 @@ void App::closeVoiceAudioDevices() {
     voice_playback_samples_queued_ = 0;
     voice_playback_started_ = false;
     voice_playback_buffer_.clear();
-}
-
-bool App::initVoiceAudio() {
-    return openVoiceAudioDevices();
 }
 
 void App::shutdownVoiceAudio() {
@@ -1583,12 +1509,55 @@ void App::applyModemSettingsToModem() {
     if (!modem_ || !modem_->isConnected()) {
         return;
     }
-
     config_.modem.family = normalizeModemFamily(config_.modem.family);
-    // FAMILY is IDLE/LISTENING-only on the modem; a mid-session change is
-    // answered with ERROR:STATE and simply does not take effect until the
-    // next session, which is the documented behaviour (INTERFACES.md).
-    (void)modem_->setFamily(config_.modem.family);
+    if (config_.modem.family != modem_->getStatus().family) {
+        setModemFamily(config_.modem.family);
+    }
+}
+
+void App::logCommandFailure(const std::string& what, const std::string& cmd,
+                            const std::string& response) {
+    // Commands still pending when the modem connection closes fail with no
+    // answer; that is not news to the operator.
+    if (shutdown_done_ || (response.empty() && (!modem_ || !modem_->isConnected()))) {
+        return;
+    }
+    shared_state_.addSystemMessage(what + ": " + describeCommandError(cmd, response));
+}
+
+void App::setModemFamily(const std::string& family) {
+    const std::string target = normalizeModemFamily(family);
+    config_.modem.family = target;
+    if (!modem_ || !modem_->isConnected()) {
+        shared_state_.addSystemMessage("Connect to the modem to change its bandwidth family");
+        return;
+    }
+    // FAMILY is IDLE/LISTENING-only; ULTRA must be permitted (ULTRA ON)
+    // before FAMILY ULTRA is accepted (ModemClient::setFamily sends both).
+    // A refusal reverts the setting to what the modem actually runs.
+    modem_->setFamily(target, [this, target](bool ok, const std::string& response) {
+        if (ok) {
+            shared_state_.addSystemMessage("Modem bandwidth family set to " + target);
+        } else {
+            logCommandFailure("Could not switch the modem to " + target, "FAMILY " + target,
+                              response);
+            config_.modem.family = normalizeModemFamily(modem_->getStatus().family);
+        }
+        syncFamilyFromModem();
+        modem_->sendCommand("STATUS");
+    });
+}
+
+void App::syncFamilyFromModem() {
+    if (!modem_ || !modem_->isConnected()) {
+        return;
+    }
+    modem_->sendCommandAsync("FAMILY", [this](bool ok, const std::string& response) {
+        if (!ok || response.rfind("FAMILY ", 0) != 0) {
+            return;
+        }
+        config_.modem.family = normalizeModemFamily(response.substr(7));
+    });
 }
 
 void App::pumpVoiceAudio() {
@@ -1940,11 +1909,29 @@ void App::initializeWindows() {
 
     // Wire up callbacks for PositionWindow
     position_window_->onUpdatePosition = [this](double lat, double lon) { updatePosition(lat, lon); };
+    position_window_->onSendBroadcastPayload = [this](const std::vector<uint8_t>& data) {
+        return sendBroadcastPayload(data);
+    };
 
     // Wire up callbacks for SettingsWindow
     settings_window_->onConnectModem = [this]() { connectToModem(); };
     settings_window_->onDisconnectModem = [this]() { disconnectFromModem(); };
     settings_window_->onApplyModemConfig = [this]() { applyModemSettingsToModem(); };
+    settings_window_->onSetModemFamily = [this](const std::string& family) { setModemFamily(family); };
+    settings_window_->onApplyCallsign = [this](const std::string& callsign) {
+        config_.station.callsign = callsign;
+        const std::string call = normalizeCallsign(callsign);
+        if (!modem_ || !modem_->isConnected() || call.empty()) {
+            return;
+        }
+        modem_->setCallsign(call, [this, call](bool ok, const std::string& response) {
+            if (ok) {
+                shared_state_.addSystemMessage("Modem callsign set to " + call);
+            } else {
+                logCommandFailure("Could not set callsign " + call, "MYCALL", response);
+            }
+        });
+    };
     settings_window_->onSaveConfig = [this]() { config_.save(AppConfig::getDefaultConfigPath()); };
     settings_window_->onOpenGPSPort = [this](const std::string& port, int baud) {
         return openGPSPort(port, baud);
@@ -1954,8 +1941,8 @@ void App::initializeWindows() {
     settings_window_->onStopEmailGateway = [this]() { stopEmailGateway(); };
     settings_window_->onApplyRadioConfig = [this]() { applyRadioConfig(); };
     settings_window_->onApplyVoiceConfig = [this]() {
-        closeVoiceAudioDevices();
-        (void)openVoiceAudioDevices();
+        closeVoiceAudioDevices();  // reopened with the new devices when needed
+        voice_open_retry_at_ = {};
         applyVoiceSettingsToModem(true);
     };
     settings_window_->onVoiceStart = [this]() {
@@ -2097,8 +2084,8 @@ void App::initializeWindows() {
     main_content_->onSendChatMessage = [this](const std::string& text) { sendChatMessage(text); };
     main_content_->onSendTypingIndicator = [this]() { sendTypingIndicator(); };
     main_content_->onSendBroadcast = [this](const std::string& msg) { sendBroadcast(msg); };
-    main_content_->onSendData = [this](const std::vector<uint8_t>& data) {
-        if (modem_) modem_->sendData(data);
+    main_content_->onSendBroadcastPayload = [this](const std::vector<uint8_t>& data) {
+        return sendBroadcastPayload(data);
     };
     main_content_->onSetFrequency = [this](uint64_t freq) {
         if (modem_ && modem_->isConnected()) {
@@ -2402,6 +2389,7 @@ void App::update() {
     auto now = std::chrono::steady_clock::now();
     runTestScript();
     pollModemConnect();
+    maybeReconnectModem();
     pollAPRSConnect();
     pollPathPicker();
 
@@ -2429,11 +2417,31 @@ void App::update() {
         // dial frequency (INTERFACES.md "Companion App Split"): the modem
         // cannot know it, and without it every band shares one memory of
         // each peer.
-        if (current_frequency_hz_ != last_reported_dial_hz_) {
-            if (modem_->reportDialFrequency(
-                    static_cast<double>(current_frequency_hz_))) {
-                last_reported_dial_hz_ = current_frequency_hz_;
+        // Only a frequency the rig confirmed is reported; without a rig
+        // (or in dry-run) the dial is unknown, which FREQINFO 0 says.
+        uint32_t dial_hz = 0;
+        if (radio_) {
+            const RadioController::Status rs = radio_->getStatus();
+            if (rs.connected && !rs.dry_run &&
+                rs.frequency_hz <= std::numeric_limits<uint32_t>::max()) {
+                dial_hz = static_cast<uint32_t>(rs.frequency_hz);
             }
+        }
+        if (dial_hz != last_reported_dial_hz_) {
+            last_reported_dial_hz_ = dial_hz;
+            modem_->reportDialFrequency(
+                static_cast<double>(dial_hz),
+                [this, dial_hz](bool ok, const std::string& response) {
+                    if (!ok) {
+                        if (last_reported_dial_hz_ == dial_hz) {
+                            last_reported_dial_hz_ = kDialUnreported;  // retry later
+                        }
+                        if (!response.empty()) {
+                            logCommandFailure("Could not report the dial frequency",
+                                              "FREQINFO", response);
+                        }
+                    }
+                });
         }
         auto voice_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - last_voice_status_poll_);
@@ -2529,6 +2537,7 @@ void App::update() {
 
     // Flush queued email relay traffic when a suitable gateway is available.
     processQueuedGatewayMail();
+    updateVoiceAudioDevices();
     pumpVoiceAudio();
 
     // Mail ACK/NACK timeout and retry handling.
@@ -2539,8 +2548,10 @@ void App::update() {
         dropPendingFileOffers();
     }
 
-    // File transfer state machine (offer/ack/chunk/retry).
-    if (file_transfer_mgr_ && modem_ && modem_->isConnected()) {
+    // File transfer state machine (streaming, flow control, timeouts). It
+    // also fails whatever is in flight once the station link is gone, even
+    // when the modem connection itself dropped.
+    if (file_transfer_mgr_ && modem_) {
         file_transfer_mgr_->setDownloadPath(config_.files.download_path);
         file_transfer_mgr_->setAutoAccept(config_.files.auto_accept);
         file_transfer_mgr_->setTrustedCallsigns(config_.files.trusted_callsigns);
@@ -2680,6 +2691,12 @@ void App::render() {
     // DETACHABLE WINDOWS (delegated to modular window classes)
     // ========================================================================
 
+    // `show chat` (test hook) returns to the main view: every floating
+    // window closes, Settings included.
+    const bool close_all = close_tool_windows_;
+    close_tool_windows_ = false;
+    if (close_all) show_settings_ = false;
+
     // Settings window
     if (show_settings_) {
         prepareToolWindow(620, 520, 0);
@@ -2691,6 +2708,7 @@ void App::render() {
 
     // Mail window
     static bool show_mail = false;
+    if (close_all) show_mail = false;
     if (current_tab_ == AppTab::Mail) show_mail = true;
     if (show_mail) {
         prepareToolWindow(600, 500, 1);
@@ -2703,6 +2721,7 @@ void App::render() {
 
     // File transfer window
     static bool show_files = false;
+    if (close_all) show_files = false;
     if (current_tab_ == AppTab::Files) show_files = true;
     if (show_files) {
         prepareToolWindow(600, 420, 2);
@@ -2717,6 +2736,7 @@ void App::render() {
 
     // Weather window
     static bool show_weather = false;
+    if (close_all) show_weather = false;
     if (current_tab_ == AppTab::Weather) show_weather = true;
     if (show_weather) {
         prepareToolWindow(500, 400, 3);
@@ -2729,6 +2749,7 @@ void App::render() {
 
     // Position window
     static bool show_position = false;
+    if (close_all) show_position = false;
     if (current_tab_ == AppTab::Position) show_position = true;
     if (show_position) {
         prepareToolWindow(450, 350, 4);
@@ -2741,6 +2762,7 @@ void App::render() {
 
     // Station map window
     static bool show_station_map = false;
+    if (close_all) show_station_map = false;
     if (current_tab_ == AppTab::StationMap) show_station_map = true;
     if (show_station_map) {
         prepareToolWindow(860, 620, 5);
@@ -2753,6 +2775,7 @@ void App::render() {
 
     // Messages window
     static bool show_messages = false;
+    if (close_all) show_messages = false;
     if (current_tab_ == AppTab::Messages) show_messages = true;
     if (show_messages) {
         prepareToolWindow(600, 450, 6);
@@ -2765,6 +2788,7 @@ void App::render() {
 
     // BBS window
     static bool show_bbs = false;
+    if (close_all) show_bbs = false;
     if (current_tab_ == AppTab::BBS) show_bbs = true;
     if (show_bbs) {
         prepareToolWindow(650, 500, 7);
@@ -2777,6 +2801,7 @@ void App::render() {
 
     // Frequency window
     static bool show_frequency = false;
+    if (close_all) show_frequency = false;
     if (current_tab_ == AppTab::Frequency) show_frequency = true;
     if (show_frequency) {
         prepareToolWindow(500, 400, 8);
@@ -2953,11 +2978,26 @@ void App::renderStatusBar() {
 
     divider();
 
-    // Link status
+    // Link status, from the modem's own FSM state.
+    const bool modem_up = status.state == ModemState::Connected;
+    const std::string& fsm = status.fsm_state;
     if (status.link_state == LinkState::Connected) {
         ImGui::TextColored(pal.success, "LINK: %s", status.remote_callsign.c_str());
+    } else if (modem_up && fsm == "CALLING") {
+        const std::string target = normalizeCallsign(pending_connect_target_);
+        ImGui::TextColored(pal.warning, "LINK: CALLING %s", target.c_str());
+    } else if (modem_up && (fsm == "CONNECTING" || fsm == "DISCONNECTING")) {
+        ImGui::TextColored(pal.warning, "LINK: %s", fsm.c_str());
+    } else if (modem_up && fsm == "LISTENING") {
+        ImGui::Text("LINK: LISTENING");
     } else {
         ImGui::Text("LINK: IDLE");
+    }
+
+    if (modem_up) {
+        divider();
+        // What the modem is actually running, not what the settings ask for.
+        ImGui::Text("%s %s", status.family.c_str(), status.mode.c_str());
     }
 
     divider();
@@ -3958,7 +3998,7 @@ bool App::forwardPacketViaMesh(const std::vector<uint8_t>& payload,
     }
 
     auto relay_packet = mesh_relay_->createRelayPacket(destination, payload, message_id);
-    const bool ok = modem_->sendData(relay_packet);
+    const bool ok = sendBroadcastPayload(relay_packet);
     if (ok && !message_id.empty()) {
         ChatMessage msg;
         msg.from = "SYSTEM";
@@ -3975,7 +4015,35 @@ bool App::forwardPacketViaMesh(const std::vector<uint8_t>& payload,
 // Event handlers
 
 void App::onModemStateChange(const std::string& state) {
-    (void)state;
+    // EVT:STATE and STATE replies both land here; log transitions once.
+    if (state == last_logged_fsm_state_) {
+        return;
+    }
+    last_logged_fsm_state_ = state;
+    if (state == "CALLING") {
+        const std::string target = normalizeCallsign(pending_connect_target_);
+        shared_state_.addSystemMessage(target.empty() ? std::string("Calling...")
+                                                      : "Calling " + target + "...");
+    } else if (state == "CONNECTING") {
+        shared_state_.addSystemMessage(pending_connect_target_.empty()
+                                           ? std::string("Incoming call, setting up the link...")
+                                           : std::string("Answered, setting up the link..."));
+    } else if (state == "DISCONNECTING") {
+        shared_state_.addSystemMessage("Disconnecting...");
+    }
+}
+
+void App::onModemEvent(const std::string& name, const std::string& args) {
+    if (name == "TX_WATCHDOG") {
+        shared_state_.addSystemMessage("Modem fault: the TX watchdog released PTT after " +
+                                       args + " s of continuous keying");
+    } else if (name == "CFO_WARN") {
+        shared_state_.addSystemMessage("Transmit frequency alignment is at " + args +
+                                       " Hz; retune the dial");
+    } else if (name == "STREAM_REPLAY") {
+        shared_state_.addSystemMessage("The peer restarted; " + args +
+                                       " bytes were re-sent and may repeat");
+    }
 }
 
 void App::onDataReceived(const std::vector<uint8_t>& data) {
@@ -4163,17 +4231,27 @@ void App::onConnected(const std::string& callsign) {
     pending_connect_auto_qsy_ = false;
 }
 
-void App::onDisconnected() {
+void App::onDisconnected(const std::string& reason) {
+    last_logged_fsm_state_.clear();
     dropPendingFileOffers();
+    if (file_transfer_mgr_) {
+        file_transfer_mgr_->linkLost("Link lost");
+    }
+    const std::string why = describeDisconnectReason(reason);
+    if (current_chat_partner_.empty()) {
+        // The call never connected (NO_ANSWER, REFUSED, ...): say so.
+        const std::string target = normalizeCallsign(pending_connect_target_);
+        if (!target.empty()) {
+            shared_state_.addSystemMessage("Call to " + target + " failed: " + why);
+        } else if (!reason.empty() && reason != "NORMAL") {
+            shared_state_.addSystemMessage(why);
+        }
+    }
     voice_local_ptt_ = false;
     voice_auto_started_ = false;
     voice_start_pending_ = false;
     voice_start_inflight_ = false;
     pending_connect_auto_qsy_ = false;
-
-    if (modem_ && modem_->isConnected()) {
-        (void)modem_->setListenMode(true);
-    }
 
     const bool workflow_active = (qsy_workflow_state_ != QsyWorkflowState::Idle) ||
                                  !qsy_target_band_.empty() || qsy_suggestion_pending_;
@@ -4197,6 +4275,9 @@ void App::onDisconnected() {
         ChatMessage msg;
         msg.from = "SYSTEM";
         msg.text = "Disconnected from " + current_chat_partner_ + " (QSO: " + duration + ")";
+        if (!reason.empty() && reason != "NORMAL") {
+            msg.text += " - " + why;
+        }
         msg.is_outgoing = false;
         msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -4266,18 +4347,40 @@ void App::onDisconnected() {
 }
 
 void App::connectToModem() {
+    modem_auto_paused_ = false;  // an explicit connect re-arms auto-reconnect
+    startModemConnect(true);
+}
+
+void App::startModemConnect(bool announce) {
     if (!modem_) return;
-    if (modem_->isConnecting()) return;
+    if (modem_->isConnecting() || modem_->isConnected()) return;
 
     // The TCP connects run on a helper thread (see pollModemConnect()), so an
     // unreachable host never freezes the window.
     if (modem_->beginConnect(config_.modem.host,
                              config_.modem.command_port,
                              config_.modem.data_port,
-                             config_.modem.voice_port)) {
+                             config_.modem.voice_port) &&
+        announce) {
         shared_state_.addSystemMessage("Connecting to modem at " + config_.modem.host + ":" +
                                        std::to_string(config_.modem.command_port) + "...");
     }
+}
+
+// AUTO-RECONNECT (modem.auto_connect, every modem.reconnect_interval_sec):
+// the companion usually starts together with the modem and may come up
+// first, and the modem may be restarted under it. Before this, a modem
+// that was not listening at the one start-up attempt left the companion
+// disconnected until the operator pressed CONNECT MODEM. A manual
+// disconnect pauses it; quiet retries log only the first failure.
+void App::maybeReconnectModem() {
+    if (!modem_ || !config_.modem.auto_connect || modem_auto_paused_) return;
+    if (modem_->isConnected() || modem_->isConnecting()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < modem_next_attempt_) return;
+    const int interval = std::clamp(config_.modem.reconnect_interval_sec, 2, 300);
+    modem_next_attempt_ = now + std::chrono::seconds(interval);
+    startModemConnect(!modem_unreachable_logged_);
 }
 
 struct App::PathPickerJob {
@@ -4350,11 +4453,18 @@ void App::pollModemConnect() {
     if (!modem_ || !modem_->isConnecting()) return;
     switch (modem_->pollConnect()) {
     case ConnectProgress::Connected:
+        modem_unreachable_logged_ = false;
         onModemConnected();
         break;
     case ConnectProgress::Failed:
-        shared_state_.addSystemMessage("Could not reach the modem at " + config_.modem.host + ":" +
-                                       std::to_string(config_.modem.command_port));
+        if (!modem_unreachable_logged_) {
+            shared_state_.addSystemMessage(
+                "Could not reach the modem at " + config_.modem.host + ":" +
+                std::to_string(config_.modem.command_port) +
+                (config_.modem.auto_connect && !modem_auto_paused_ ? " - retrying in the background"
+                                                                   : ""));
+            modem_unreachable_logged_ = true;
+        }
         break;
     default:
         break;
@@ -4362,11 +4472,19 @@ void App::pollModemConnect() {
 }
 
 void App::onModemConnected() {
+    shared_state_.addSystemMessage("Connected to modem at " + config_.modem.host + ":" +
+                                   std::to_string(config_.modem.command_port));
+    last_logged_fsm_state_.clear();
+    last_reported_dial_hz_ = kDialUnreported;
     // Set callsign
     if (!config_.station.callsign.empty()) {
-        modem_->setCallsign(config_.station.callsign);
+        const std::string call = normalizeCallsign(config_.station.callsign);
+        modem_->setCallsign(call, [this, call](bool ok, const std::string& response) {
+            if (!ok) logCommandFailure("Could not set callsign " + call, "MYCALL", response);
+        });
     }
-    applyModemSettingsToModem();
+    // The modem keeps its own saved family; reflect it rather than push ours.
+    syncFamilyFromModem();
     applyVoiceSettingsToModem(false);
     // Passive monitoring is opt-in on Skywave and is how this app hears
     // CQ, beacons and broadcast traffic from stations it is not linked
@@ -4377,6 +4495,7 @@ void App::onModemConnected() {
 }
 
 void App::disconnectFromModem() {
+    modem_auto_paused_ = true;  // the operator chose to be disconnected
     if (modem_) {
         if (voice_local_ptt_) {
             (void)modem_->setVoicePtt(false);
@@ -4410,7 +4529,16 @@ void App::connectToStation(const std::string& callsign) {
          * Auto-QSY is only safe when an explicit CQ-response flow arms it. */
         pending_connect_auto_qsy_ = false;
 
-        modem_->connectToStation(normalized);
+        modem_->connectToStation(normalized, [this, normalized](bool ok, const std::string& response) {
+            if (!ok) {
+                if (normalizeCallsign(pending_connect_target_) == normalized) {
+                    pending_connect_target_.clear();
+                }
+                logCommandFailure("Call to " + normalized + " not started", "CONNECT", response);
+            }
+        });
+    } else if (!normalized.empty()) {
+        shared_state_.addSystemMessage("Cannot call " + normalized + ": the modem is not connected");
     }
 }
 
@@ -4717,7 +4845,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     // File transfer protocol messages (0x10-0x18).
     if (file_transfer_mgr_ && modem_ &&
         msg_type >= static_cast<uint8_t>(FileMessageType::FileOffer) &&
-        msg_type <= static_cast<uint8_t>(FileMessageType::FileResume)) {
+        msg_type <= static_cast<uint8_t>(FileMessageType::FileLast)) {
         file_transfer_mgr_->processIncomingData(*modem_, data);
         syncTransfersFromManager();
         return;
@@ -5280,7 +5408,12 @@ void App::updateCQ() {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_cq_sent_);
 
     if (elapsed.count() >= CQ_INTERVAL_MS && cq_current_repeat_ < cq_repeat_count_) {
-        modem_->sendCq();
+        modem_->sendCq([this](bool ok, const std::string& response) {
+            if (!ok) {
+                logCommandFailure("CQ not sent", "CQ", response);
+                if (cq_active_) stopCQ();
+            }
+        });
 
         last_cq_sent_ = now;
         cq_current_repeat_++;
@@ -5306,7 +5439,9 @@ bool App::sendBroadcastPayload(const std::vector<uint8_t>& payload) {
     if (modem_->getStatus().link_state == LinkState::Connected) {
         return modem_->sendData(payload);
     }
-    return modem_->sendBroadcastData(payload);
+    return modem_->sendBroadcastData(payload, [this](bool ok, const std::string& response) {
+        if (!ok) logCommandFailure("Broadcast not sent", "BCAST", response);
+    });
 }
 
 void App::sendBroadcast(const std::string& message) {
@@ -5657,7 +5792,10 @@ void App::updateQsyWorkflow() {
         pending_connect_target_ = qsy_workflow_peer_;
         qsy_workflow_state_ = QsyWorkflowState::ReconnectConnecting;
         qsy_connect_attempt_started_ = now;
-        modem_->connectToStation(qsy_workflow_peer_);
+        const std::string peer = qsy_workflow_peer_;
+        modem_->connectToStation(peer, [this, peer](bool ok, const std::string& response) {
+            if (!ok) logCommandFailure("Reconnect call to " + peer + " not started", "CONNECT", response);
+        });
 
         ChatMessage msg;
         msg.from = "SYSTEM";
@@ -10819,19 +10957,24 @@ void skylink::App::runTestScript() {
     } else if (cmd == "position") {
         auto f = splitBar(arg);
         if (f.size() >= 2) updatePosition(std::atof(f[0].c_str()), std::atof(f[1].c_str()));
+    } else if (cmd == "family") {
+        setModemFamily(arg);
     } else if (cmd == "modem") {
         if (modem_) modem_->sendCommand(arg);
     } else if (cmd == "screenshot") {
         test_shot_path_ = arg;
     } else if (cmd == "show") {
         static const std::pair<const char*, AppTab> kTabs[] = {
-            {"chat", AppTab::Chat}, {"files", AppTab::Files}, {"bbs", AppTab::BBS},
+            {"files", AppTab::Files}, {"bbs", AppTab::BBS},
             {"frequency", AppTab::Frequency}, {"messages", AppTab::Messages},
             {"mail", AppTab::Mail}, {"weather", AppTab::Weather},
             {"position", AppTab::Position}, {"map", AppTab::StationMap},
         };
         if (arg == "settings") {
             show_settings_ = true;
+        } else if (arg == "chat") {
+            current_tab_ = AppTab::Chat;
+            close_tool_windows_ = true;
         } else {
             bool found = false;
             for (const auto& [name, tab] : kTabs) {
@@ -10859,6 +11002,13 @@ void skylink::App::dumpTestReport(const std::string& path) {
     o << "{\n  \"callsign\": \"" << jsonEsc(config_.station.callsign) << "\",\n";
     o << "  \"modem_connected\": " << (modem_ && modem_->isConnected() ? "true" : "false") << ",\n";
     o << "  \"link_connected\": " << (isStationLinkConnected(false) ? "true" : "false") << ",\n";
+    {
+        const ModemStatus ms = modem_ ? modem_->getStatus() : ModemStatus{};
+        o << "  \"modem\": {\"state\": \"" << jsonEsc(ms.fsm_state) << "\", \"family\": \""
+          << jsonEsc(ms.family) << "\", \"mode\": \"" << jsonEsc(ms.mode) << "\", \"txbuf\": "
+          << ms.tx_buffer_bytes << ", \"config_family\": \"" << jsonEsc(config_.modem.family)
+          << "\"},\n";
+    }
     o << "  \"chat\": [";
     for (size_t i = 0; i < chat_history_.size(); ++i) {
         const auto& m = chat_history_[i];

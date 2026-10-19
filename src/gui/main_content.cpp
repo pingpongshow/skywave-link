@@ -456,7 +456,13 @@ void MainContentRenderer::render() {
     ImGui::SameLine(0.0f, em * 2.0f);
     ImGui::TextColored(pal.heading, "FILE");
     ImGui::SameLine();
-    bool has_transfers = state_.transfers && !state_.transfers->empty();
+    // Finished (completed or failed) transfers stay listed; only running ones count.
+    bool has_transfers = false;
+    if (state_.transfers) {
+        for (const auto& t : *state_.transfers) {
+            if (!t.completed && !t.failed) has_transfers = true;
+        }
+    }
     if (has_transfers) {
         ImGui::TextColored(pal.success, "ACTIVE");
     } else {
@@ -596,7 +602,22 @@ void MainContentRenderer::render() {
     ImGui::PopFont();
 
     ui::SectionHeader("SNR (dB)");
-    float remote_snr = state_.remote_snr_db ? *state_.remote_snr_db : 0.0f;
+    // Last: this station's RX SNR. Avg: its running mean over the current
+    // session. Mine: how well the peer hears this station (modem RSNR).
+    static double snr_sum = 0.0;
+    static int snr_samples = 0;
+    static float snr_last_sampled = -1000.0f;
+    const bool linked = status.link_state == LinkState::Connected;
+    if (!linked) {
+        snr_sum = 0.0;
+        snr_samples = 0;
+        snr_last_sampled = -1000.0f;
+    } else if (status.snr_db != snr_last_sampled) {
+        // Sample on change (EVT:SNR / STATUS), not per frame.
+        snr_sum += status.snr_db;
+        ++snr_samples;
+        snr_last_sampled = status.snr_db;
+    }
     if (ImGui::BeginTable("SnrTable", 3, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextColored(pal.muted, "Last");
@@ -604,25 +625,23 @@ void MainContentRenderer::render() {
         ImGui::TableNextColumn(); ImGui::TextColored(pal.muted, "Mine");
         ImGui::PushFont(ui::monoFont(), 0.0f);
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::Text("%.0f", status.snr_db);
-        ImGui::TableNextColumn(); ImGui::Text("%.0f", status.snr_db);
-        ImGui::TableNextColumn(); ImGui::Text("%.0f", remote_snr);
+        ImGui::TableNextColumn();
+        if (linked) ImGui::Text("%.0f", status.snr_db); else ImGui::TextColored(pal.muted, "--");
+        ImGui::TableNextColumn();
+        if (snr_samples > 0) {
+            ImGui::Text("%.0f", snr_sum / snr_samples);
+        } else {
+            ImGui::TextColored(pal.muted, "--");
+        }
+        ImGui::TableNextColumn();
+        if (linked && status.remote_snr_valid) {
+            ImGui::Text("%.0f", status.remote_snr_db);
+        } else {
+            ImGui::TextColored(pal.muted, "--");
+        }
         ImGui::PopFont();
         ImGui::EndTable();
     }
-
-    ImGui::Spacing();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(pal.heading, "QSY");
-    ImGui::SameLine();
-    static int qsy_slot = 0;
-    const float small_button = ImGui::GetFrameHeight();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - (small_button + style.ItemSpacing.x) * 2.0f);
-    ImGui::InputInt("##QSYSlot", &qsy_slot, 0, 0);
-    ImGui::SameLine();
-    if (ImGui::Button("^", ImVec2(small_button, 0))) { qsy_slot++; }
-    ImGui::SameLine();
-    if (ImGui::Button("#", ImVec2(small_button, 0))) { /* random slot */ }
 
     ui::SectionHeader("Actions");
 
@@ -736,11 +755,12 @@ void MainContentRenderer::render() {
                 }
                 packet.insert(packet.end(), msg_text.begin(), msg_text.end());
 
-                state_.modem->sendBeacon();
-                if (onSendData) onSendData(packet);
-
-                state_.addSystemMessage("[POSITION BROADCAST] " + grid + " - " +
-                    (state_.broadcast_message ? state_.broadcast_message : ""));
+                if (onSendBroadcastPayload && onSendBroadcastPayload(packet)) {
+                    state_.addSystemMessage("[POSITION BROADCAST] " + grid + " - " +
+                        (state_.broadcast_message ? state_.broadcast_message : ""));
+                } else {
+                    state_.addSystemMessage("Position broadcast not sent: the modem is not connected");
+                }
             } else if (state_.broadcast_message && std::strlen(state_.broadcast_message) > 0) {
                 if (onSendBroadcast) onSendBroadcast(state_.broadcast_message);
             }

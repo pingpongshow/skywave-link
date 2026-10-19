@@ -46,10 +46,11 @@ SKYLINK_TEST_LOG=scriptA.log \
 | `bbs_fetch <OWNER>\|<filename>` | `requestRemoteBBSDownload()` |
 | `snr` | `exchangeSNR(true)` |
 | `position <lat>\|<lon>` | `updatePosition()` |
+| `family <NAME>` | `setModemFamily()`, as choosing a Bandwidth Family in Settings (WIDE, MID, NARROW, ULTRA; ULTRA sends `ULTRA ON` first; a refusal reverts the setting and is logged) |
 | `modem <command>` | a raw modem control command |
 | `screenshot <path.ppm>` | the next rendered frame, read back from GL (works with the display asleep) |
-| `dump <path.json>` | report: chat, transfers, mail in/out, heard stations and beacons, ping results, weather, BBS files, modem/link state |
-| `show <window>` | open a window: `settings`, `files`, `bbs`, `frequency`, `messages`, `mail`, `weather`, `position`, `map` (`chat` returns to the main view) |
+| `dump <path.json>` | report: chat, transfers, mail in/out, heard stations and beacons, ping results, weather, BBS files, modem/link state (`modem`: FSM state, family, mode, TX backlog, configured family) |
+| `show <window>` | open a window: `settings`, `files`, `bbs`, `frequency`, `messages`, `mail`, `weather`, `position`, `map`; `show chat` returns to the main view and closes every floating window, Settings included |
 | `theme dark\|light` | switch the colour theme (as Settings -> UI -> Dark Mode) |
 | `quit` | normal shutdown (graceful link teardown, config save) |
 

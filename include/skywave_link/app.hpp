@@ -320,6 +320,7 @@ private:
     // UI state
     AppTab current_tab_ = AppTab::Chat;
     bool show_settings_ = false;
+    bool close_tool_windows_ = false;   // close every floating window next frame
     bool running_ = true;
     bool shutdown_done_ = false;
     bool imgui_initialized_ = false;
@@ -367,7 +368,12 @@ private:
     char modem_host_input_[256] = {0};
     // Last dial frequency pushed to the modem, so FREQINFO is sent on
     // change rather than every poll.
-    uint32_t last_reported_dial_hz_ = 0;
+    // Last FREQINFO pushed to the modem; kDialUnreported forces a push (of
+    // the rig-confirmed frequency, or 0 = unknown) after a modem connect.
+    static constexpr uint32_t kDialUnreported = 0xFFFFFFFFu;
+    uint32_t last_reported_dial_hz_ = kDialUnreported;
+    // Modem FSM state last announced in the log (dedupes STATE echoes).
+    std::string last_logged_fsm_state_;
     int modem_port_input_ = kDefaultCommandPort;
     int voice_port_input_ = kDefaultVoicePort;
     char voice_capture_device_input_[256] = {0};
@@ -391,6 +397,24 @@ private:
     uint32_t voice_capture_device_id_ = 0;
     uint32_t voice_playback_device_id_ = 0;
     bool voice_audio_ready_ = false;
+    // Voice devices open on a helper thread, and only while voice can be
+    // used: opening them at start-up blocked the first frame inside
+    // CoreAudio (microphone permission) and kept the mic live all day.
+    struct VoiceOpenJob {
+        std::atomic<bool> done{false};
+        uint32_t capture = 0, playback = 0;
+        std::string error;
+    };
+    std::shared_ptr<VoiceOpenJob> voice_open_job_;
+    // Modem auto-reconnect (maybeReconnectModem).
+    bool modem_auto_paused_ = false;
+    bool modem_unreachable_logged_ = false;
+    std::chrono::steady_clock::time_point modem_next_attempt_{};
+    void startModemConnect(bool announce);
+    void maybeReconnectModem();
+    std::chrono::steady_clock::time_point voice_open_retry_at_{};
+    bool voiceAudioWanted();
+    void updateVoiceAudioDevices();
     static constexpr size_t VOICE_PLAYBACK_PREBUFFER_SAMPLES = 3200;
     static constexpr size_t VOICE_PLAYBACK_REBUFFER_SAMPLES = 1600;
     static constexpr size_t VOICE_PLAYBACK_MIN_CHUNK_SAMPLES = 800;
@@ -557,11 +581,19 @@ private:
     // Initialization
     bool initSDL();
     bool initImGui();
-    bool initVoiceAudio();
     void shutdownVoiceAudio();
     void pumpVoiceAudio();
     void applyVoiceSettingsToModem(bool restart_if_open);
     void applyModemSettingsToModem();
+    // Ask the modem to switch bandwidth family (ULTRA ON first when needed).
+    // On refusal the setting reverts to the modem's actual family and the
+    // reason is logged.
+    void setModemFamily(const std::string& family);
+    // Read the modem's FAMILY into the settings (the modem is the authority).
+    void syncFamilyFromModem();
+    // Log a refused/unanswered modem command in plain words.
+    void logCommandFailure(const std::string& what, const std::string& cmd,
+                           const std::string& response);
     bool setVoicePttState(bool enabled);
     bool handleVoiceHotkeyEvent(const SDL_KeyboardEvent& key, bool pressed);
     bool openVoiceAudioDevices();
@@ -607,7 +639,8 @@ private:
     void onBroadcastMessage(const std::string& sender,
                             const std::vector<uint8_t>& payload);
     void onConnected(const std::string& callsign);
-    void onDisconnected();
+    void onDisconnected(const std::string& reason);
+    void onModemEvent(const std::string& name, const std::string& args);
 
     // Actions
     void connectToModem();

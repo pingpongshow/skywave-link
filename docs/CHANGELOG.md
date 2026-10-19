@@ -6,6 +6,84 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed (2026-10-19)
+
+- **Start-up hang.** The voice microphone and speaker were opened during
+  start-up on the GUI thread; that open waits inside CoreAudio (the
+  microphone permission check) and the window never finished starting, so
+  the app also never connected to the modem. Voice devices now open on a
+  helper thread and only while voice can be used (a voice mode is set,
+  the modem is connected, and a session is up, voice is active, or the
+  mode is BROADCAST); they close again afterwards, so the microphone is no
+  longer live all the time.
+- **Modem auto-reconnect.** `modem.reconnect_interval_sec` was read but
+  never used: a modem that was not listening at the single start-up
+  attempt (both apps launched together) left the companion disconnected
+  until CONNECT MODEM was pressed, and a restarted modem was never
+  rejoined. With `auto_connect` on, the app now retries every interval
+  until connected; a manual disconnect pauses it, and only the first
+  failure is logged.
+
+### Changed (2026-10-19)
+
+- **File transfer streams.** The file is sent in 2 KB chunks back to back
+  over the modem's reliable, ordered ARQ session instead of 200-byte chunks
+  each waiting for an application ACK (10 s timeout, spurious
+  retransmits). Flow control follows the modem's TX backlog (`BUFFER`):
+  new data is written only while about 8 KB or less is queued. The
+  receiver checks size and CRC end to end and answers once (FileAck with
+  ok/failed and a reason); one 180 s inactivity timeout replaces
+  per-chunk retries. New wire format (FileOffer: payload size + CRC;
+  FileChunk: offset + data; FileComplete: size + payload CRC; FileNack and
+  FileResume removed); both ends must run this version. Live: 20 KB
+  between two modems in ~85 s (was 600-800 B in 100 s)
+- Bandwidth family: choosing a family in Settings applies it to the modem
+  at once. ULTRA sends `ULTRA ON` then `FAMILY ULTRA`; leaving ULTRA is a
+  plain `FAMILY` change. A refusal (e.g. mid-session) reverts the choice
+  to the modem's actual family and logs why. On modem connect the app
+  reads the modem's saved `FAMILY` instead of overwriting it
+- Status bar shows the modem's FSM state (`LINK: CALLING <call>`,
+  `CONNECTING`, `DISCONNECTING`, `LISTENING`) and the family/mode the
+  modem is actually running
+- `LISTEN ON` is no longer forced after every disconnect (the modem
+  persists LISTEN)
+- Settings tab bar scrolls instead of truncating labels
+- Builds with `-Wall -Wextra` for the project's own sources (not
+  `thirdparty/`); dead code it reported was removed
+- Test hook: `family <NAME>`; `dump` reports the modem's state, family,
+  mode and TX backlog; `show chat` closes every floating window as
+  documented
+
+### Fixed (2026-10-19)
+
+- File transfers kept running after the radio link ended; every transfer
+  in flight now fails ("Link lost") on both sides, and nothing is sent
+  unless the station link is up
+- `ModemClient::sendData()` wrote unframed bytes to the data port while no
+  session was up, where they sat in the modem's TX queue (seen as
+  `TXBUF=666` after a disconnect); it now refuses them, and queued session
+  data is dropped when the session ends. Mesh relay forwarding uses the
+  broadcast path when idle
+- Failed and refused calls were silent: `EVT:DISCONNECTED <reason>` is
+  reported in plain words ("Call to K1ZZZ failed: No answer from the
+  called station"), state changes (calling, incoming call, disconnecting)
+  and modem warnings (TX watchdog, CFO, stream replay) are logged
+- CONNECT, CQ, BCAST, MYCALL (Settings Apply and on modem connect),
+  FREQINFO and FAMILY report modem `ERROR:` answers to the log instead of
+  treating "sent" as success
+- Idle position broadcasts (main view and Position window) went out as
+  `BEACON` plus raw data-port bytes; they now use BCAST (session data
+  while linked)
+- SNR panel: "Mine" shows the peer's report (modem `RSNR` / `EVT:SNR`
+  remote value), "Avg" is a real running average over the session;
+  `EVT:SNR <local> <remote>` is parsed in full
+- FREQINFO reported a dial frequency no rig had confirmed (e.g. 7055000
+  with no radio); only the rig's confirmed frequency is reported,
+  otherwise `FREQINFO 0` (unknown)
+- "Connected to modem" is logged when the modem connection comes up
+- Removed the dead QSY slot control from the main view
+- The main view's FILE indicator counted finished transfers as active
+
 ### Changed (2026-10-18)
 
 - **Modern GUI look.** Roboto (UI) and Cousine (monospace) are compiled

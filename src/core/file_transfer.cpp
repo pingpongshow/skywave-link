@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <sstream>
 #include <exception>
+#include <cstdlib>
 
 namespace skylink {
 
@@ -141,8 +142,59 @@ uint32_t FileTransferManager::calculateCRC32(const std::vector<uint8_t>& data) {
     return crc ^ 0xFFFFFFFF;
 }
 
+namespace {
+
+// The LZH payload of an incompressible file is slightly larger than the
+// file; offers are bounded with that headroom.
+constexpr size_t kMaxFilePayload = MAX_FILE_SIZE + MAX_FILE_SIZE / 8 + 1024;
+// ModemClient frames each session message with a 4-byte header.
+constexpr size_t kSessionFrameOverhead = 4;
+constexpr auto kBacklogQueryInterval = std::chrono::milliseconds(250);
+
+void putLe32(std::vector<uint8_t>& m, uint32_t v) {
+    m.push_back(static_cast<uint8_t>(v & 0xFF));
+    m.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    m.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    m.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+}
+
+uint32_t getLe32(const std::vector<uint8_t>& d, size_t pos) {
+    return static_cast<uint32_t>(d[pos])
+         | (static_cast<uint32_t>(d[pos + 1]) << 8)
+         | (static_cast<uint32_t>(d[pos + 2]) << 16)
+         | (static_cast<uint32_t>(d[pos + 3]) << 24);
+}
+
+int64_t unixNow() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+bool isActive(TransferState s) {
+    return s == TransferState::Pending || s == TransferState::Negotiating ||
+           s == TransferState::Transferring;
+}
+
+} // namespace
+
+bool FileTransferManager::linkUp(const ModemClient& modem) {
+    return modem.isConnected() && modem.getStatus().link_state == LinkState::Connected;
+}
+
+bool FileTransferManager::send(ModemClient& modem, const std::vector<uint8_t>& msg) {
+    if (!linkUp(modem)) return false;
+    if (!modem.sendData(msg)) return false;
+    bytes_sent_ += msg.size() + kSessionFrameOverhead;
+    return true;
+}
+
 std::string FileTransferManager::sendFile(ModemClient& modem, const std::string& remote_callsign,
                                            const std::string& filepath) {
+    if (!linkUp(modem)) {
+        std::cerr << "[FileTransfer] Not linked to a station; cannot send " << filepath << "\n";
+        return "";
+    }
+
     // Check if file exists and is within size limit
     std::error_code ec;
     auto file_size = std::filesystem::file_size(filepath, ec);
@@ -161,7 +213,6 @@ std::string FileTransferManager::sendFile(ModemClient& modem, const std::string&
         return "";
     }
 
-    // Read file
     std::ifstream file(filepath, std::ios::binary);
     if (!file) {
         std::cerr << "[FileTransfer] Cannot open file: " << filepath << "\n";
@@ -175,15 +226,13 @@ std::string FileTransferManager::sendFile(ModemClient& modem, const std::string&
         return "";
     }
 
-    // Compress data
     LZHCodec lzh;
     std::vector<uint8_t> compressed = lzh.compress(file_data);
-    if (compressed.empty()) {
-        std::cerr << "[FileTransfer] Compression produced empty payload: " << filepath << "\n";
+    if (compressed.empty() || compressed.size() > kMaxFilePayload) {
+        std::cerr << "[FileTransfer] Compression failed: " << filepath << "\n";
         return "";
     }
 
-    // Create transfer
     Transfer t;
     t.progress.transfer_id = generateTransferId();
     // The offer carries a one-byte length: truncate long names here so the
@@ -193,34 +242,22 @@ std::string FileTransferManager::sendFile(ModemClient& modem, const std::string&
     t.progress.direction = TransferDirection::Upload;
     t.progress.state = TransferState::Negotiating;
     t.progress.total_bytes = compressed.size();
-    t.progress.transferred_bytes = 0;
-    t.progress.total_chunks = (compressed.size() + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
-    t.progress.completed_chunks = 0;
-    t.progress.started_at = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    t.progress.started_at = unixNow();
     t.progress.last_activity = t.progress.started_at;
-
     t.data = std::move(compressed);
     t.local_path = filepath;
     t.crc32 = calculateCRC32(file_data);
-    t.retry_count = 0;
-    t.current_chunk = 0;
-    t.last_send = std::chrono::steady_clock::now();
+    t.last_activity = Clock::now();
 
     const std::string transfer_id = t.progress.transfer_id;
-
-    // Store transfer
+    const std::vector<uint8_t> offer = buildFileOffer(t);
     transfers_[transfer_id] = std::move(t);
-    auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) {
-        std::cerr << "[FileTransfer] Internal error storing transfer\n";
+    if (!send(modem, offer)) {
+        transfers_.erase(transfer_id);
+        std::cerr << "[FileTransfer] Could not send the offer for " << filepath << "\n";
         return "";
     }
-
-    // Send file offer
-    auto offer = buildFileOffer(it->second);
-    modem.sendData(offer);
-
+    notifyProgress(transfers_[transfer_id]);
     return transfer_id;
 }
 
@@ -229,12 +266,9 @@ void FileTransferManager::acceptTransfer(ModemClient& modem, const std::string& 
     if (it == transfers_.end()) {
         return;
     }
-
     it->second.progress.state = TransferState::Transferring;
-
-    auto accept = buildFileAccept(transfer_id);
-    modem.sendData(accept);
-
+    it->second.last_activity = Clock::now();
+    send(modem, buildIdMessage(FileMessageType::FileAccept, transfer_id));
 }
 
 void FileTransferManager::rejectTransfer(ModemClient& modem, const std::string& transfer_id) {
@@ -242,58 +276,76 @@ void FileTransferManager::rejectTransfer(ModemClient& modem, const std::string& 
     if (it == transfers_.end()) {
         return;
     }
-
     it->second.progress.state = TransferState::Failed;
     it->second.progress.error_message = "Rejected by user";
-
-    auto reject = buildFileReject(transfer_id);
-    modem.sendData(reject);
-
+    send(modem, buildIdMessage(FileMessageType::FileReject, transfer_id));
 }
 
 void FileTransferManager::cancelTransfer(ModemClient& modem, const std::string& transfer_id) {
     auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) {
+    if (it == transfers_.end() || !isActive(it->second.progress.state)) {
         return;
     }
-
+    pending_offers_.erase(transfer_id);
     it->second.progress.state = TransferState::Cancelled;
+    it->second.progress.error_message = "Cancelled";
+    send(modem, buildIdMessage(FileMessageType::FileCancel, transfer_id));
+    notifyProgress(it->second);
+}
 
-    auto cancel = buildFileCancel(transfer_id);
-    modem.sendData(cancel);
-
+void FileTransferManager::linkLost(const std::string& reason) {
+    std::vector<std::string> deferred;
+    for (const auto& [id, offered] : pending_offers_) {
+        (void)offered;
+        deferred.push_back(id);
+    }
+    pending_offers_.clear();
+    for (const auto& id : deferred) {
+        failPendingOffer(id, "Offer dropped: session ended");
+    }
+    for (auto& [id, t] : transfers_) {
+        (void)id;
+        if (isActive(t.progress.state)) {
+            failTransfer(t, reason);
+        }
+    }
 }
 
 void FileTransferManager::processIncomingData(ModemClient& modem, const std::vector<uint8_t>& data) {
-    if (data.empty()) return;
+    if (data.size() < 3) return;
 
     try {
-        FileMessageType type = static_cast<FileMessageType>(data[0]);
+        const auto type = static_cast<FileMessageType>(data[0]);
+        if (type == FileMessageType::FileOffer) {
+            handleFileOffer(modem, data);
+            return;
+        }
+
+        size_t pos = 1;
+        const uint8_t id_len = data[pos++];
+        if (id_len == 0 || pos + id_len > data.size()) return;
+        const std::string id(data.begin() + static_cast<std::ptrdiff_t>(pos),
+                             data.begin() + static_cast<std::ptrdiff_t>(pos + id_len));
+        pos += id_len;
 
         switch (type) {
-            case FileMessageType::FileOffer:
-                handleFileOffer(modem, data);
-                break;
             case FileMessageType::FileAccept:
-                handleFileAccept(modem, data);
+                handleFileAccept(modem, id);
                 break;
             case FileMessageType::FileReject:
-                handleFileReject(data);
+                handleFileReject(id);
                 break;
             case FileMessageType::FileChunk:
-                handleFileChunk(modem, data);
-                break;
-            case FileMessageType::FileAck:
-                handleFileAck(modem, data);
-                break;
-            case FileMessageType::FileNack:
-                handleFileNack(modem, data);
+                handleFileChunk(modem, id, data, pos);
                 break;
             case FileMessageType::FileComplete:
-                handleFileComplete(data);
+                handleFileComplete(modem, id, data, pos);
+                break;
+            case FileMessageType::FileAck:
+                handleFileAck(id, data, pos);
                 break;
             case FileMessageType::FileCancel:
-                handleFileCancel(data);
+                handleFileCancel(id);
                 break;
             default:
                 // Not a file transfer message
@@ -307,7 +359,14 @@ void FileTransferManager::processIncomingData(ModemClient& modem, const std::vec
 }
 
 void FileTransferManager::update(ModemClient& modem) {
-    auto now = std::chrono::steady_clock::now();
+    // Nothing is ever sent without a station link; whatever was in flight
+    // over a link that is gone has failed.
+    if (!linkUp(modem)) {
+        linkLost();
+        return;
+    }
+
+    const auto now = Clock::now();
 
     // Deferred offers nobody answered are rejected.
     for (auto pit = pending_offers_.begin(); pit != pending_offers_.end();) {
@@ -316,7 +375,7 @@ void FileTransferManager::update(ModemClient& modem) {
             pit = pending_offers_.erase(pit);
             auto it = transfers_.find(id);
             if (it != transfers_.end() && it->second.progress.state == TransferState::Negotiating) {
-                modem.sendData(buildFileReject(id));
+                send(modem, buildIdMessage(FileMessageType::FileReject, id));
                 failPendingOffer(id, "Offer timed out");
             }
         } else {
@@ -324,24 +383,114 @@ void FileTransferManager::update(ModemClient& modem) {
         }
     }
 
-    for (auto& [id, t] : transfers_) {
-        if (t.progress.state == TransferState::Transferring &&
-            t.progress.direction == TransferDirection::Upload) {
+    pumpUploads(modem);
 
-            // Check for timeout and retransmit
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - t.last_send);
-            if (elapsed.count() > 10) {  // 10 second timeout
-                if (t.retry_count < 5) {
-                    // Retransmit current chunk
-                    sendNextChunk(modem, t);
-                    t.retry_count++;
-                } else {
-                    // Too many retries
-                    t.progress.state = TransferState::Failed;
-                    t.progress.error_message = "Timeout - no response";
-                    notifyProgress(t);
-                }
+    // One long inactivity timeout replaces per-chunk retransmission: the
+    // modem's ARQ already delivers every byte in order or drops the link.
+    for (auto& [id, t] : transfers_) {
+        const TransferState s = t.progress.state;
+        if (s != TransferState::Negotiating && s != TransferState::Transferring) continue;
+        if (pending_offers_.count(id) > 0) continue;  // the operator is deciding
+        if (now - t.last_activity < inactivity_timeout_) continue;
+        const bool unanswered = (s == TransferState::Negotiating &&
+                                 t.progress.direction == TransferDirection::Upload);
+        send(modem, buildIdMessage(FileMessageType::FileCancel, id));
+        failTransfer(t, unanswered ? "No answer to the file offer"
+                                   : "Timed out (no progress)");
+    }
+}
+
+size_t FileTransferManager::estimatedBacklog(const ModemClient& modem) const {
+    // The last BUFFER answer, plus everything written since the query it
+    // answers, plus bytes still waiting in the client's socket queue.
+    const uint64_t since = bytes_sent_ > backlog_->sent_at_reply
+                               ? bytes_sent_ - backlog_->sent_at_reply : 0;
+    return backlog_->reported + static_cast<size_t>(since) + modem.pendingDataBytes();
+}
+
+void FileTransferManager::queryBacklog(ModemClient& modem) {
+    const auto now = Clock::now();
+    if (backlog_->query_outstanding || now - last_backlog_query_ < kBacklogQueryInterval) {
+        return;
+    }
+    last_backlog_query_ = now;
+    backlog_->query_outstanding = true;
+    const uint64_t sent_at = bytes_sent_;
+    backlog_->sent_at_query = sent_at;
+    std::weak_ptr<BacklogState> weak = backlog_;
+    modem.sendCommandAsync("BUFFER", [weak, sent_at](bool ok, const std::string& response) {
+        auto st = weak.lock();
+        if (!st) return;
+        st->query_outstanding = false;
+        if (!ok) return;
+        // `BUFFER <bytes>`
+        size_t value = 0;
+        const size_t sp = response.find(' ');
+        if (sp != std::string::npos) {
+            value = static_cast<size_t>(std::strtoull(response.c_str() + sp + 1, nullptr, 10));
+        }
+        if (value != st->reported) st->changed = true;
+        st->reported = value;
+        st->sent_at_reply = sent_at;
+    });
+}
+
+void FileTransferManager::pumpUploads(ModemClient& modem) {
+    bool any = false;
+    for (const auto& [id, t] : transfers_) {
+        (void)id;
+        if (t.progress.direction == TransferDirection::Upload &&
+            t.progress.state == TransferState::Transferring) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+
+    queryBacklog(modem);
+    const auto now = Clock::now();
+    size_t backlog = estimatedBacklog(modem);
+    const bool draining = backlog_->changed;
+    backlog_->changed = false;
+
+    for (auto& [id, t] : transfers_) {
+        (void)id;
+        if (t.progress.direction != TransferDirection::Upload ||
+            t.progress.state != TransferState::Transferring) {
+            continue;
+        }
+        if (draining) t.last_activity = now;
+
+        while (!t.complete_sent && t.progress.state == TransferState::Transferring) {
+            std::vector<uint8_t> msg;
+            size_t len = 0;
+            if (t.next_offset < t.data.size()) {
+                if (backlog >= FILE_TX_BACKLOG_TARGET) break;
+                len = std::min(FILE_CHUNK_SIZE, t.data.size() - t.next_offset);
+                msg = buildFileChunk(t, t.next_offset, len);
+            } else {
+                msg = buildFileComplete(t);
             }
+            if (!send(modem, msg)) {
+                failTransfer(t, "Could not hand data to the modem");
+                break;
+            }
+            if (len > 0) {
+                t.next_offset += len;
+            } else {
+                t.complete_sent = true;
+            }
+            backlog += msg.size() + kSessionFrameOverhead;
+            t.last_activity = now;
+        }
+        if (t.progress.state != TransferState::Transferring) continue;
+
+        // Bytes still queued in the modem have not gone out yet.
+        const size_t aired = t.next_offset - std::min(t.next_offset, backlog);
+        if (aired > t.progress.transferred_bytes) {
+            t.progress.transferred_bytes = aired;
+            t.progress.last_activity = unixNow();
+            notifyProgress(t);
         }
     }
 }
@@ -349,9 +498,8 @@ void FileTransferManager::update(ModemClient& modem) {
 std::vector<TransferProgress> FileTransferManager::getActiveTransfers() const {
     std::vector<TransferProgress> result;
     for (const auto& [id, t] : transfers_) {
-        if (t.progress.state == TransferState::Negotiating ||
-            t.progress.state == TransferState::Transferring ||
-            t.progress.state == TransferState::Pending) {
+        (void)id;
+        if (isActive(t.progress.state)) {
             result.push_back(t.progress);
         }
     }
@@ -361,6 +509,7 @@ std::vector<TransferProgress> FileTransferManager::getActiveTransfers() const {
 std::vector<TransferProgress> FileTransferManager::getCompletedTransfers() const {
     std::vector<TransferProgress> result;
     for (const auto& [id, t] : transfers_) {
+        (void)id;
         if (t.progress.state == TransferState::Completed ||
             t.progress.state == TransferState::Failed ||
             t.progress.state == TransferState::Cancelled) {
@@ -378,189 +527,93 @@ TransferProgress FileTransferManager::getTransfer(const std::string& transfer_id
     return TransferProgress{};
 }
 
-// Build protocol messages
+// Build protocol messages (see FileMessageType for the layouts)
+
+std::vector<uint8_t> FileTransferManager::buildIdMessage(FileMessageType type,
+                                                         const std::string& transfer_id) {
+    std::vector<uint8_t> msg;
+    msg.push_back(static_cast<uint8_t>(type));
+    msg.push_back(static_cast<uint8_t>(transfer_id.size()));
+    msg.insert(msg.end(), transfer_id.begin(), transfer_id.end());
+    return msg;
+}
 
 std::vector<uint8_t> FileTransferManager::buildFileOffer(const Transfer& t) {
-    // Format: type(1) + id_len(1) + id + filename_len(1) + filename + size(4) + chunks(2) + crc(4)
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileOffer));
-    msg.push_back(static_cast<uint8_t>(t.progress.transfer_id.size()));
-    msg.insert(msg.end(), t.progress.transfer_id.begin(), t.progress.transfer_id.end());
+    std::vector<uint8_t> msg = buildIdMessage(FileMessageType::FileOffer, t.progress.transfer_id);
     const std::string name = truncateFilename(t.progress.filename);
     msg.push_back(static_cast<uint8_t>(name.size()));
     msg.insert(msg.end(), name.begin(), name.end());
-
-    uint32_t size = static_cast<uint32_t>(t.progress.total_bytes);
-    msg.push_back(size & 0xFF);
-    msg.push_back((size >> 8) & 0xFF);
-    msg.push_back((size >> 16) & 0xFF);
-    msg.push_back((size >> 24) & 0xFF);
-
-    uint16_t chunks = static_cast<uint16_t>(t.progress.total_chunks);
-    msg.push_back(chunks & 0xFF);
-    msg.push_back((chunks >> 8) & 0xFF);
-
-    msg.push_back(t.crc32 & 0xFF);
-    msg.push_back((t.crc32 >> 8) & 0xFF);
-    msg.push_back((t.crc32 >> 16) & 0xFF);
-    msg.push_back((t.crc32 >> 24) & 0xFF);
-
+    putLe32(msg, static_cast<uint32_t>(t.progress.total_bytes));
+    putLe32(msg, t.crc32);
     return msg;
 }
 
-std::vector<uint8_t> FileTransferManager::buildFileAccept(const std::string& transfer_id) {
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileAccept));
-    msg.push_back(static_cast<uint8_t>(transfer_id.size()));
-    msg.insert(msg.end(), transfer_id.begin(), transfer_id.end());
+std::vector<uint8_t> FileTransferManager::buildFileChunk(const Transfer& t, size_t offset, size_t len) {
+    std::vector<uint8_t> msg = buildIdMessage(FileMessageType::FileChunk, t.progress.transfer_id);
+    putLe32(msg, static_cast<uint32_t>(offset));
+    msg.insert(msg.end(), t.data.begin() + static_cast<std::ptrdiff_t>(offset),
+               t.data.begin() + static_cast<std::ptrdiff_t>(offset + len));
     return msg;
 }
 
-std::vector<uint8_t> FileTransferManager::buildFileReject(const std::string& transfer_id) {
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileReject));
-    msg.push_back(static_cast<uint8_t>(transfer_id.size()));
-    msg.insert(msg.end(), transfer_id.begin(), transfer_id.end());
+std::vector<uint8_t> FileTransferManager::buildFileComplete(const Transfer& t) {
+    std::vector<uint8_t> msg = buildIdMessage(FileMessageType::FileComplete, t.progress.transfer_id);
+    putLe32(msg, static_cast<uint32_t>(t.data.size()));
+    putLe32(msg, calculateCRC32(t.data));
     return msg;
 }
 
-std::vector<uint8_t> FileTransferManager::buildFileChunk(const Transfer& t, int chunk_index) {
-    // Format: type(1) + id_len(1) + id + chunk_index(2) + data_len(2) + data_crc32(4) + data
-    if (chunk_index < 0) {
-        return {};
-    }
-
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileChunk));
-    msg.push_back(static_cast<uint8_t>(t.progress.transfer_id.size()));
-    msg.insert(msg.end(), t.progress.transfer_id.begin(), t.progress.transfer_id.end());
-
-    msg.push_back(chunk_index & 0xFF);
-    msg.push_back((chunk_index >> 8) & 0xFF);
-
-    size_t offset = static_cast<size_t>(chunk_index) * FILE_CHUNK_SIZE;
-    if (offset > t.data.size()) {
-        return {};
-    }
-    size_t len = std::min(FILE_CHUNK_SIZE, t.data.size() - offset);
-    std::vector<uint8_t> chunk_data(t.data.begin() + offset, t.data.begin() + offset + len);
-    uint32_t chunk_crc = calculateCRC32(chunk_data);
-
-    msg.push_back(len & 0xFF);
-    msg.push_back((len >> 8) & 0xFF);
-    msg.push_back(chunk_crc & 0xFF);
-    msg.push_back((chunk_crc >> 8) & 0xFF);
-    msg.push_back((chunk_crc >> 16) & 0xFF);
-    msg.push_back((chunk_crc >> 24) & 0xFF);
-
-    msg.insert(msg.end(), chunk_data.begin(), chunk_data.end());
-
-    return msg;
-}
-
-std::vector<uint8_t> FileTransferManager::buildFileAck(const std::string& transfer_id, int chunk_index) {
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileAck));
-    msg.push_back(static_cast<uint8_t>(transfer_id.size()));
-    msg.insert(msg.end(), transfer_id.begin(), transfer_id.end());
-    msg.push_back(chunk_index & 0xFF);
-    msg.push_back((chunk_index >> 8) & 0xFF);
-    return msg;
-}
-
-std::vector<uint8_t> FileTransferManager::buildFileNack(const std::string& transfer_id, int chunk_index) {
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileNack));
-    msg.push_back(static_cast<uint8_t>(transfer_id.size()));
-    msg.insert(msg.end(), transfer_id.begin(), transfer_id.end());
-    msg.push_back(chunk_index & 0xFF);
-    msg.push_back((chunk_index >> 8) & 0xFF);
-    return msg;
-}
-
-std::vector<uint8_t> FileTransferManager::buildFileComplete(const std::string& transfer_id, uint32_t crc) {
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileComplete));
-    msg.push_back(static_cast<uint8_t>(transfer_id.size()));
-    msg.insert(msg.end(), transfer_id.begin(), transfer_id.end());
-    msg.push_back(crc & 0xFF);
-    msg.push_back((crc >> 8) & 0xFF);
-    msg.push_back((crc >> 16) & 0xFF);
-    msg.push_back((crc >> 24) & 0xFF);
-    return msg;
-}
-
-std::vector<uint8_t> FileTransferManager::buildFileCancel(const std::string& transfer_id) {
-    std::vector<uint8_t> msg;
-    msg.push_back(static_cast<uint8_t>(FileMessageType::FileCancel));
-    msg.push_back(static_cast<uint8_t>(transfer_id.size()));
-    msg.insert(msg.end(), transfer_id.begin(), transfer_id.end());
+std::vector<uint8_t> FileTransferManager::buildFileAck(const std::string& transfer_id, bool ok,
+                                                       const std::string& reason) {
+    std::vector<uint8_t> msg = buildIdMessage(FileMessageType::FileAck, transfer_id);
+    msg.push_back(ok ? 0 : 1);
+    msg.insert(msg.end(), reason.begin(), reason.end());
     return msg;
 }
 
 // Handle incoming messages
 
 void FileTransferManager::handleFileOffer(ModemClient& modem, const std::vector<uint8_t>& data) {
-    if (data.size() < 3) return;
-
     size_t pos = 1;
-    uint8_t id_len = data[pos++];
+    const uint8_t id_len = data[pos++];
     if (id_len == 0 || pos + id_len > data.size()) return;
 
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
+    std::string transfer_id(data.begin() + static_cast<std::ptrdiff_t>(pos),
+                            data.begin() + static_cast<std::ptrdiff_t>(pos + id_len));
     pos += id_len;
 
     if (pos >= data.size()) return;
-    uint8_t name_len = data[pos++];
+    const uint8_t name_len = data[pos++];
     if (name_len == 0 || pos + name_len > data.size()) return;
 
-    std::string raw_name(data.begin() + pos, data.begin() + pos + name_len);
+    std::string raw_name(data.begin() + static_cast<std::ptrdiff_t>(pos),
+                         data.begin() + static_cast<std::ptrdiff_t>(pos + name_len));
     pos += name_len;
 
     // Sanitize filename: strip path components to prevent directory traversal
     std::string filename = std::filesystem::path(raw_name).filename().string();
     if (filename.empty() || filename == "." || filename == "..") {
-        modem.sendData(buildFileReject(transfer_id));
+        send(modem, buildIdMessage(FileMessageType::FileReject, transfer_id));
         return;
     }
 
-    if (pos + 10 > data.size()) return;
+    if (pos + 8 > data.size()) return;
+    const uint32_t size = getLe32(data, pos);
+    const uint32_t crc = getLe32(data, pos + 4);
 
-    uint32_t size = static_cast<uint32_t>(data[pos])
-                  | (static_cast<uint32_t>(data[pos+1]) << 8)
-                  | (static_cast<uint32_t>(data[pos+2]) << 16)
-                  | (static_cast<uint32_t>(data[pos+3]) << 24);
-    pos += 4;
-
-    uint16_t chunks = data[pos] | (data[pos+1] << 8);
-    pos += 2;
-
-    uint32_t crc = static_cast<uint32_t>(data[pos])
-                 | (static_cast<uint32_t>(data[pos+1]) << 8)
-                 | (static_cast<uint32_t>(data[pos+2]) << 16)
-                 | (static_cast<uint32_t>(data[pos+3]) << 24);
-    pos += 4;
-
-    const size_t max_chunks = (MAX_FILE_SIZE + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
-    if (size == 0 || size > MAX_FILE_SIZE || chunks == 0 || chunks > max_chunks) {
-        modem.sendData(buildFileReject(transfer_id));
-        return;
-    }
-    const size_t expected_chunks = (size + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
-    if (chunks != expected_chunks) {
-        modem.sendData(buildFileReject(transfer_id));
+    if (size == 0 || size > kMaxFilePayload) {
+        send(modem, buildIdMessage(FileMessageType::FileReject, transfer_id));
         return;
     }
 
-    // A repeated offer for an id already awaiting the operator changes nothing.
-    if (pending_offers_.count(transfer_id) > 0) {
+    // A repeated offer for an id already known changes nothing.
+    auto existing = transfers_.find(transfer_id);
+    if (existing != transfers_.end() && isActive(existing->second.progress.state)) {
         return;
     }
 
-    // Get remote callsign from modem status
     std::string remote = modem.getStatus().remote_callsign;
 
-    // Create download transfer
     Transfer t;
     t.progress.transfer_id = transfer_id;
     t.progress.filename = filename;
@@ -568,18 +621,11 @@ void FileTransferManager::handleFileOffer(ModemClient& modem, const std::vector<
     t.progress.direction = TransferDirection::Download;
     t.progress.state = TransferState::Negotiating;
     t.progress.total_bytes = size;
-    t.progress.transferred_bytes = 0;
-    t.progress.total_chunks = chunks;
-    t.progress.completed_chunks = 0;
-    t.progress.started_at = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    t.progress.started_at = unixNow();
     t.progress.last_activity = t.progress.started_at;
-
-    t.data.resize(size);
-    t.chunk_received.resize(chunks, false);
+    t.data.reserve(size);
     t.crc32 = crc;
-    t.retry_count = 0;
-    t.current_chunk = 0;
+    t.last_activity = Clock::now();
 
     transfers_[transfer_id] = std::move(t);
 
@@ -592,7 +638,7 @@ void FileTransferManager::handleFileOffer(ModemClient& modem, const std::vector<
 
     if (decision == FileOfferDecision::Defer) {
         if (pending_offers_.size() < MAX_PENDING_OFFERS) {
-            pending_offers_[transfer_id] = std::chrono::steady_clock::now();
+            pending_offers_[transfer_id] = Clock::now();
             notifyProgress(transfers_[transfer_id]);
             return;
         }
@@ -604,6 +650,7 @@ void FileTransferManager::handleFileOffer(ModemClient& modem, const std::vector<
     } else {
         rejectTransfer(modem, transfer_id);
     }
+    notifyProgress(transfers_[transfer_id]);
 }
 
 bool FileTransferManager::acceptPendingOffer(ModemClient& modem, const std::string& transfer_id) {
@@ -672,294 +719,147 @@ void FileTransferManager::failPendingOffer(const std::string& transfer_id, const
     notifyProgress(it->second);
 }
 
-void FileTransferManager::handleFileAccept(ModemClient& modem, const std::vector<uint8_t>& data) {
-    if (data.size() < 3) return;
-
-    size_t pos = 1;
-    uint8_t id_len = data[pos++];
-    if (id_len == 0 || pos + id_len > data.size()) return;
-
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
-
-    auto it = transfers_.find(transfer_id);
+void FileTransferManager::handleFileAccept(ModemClient& modem, const std::string& id) {
+    auto it = transfers_.find(id);
     if (it == transfers_.end()) return;
-
-    it->second.progress.state = TransferState::Transferring;
-    it->second.current_chunk = 0;
-
-    // Start sending chunks
-    sendNextChunk(modem, it->second);
-}
-
-void FileTransferManager::handleFileReject(const std::vector<uint8_t>& data) {
-    if (data.size() < 3) return;
-
-    size_t pos = 1;
-    uint8_t id_len = data[pos++];
-    if (id_len == 0 || pos + id_len > data.size()) return;
-
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
-
-    auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) return;
-
-    it->second.progress.state = TransferState::Failed;
-    it->second.progress.error_message = "Rejected by remote";
-    notifyProgress(it->second);
-
-}
-
-void FileTransferManager::handleFileChunk(ModemClient& modem, const std::vector<uint8_t>& data) {
-    if (data.size() < 11) return;
-
-    size_t pos = 1;
-    uint8_t id_len = data[pos++];
-    if (id_len == 0 || pos + id_len > data.size()) return;
-
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
-    pos += id_len;
-
-    auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) return;
-
-    // Only accept chunks when actively transferring
-    if (it->second.progress.state != TransferState::Transferring) return;
-    if (pos + 4 > data.size()) return;
-
-    uint16_t chunk_index = data[pos] | (data[pos+1] << 8);
-    pos += 2;
-
-    uint16_t chunk_len = data[pos] | (data[pos+1] << 8);
-    pos += 2;
-    if (pos + 4 > data.size()) {
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
+    Transfer& t = it->second;
+    if (t.progress.direction != TransferDirection::Upload ||
+        t.progress.state != TransferState::Negotiating) {
         return;
     }
-    uint32_t expected_chunk_crc =
-        static_cast<uint32_t>(data[pos])
-        | (static_cast<uint32_t>(data[pos+1]) << 8)
-        | (static_cast<uint32_t>(data[pos+2]) << 16)
-        | (static_cast<uint32_t>(data[pos+3]) << 24);
+    t.progress.state = TransferState::Transferring;
+    t.next_offset = 0;
+    t.complete_sent = false;
+    t.last_activity = Clock::now();
+    notifyProgress(t);
+    pumpUploads(modem);
+}
+
+void FileTransferManager::handleFileReject(const std::string& id) {
+    auto it = transfers_.find(id);
+    if (it == transfers_.end()) return;
+    if (it->second.progress.direction != TransferDirection::Upload) return;
+    if (!isActive(it->second.progress.state)) return;
+    failTransfer(it->second, "Rejected by remote");
+}
+
+void FileTransferManager::handleFileChunk(ModemClient& modem, const std::string& id,
+                                          const std::vector<uint8_t>& data, size_t pos) {
+    auto it = transfers_.find(id);
+    if (it == transfers_.end()) return;
+    Transfer& t = it->second;
+    if (t.progress.direction != TransferDirection::Download ||
+        t.progress.state != TransferState::Transferring) {
+        return;
+    }
+    if (pos + 4 > data.size()) return;
+    const size_t offset = getLe32(data, pos);
     pos += 4;
+    const size_t len = data.size() - pos;
+    const size_t have = t.data.size();
+    t.last_activity = Clock::now();
 
-    if (chunk_index >= it->second.chunk_received.size()) {
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
+    // The session is ordered and reliable: a gap means data was lost
+    // somewhere outside the modem's guarantees, and cannot be repaired.
+    if (offset > have) {
+        const std::string reason = "Data missing at byte " + std::to_string(have);
+        send(modem, buildFileAck(id, false, reason));
+        failTransfer(t, reason);
         return;
     }
-    if (chunk_len > FILE_CHUNK_SIZE) {
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
+    if (offset + len > t.progress.total_bytes) {
+        const std::string reason = "More data than offered";
+        send(modem, buildFileAck(id, false, reason));
+        failTransfer(t, reason);
         return;
     }
+    if (offset + len <= have) {
+        return;  // a replay (EVT:STREAM_REPLAY) of bytes already held
+    }
+    const size_t skip = have - offset;
+    t.data.insert(t.data.end(), data.begin() + static_cast<std::ptrdiff_t>(pos + skip), data.end());
+    t.progress.transferred_bytes = t.data.size();
+    t.progress.last_activity = unixNow();
+    notifyProgress(t);
+}
 
-    if (pos + chunk_len > data.size()) {
-        // Send NACK
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
+void FileTransferManager::handleFileComplete(ModemClient& modem, const std::string& id,
+                                             const std::vector<uint8_t>& data, size_t pos) {
+    auto it = transfers_.find(id);
+    if (it == transfers_.end()) return;
+    Transfer& t = it->second;
+    if (t.progress.direction != TransferDirection::Download ||
+        t.progress.state != TransferState::Transferring) {
         return;
     }
+    if (pos + 8 > data.size()) return;
+    const uint32_t size = getLe32(data, pos);
+    const uint32_t payload_crc = getLe32(data, pos + 4);
+    t.last_activity = Clock::now();
 
-    std::vector<uint8_t> chunk_payload(data.begin() + pos, data.begin() + pos + chunk_len);
-    uint32_t actual_chunk_crc = calculateCRC32(chunk_payload);
-    if (actual_chunk_crc != expected_chunk_crc) {
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
+    std::string reason;
+    if (size != t.progress.total_bytes) {
+        reason = "Size mismatch";
+    } else if (t.data.size() != size) {
+        reason = "Incomplete: " + std::to_string(t.data.size()) + " of " +
+                 std::to_string(size) + " bytes";
+    } else if (calculateCRC32(t.data) != payload_crc) {
+        reason = "CRC mismatch";
+    }
+    if (!reason.empty()) {
+        send(modem, buildFileAck(id, false, reason));
+        failTransfer(t, reason);
         return;
     }
+    finishDownload(modem, t);
+}
 
-    size_t offset = chunk_index * FILE_CHUNK_SIZE;
-    if (offset > it->second.progress.total_bytes) {
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
+void FileTransferManager::handleFileAck(const std::string& id, const std::vector<uint8_t>& data,
+                                        size_t pos) {
+    auto it = transfers_.find(id);
+    if (it == transfers_.end()) return;
+    Transfer& t = it->second;
+    if (t.progress.direction != TransferDirection::Upload ||
+        t.progress.state != TransferState::Transferring) {
         return;
     }
-
-    size_t expected_len = std::min(
-        static_cast<size_t>(FILE_CHUNK_SIZE),
-        it->second.progress.total_bytes - offset);
-    if (chunk_len != expected_len) {
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
+    if (pos >= data.size()) return;
+    const bool ok = data[pos] == 0;
+    const std::string reason(data.begin() + static_cast<std::ptrdiff_t>(pos + 1), data.end());
+    if (!ok) {
+        failTransfer(t, "Receiver reported: " + (reason.empty() ? std::string("failed") : reason));
         return;
     }
-
-    // Duplicate chunk: ACK again, but do not overwrite previously accepted data.
-    if (it->second.chunk_received[chunk_index]) {
-        modem.sendData(buildFileAck(transfer_id, chunk_index));
-        return;
-    }
-
-    if (offset + chunk_len > it->second.data.size()) {
-        modem.sendData(buildFileNack(transfer_id, chunk_index));
-        return;
-    }
-
-    // Copy chunk data
-    std::memcpy(it->second.data.data() + offset, chunk_payload.data(), chunk_len);
-
-    it->second.chunk_received[chunk_index] = true;
-    it->second.progress.completed_chunks++;
-    it->second.progress.transferred_bytes = std::min(
-        it->second.progress.total_bytes,
-        it->second.progress.transferred_bytes + static_cast<size_t>(chunk_len));
-    it->second.progress.last_activity = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
-    // Send ACK
-    modem.sendData(buildFileAck(transfer_id, chunk_index));
-
-    notifyProgress(it->second);
-
-    // Check if complete
-    if (it->second.progress.completed_chunks >= it->second.progress.total_chunks) {
-        completeDownload(it->second);
+    t.progress.state = TransferState::Completed;
+    t.progress.transferred_bytes = t.progress.total_bytes;
+    t.progress.last_activity = unixNow();
+    notifyProgress(t);
+    if (complete_callback_) {
+        complete_callback_(id, true, t.local_path);
     }
 }
 
-void FileTransferManager::handleFileAck(ModemClient& modem, const std::vector<uint8_t>& data) {
-    if (data.size() < 5) return;
-
-    size_t pos = 1;
-    uint8_t id_len = data[pos++];
-    if (id_len == 0 || pos + id_len > data.size()) return;
-
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
-    pos += id_len;
-
-    auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) return;
-
-    // Only process ACKs for active uploads
-    if (it->second.progress.state != TransferState::Transferring) return;
-
-    if (pos + 2 > data.size()) return;
-
-    uint16_t chunk_index = data[pos] | (data[pos+1] << 8);
-    if (chunk_index >= it->second.progress.total_chunks) return;
-
-    if (static_cast<int>(chunk_index) == it->second.current_chunk) {
-        it->second.progress.completed_chunks++;
-        it->second.progress.transferred_bytes =
-            std::min(it->second.data.size(),
-                     static_cast<size_t>((chunk_index + 1) * FILE_CHUNK_SIZE));
-        it->second.current_chunk++;
-        it->second.retry_count = 0;
-        it->second.progress.last_activity = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-
-        notifyProgress(it->second);
-
-        // Send next chunk or complete
-        if (it->second.current_chunk < static_cast<int>(it->second.progress.total_chunks)) {
-            sendNextChunk(modem, it->second);
-        } else {
-            // All chunks sent, send complete
-            modem.sendData(buildFileComplete(transfer_id, it->second.crc32));
-            it->second.progress.state = TransferState::Completed;
-            notifyProgress(it->second);
-
-            if (complete_callback_) {
-                complete_callback_(transfer_id, true, it->second.local_path);
-            }
-        }
-    }
-}
-
-void FileTransferManager::handleFileNack(ModemClient& modem, const std::vector<uint8_t>& data) {
-    if (data.size() < 5) return;
-
-    size_t pos = 1;
-    uint8_t id_len = data[pos++];
-    if (id_len == 0 || pos + id_len > data.size()) return;
-
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
-    pos += id_len;
-
-    auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) return;
-    if (pos + 2 > data.size()) return;
-
-    uint16_t chunk_index = data[pos] | (data[pos+1] << 8);
-    if (chunk_index >= it->second.progress.total_chunks) return;
-
-    // Resend requested chunk
-    it->second.current_chunk = chunk_index;
-    sendNextChunk(modem, it->second);
-
-}
-
-void FileTransferManager::handleFileComplete(const std::vector<uint8_t>& data) {
-    if (data.size() < 7) return;
-
-    size_t pos = 1;
-    uint8_t id_len = data[pos++];
-    if (id_len == 0 || pos + id_len > data.size()) return;
-
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
-    pos += id_len;
-
-    auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) return;
-    if (pos + 4 > data.size()) return;
-
-    if (it->second.progress.state == TransferState::Completed) {
+void FileTransferManager::handleFileCancel(const std::string& id) {
+    auto it = transfers_.find(id);
+    if (it == transfers_.end() || !isActive(it->second.progress.state)) return;
+    if (pending_offers_.erase(id) > 0) {
+        failPendingOffer(id, "Cancelled by remote");
         return;
     }
-
-    completeDownload(it->second);
-}
-
-void FileTransferManager::handleFileCancel(const std::vector<uint8_t>& data) {
-    if (data.size() < 3) return;
-
-    size_t pos = 1;
-    uint8_t id_len = data[pos++];
-    if (id_len == 0 || pos + id_len > data.size()) return;
-
-    std::string transfer_id(data.begin() + pos, data.begin() + pos + id_len);
-
-    auto it = transfers_.find(transfer_id);
-    if (it == transfers_.end()) return;
-
-    pending_offers_.erase(transfer_id);
+    failTransfer(it->second, "Cancelled by remote");
     it->second.progress.state = TransferState::Cancelled;
-    it->second.progress.error_message = "Cancelled by remote";
-    notifyProgress(it->second);
-
 }
 
-void FileTransferManager::sendNextChunk(ModemClient& modem, Transfer& t) {
-    if (t.current_chunk < 0 || t.current_chunk >= static_cast<int>(t.progress.total_chunks)) {
-        return;
-    }
-
-    auto chunk = buildFileChunk(t, t.current_chunk);
-    if (chunk.empty()) {
-        t.progress.state = TransferState::Failed;
-        t.progress.error_message = "Invalid chunk index";
-        notifyProgress(t);
-        return;
-    }
-    modem.sendData(chunk);
-    t.last_send = std::chrono::steady_clock::now();
-}
-
-void FileTransferManager::completeDownload(Transfer& t) {
-    if (t.progress.state == TransferState::Completed) {
-        return;
-    }
-
-    if (t.progress.completed_chunks < t.progress.total_chunks) {
-        return;
-    }
-
-    // Decompress and verify against CRC from file offer.
+void FileTransferManager::finishDownload(ModemClient& modem, Transfer& t) {
     LZHCodec lzh;
-    std::vector<uint8_t> decompressed = lzh.decompress(t.data);
-    uint32_t actual_crc = calculateCRC32(decompressed);
-
+    const std::vector<uint8_t> decompressed = lzh.decompress(t.data);
+    const uint32_t actual_crc = calculateCRC32(decompressed);
     if (actual_crc != t.crc32) {
-        t.progress.state = TransferState::Failed;
-        t.progress.error_message = "CRC mismatch";
-        notifyProgress(t);
         std::cerr << "[FileTransfer] FAIL id=" << shortTransferId(t.progress.transfer_id)
                   << " reason=crc_mismatch expected=0x" << std::hex << t.crc32
                   << " actual=0x" << actual_crc << std::dec << "\n";
+        send(modem, buildFileAck(t.progress.transfer_id, false, "CRC mismatch"));
+        failTransfer(t, "CRC mismatch");
         return;
     }
 
@@ -972,26 +872,40 @@ void FileTransferManager::completeDownload(Transfer& t) {
     if (!out.empty()) {
         file.open(out, std::ios::binary);
     }
+    if (file) {
+        file.write(reinterpret_cast<const char*>(decompressed.data()),
+                   static_cast<std::streamsize>(decompressed.size()));
+        file.close();
+    }
     if (!file) {
-        t.progress.state = TransferState::Failed;
-        t.progress.error_message = "Cannot write file";
-        notifyProgress(t);
         std::cerr << "[FileTransfer] FAIL id=" << shortTransferId(t.progress.transfer_id)
                   << " reason=cannot_write_file path=" << out.string() << "\n";
+        send(modem, buildFileAck(t.progress.transfer_id, false, "Receiver cannot write the file"));
+        failTransfer(t, "Cannot write file");
         return;
     }
 
-    file.write(reinterpret_cast<const char*>(decompressed.data()), decompressed.size());
-    file.close();
-
+    send(modem, buildFileAck(t.progress.transfer_id, true, ""));
     t.progress.state = TransferState::Completed;
+    t.progress.transferred_bytes = t.progress.total_bytes;
     t.local_path = out.string();
     notifyProgress(t);
-
     if (complete_callback_) {
         complete_callback_(t.progress.transfer_id, true, t.local_path);
     }
+}
 
+void FileTransferManager::failTransfer(Transfer& t, const std::string& reason) {
+    if (!isActive(t.progress.state)) return;
+    pending_offers_.erase(t.progress.transfer_id);
+    t.progress.state = TransferState::Failed;
+    t.progress.error_message = reason;
+    std::cerr << "[FileTransfer] FAIL id=" << shortTransferId(t.progress.transfer_id)
+              << " file=" << t.progress.filename << " reason=" << reason << "\n";
+    notifyProgress(t);
+    if (complete_callback_) {
+        complete_callback_(t.progress.transfer_id, false, t.progress.filename);
+    }
 }
 
 std::string FileTransferManager::truncateFilename(const std::string& name, size_t max_bytes) {

@@ -15,6 +15,8 @@ public:
     std::function<void()> onConnectModem;
     std::function<void()> onDisconnectModem;
     std::function<void()> onApplyModemConfig;
+    std::function<void(const std::string&)> onSetModemFamily;
+    std::function<void(const std::string&)> onApplyCallsign;
     std::function<void()> onSaveConfig;
     std::function<bool(const std::string&, int)> onOpenGPSPort;
     std::function<void()> onCloseGPSPort;

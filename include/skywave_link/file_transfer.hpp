@@ -9,6 +9,7 @@
 #include <map>
 #include <chrono>
 #include <fstream>
+#include <memory>
 
 namespace skylink {
 
@@ -18,8 +19,21 @@ class ModemClient;
 // Maximum file size (50 KB)
 constexpr size_t MAX_FILE_SIZE = 50 * 1024;
 
-// Chunk size for transmission (fits in one frame with overhead)
-constexpr size_t FILE_CHUNK_SIZE = 200;
+// Payload bytes per FileChunk message. The modem's ARQ session is reliable
+// and ordered, so chunks are streamed back to back with no per-chunk
+// acknowledgement; the size only bounds one data-port message.
+constexpr size_t FILE_CHUNK_SIZE = 2048;
+
+// Flow control: new chunks are written only while the modem's TX backlog
+// (BUFFER, plus bytes written since that answer) is below this, so a file is
+// never dumped into the modem at once and a cancel is not stuck behind it.
+constexpr size_t FILE_TX_BACKLOG_TARGET = 8192;
+
+// A transfer with no progress at all (nothing sent or drained, nothing
+// received) for this long fails. Generous on purpose: at the lowest modes
+// one chunk alone takes minutes, and the receiver's operator may take up to
+// DEFAULT_PENDING_OFFER_TIMEOUT_SEC to answer an offer.
+constexpr int DEFAULT_FILE_INACTIVITY_TIMEOUT_SEC = 180;
 
 // File transfer state
 enum class TransferState {
@@ -47,8 +61,6 @@ struct TransferProgress {
     TransferState state = TransferState::Idle;
     size_t total_bytes = 0;
     size_t transferred_bytes = 0;
-    size_t total_chunks = 0;
-    size_t completed_chunks = 0;
     int64_t started_at = 0;
     int64_t last_activity = 0;
     std::string error_message;
@@ -64,17 +76,24 @@ struct TransferProgress {
     }
 };
 
-// File transfer protocol messages
+// File transfer protocol messages (session data, framed by ModemClient).
+// Every message starts with type(1) + id_len(1) + id; integers are LE.
+//   FileOffer    + name_len(1) + name + payload_size(4) + file_crc32(4)
+//   FileAccept / FileReject / FileCancel   (id only)
+//   FileChunk    + offset(4) + data          (data length = rest of message)
+//   FileComplete + payload_size(4) + payload_crc32(4)   (after the last chunk)
+//   FileAck      + status(1: 0 ok, 1 failed) + reason text
+//                  (receiver's final verdict after the size/CRC check)
+// The payload is the LZH-compressed file; file_crc32 covers the original.
 enum class FileMessageType : uint8_t {
     FileOffer = 0x10,       // Offer to send file
     FileAccept = 0x11,      // Accept file transfer
     FileReject = 0x12,      // Reject file transfer
-    FileChunk = 0x13,       // File data chunk
-    FileAck = 0x14,         // Acknowledge chunk
-    FileNack = 0x15,        // Request retransmit
-    FileComplete = 0x16,    // Transfer complete
+    FileChunk = 0x13,       // File data at an offset
+    FileAck = 0x14,         // Receiver's final verdict
+    FileComplete = 0x16,    // Sender: all data written
     FileCancel = 0x17,      // Cancel transfer
-    FileResume = 0x18       // Resume interrupted transfer
+    FileLast = 0x18         // End of the reserved file-transfer range
 };
 
 // Callbacks
@@ -136,11 +155,20 @@ public:
     // Cancel active transfer
     void cancelTransfer(ModemClient& modem, const std::string& transfer_id);
 
+    // The radio session ended (or the modem went away): every transfer still
+    // negotiating or transferring fails with `reason`, and pending offers are
+    // dropped. Nothing is sent. update() does the same by itself whenever it
+    // sees the station link is not Connected.
+    void linkLost(const std::string& reason = "Link lost");
+
     // Process incoming data (call from data receive handler)
     void processIncomingData(ModemClient& modem, const std::vector<uint8_t>& data);
 
-    // Periodic update (call from main loop for timeouts, retries)
+    // Periodic update (call from the main loop): streams upload data under
+    // flow control, expires idle transfers and unanswered offers. Never
+    // sends anything unless the station link is Connected.
     void update(ModemClient& modem);
+    void setInactivityTimeout(std::chrono::seconds timeout) { inactivity_timeout_ = timeout; }
 
     // Query transfers
     std::vector<TransferProgress> getActiveTransfers() const;
@@ -155,23 +183,41 @@ public:
     // returns an existing path. Empty string if no free name was found.
     static std::string uniqueDownloadPath(const std::string& dir, const std::string& name);
 
-    // Callbacks
+    // Callbacks. onComplete fires once per transfer that ends on its own:
+    // success, or failure for any reason other than this station's own
+    // decision (reject/cancel); `path` is the file (or its name on failure).
     void onProgress(TransferProgressCallback cb) { progress_callback_ = std::move(cb); }
     void onComplete(TransferCompleteCallback cb) { complete_callback_ = std::move(cb); }
     void onFileOffer(FileOfferCallback cb) { offer_callback_ = std::move(cb); }
 
 private:
+    using Clock = std::chrono::steady_clock;
+
     // Internal transfer state
     struct Transfer {
         TransferProgress progress;
-        std::vector<uint8_t> data;           // File data (compressed for upload)
-        std::vector<bool> chunk_received;    // For downloads: which chunks received
+        std::vector<uint8_t> data;           // LZH payload (upload: all of it; download: received so far)
         std::string local_path;              // Local file path
-        uint32_t crc32 = 0;                  // CRC for integrity
-        int retry_count = 0;
-        int current_chunk = 0;               // For uploads: current chunk being sent
-        std::chrono::steady_clock::time_point last_send;
+        uint32_t crc32 = 0;                  // CRC-32 of the original file
+        size_t next_offset = 0;              // Upload: payload bytes written to the modem
+        bool complete_sent = false;          // Upload: FileComplete written
+        bool complete_received = false;      // Download: FileComplete seen
+        Clock::time_point last_activity;
     };
+
+    // Modem TX backlog bookkeeping shared by all uploads. BUFFER replies
+    // arrive through a callback that may outlive this object (it is held by
+    // the ModemClient), so the state it touches lives behind a shared_ptr.
+    struct BacklogState {
+        bool query_outstanding = false;
+        size_t reported = 0;                 // last BUFFER answer
+        uint64_t sent_at_query = 0;          // bytes_sent when that query went out
+        uint64_t sent_at_reply = 0;          // ... for the query that `reported` answers
+        bool changed = false;                // the last answer differed from the one before
+    };
+    std::shared_ptr<BacklogState> backlog_ = std::make_shared<BacklogState>();
+    uint64_t bytes_sent_ = 0;                // data-port bytes this manager has written
+    Clock::time_point last_backlog_query_{};
 
     std::map<std::string, Transfer> transfers_;
     std::string download_path_;
@@ -179,8 +225,9 @@ private:
     std::vector<std::string> trusted_callsigns_;
     // Deferred offers: transfer id -> time offered. The offer itself lives in
     // transfers_ in state Negotiating.
-    std::map<std::string, std::chrono::steady_clock::time_point> pending_offers_;
+    std::map<std::string, Clock::time_point> pending_offers_;
     std::chrono::seconds pending_offer_timeout_{DEFAULT_PENDING_OFFER_TIMEOUT_SEC};
+    std::chrono::seconds inactivity_timeout_{DEFAULT_FILE_INACTIVITY_TIMEOUT_SEC};
 
     TransferProgressCallback progress_callback_;
     TransferCompleteCallback complete_callback_;
@@ -191,29 +238,33 @@ private:
 
     // Build protocol messages
     std::vector<uint8_t> buildFileOffer(const Transfer& t);
-    std::vector<uint8_t> buildFileAccept(const std::string& transfer_id);
-    std::vector<uint8_t> buildFileReject(const std::string& transfer_id);
-    std::vector<uint8_t> buildFileChunk(const Transfer& t, int chunk_index);
-    std::vector<uint8_t> buildFileAck(const std::string& transfer_id, int chunk_index);
-    std::vector<uint8_t> buildFileNack(const std::string& transfer_id, int chunk_index);
-    std::vector<uint8_t> buildFileComplete(const std::string& transfer_id, uint32_t crc);
-    std::vector<uint8_t> buildFileCancel(const std::string& transfer_id);
+    std::vector<uint8_t> buildIdMessage(FileMessageType type, const std::string& transfer_id);
+    std::vector<uint8_t> buildFileChunk(const Transfer& t, size_t offset, size_t len);
+    std::vector<uint8_t> buildFileComplete(const Transfer& t);
+    std::vector<uint8_t> buildFileAck(const std::string& transfer_id, bool ok,
+                                      const std::string& reason);
 
     // Parse incoming messages
     void handleFileOffer(ModemClient& modem, const std::vector<uint8_t>& data);
-    void handleFileAccept(ModemClient& modem, const std::vector<uint8_t>& data);
-    void handleFileReject(const std::vector<uint8_t>& data);
-    void handleFileChunk(ModemClient& modem, const std::vector<uint8_t>& data);
-    void handleFileAck(ModemClient& modem, const std::vector<uint8_t>& data);
-    void handleFileNack(ModemClient& modem, const std::vector<uint8_t>& data);
-    void handleFileComplete(const std::vector<uint8_t>& data);
-    void handleFileCancel(const std::vector<uint8_t>& data);
+    void handleFileAccept(ModemClient& modem, const std::string& id);
+    void handleFileReject(const std::string& id);
+    void handleFileChunk(ModemClient& modem, const std::string& id,
+                         const std::vector<uint8_t>& data, size_t pos);
+    void handleFileComplete(ModemClient& modem, const std::string& id,
+                            const std::vector<uint8_t>& data, size_t pos);
+    void handleFileAck(const std::string& id, const std::vector<uint8_t>& data, size_t pos);
+    void handleFileCancel(const std::string& id);
 
     // Helper functions
-    void sendNextChunk(ModemClient& modem, Transfer& t);
-    void completeDownload(Transfer& t);
+    bool send(ModemClient& modem, const std::vector<uint8_t>& msg);
+    static bool linkUp(const ModemClient& modem);
+    size_t estimatedBacklog(const ModemClient& modem) const;
+    void queryBacklog(ModemClient& modem);
+    void pumpUploads(ModemClient& modem);
+    void finishDownload(ModemClient& modem, Transfer& t);
+    void failTransfer(Transfer& t, const std::string& reason);
     void notifyProgress(const Transfer& t);
-    uint32_t calculateCRC32(const std::vector<uint8_t>& data);
+    static uint32_t calculateCRC32(const std::vector<uint8_t>& data);
     bool isTrusted(const std::string& callsign) const;
     void failPendingOffer(const std::string& transfer_id, const std::string& reason);
 };

@@ -13,8 +13,9 @@
 //     `ERROR:UNKNOWN` = typo, `ERROR:STATE` = wrong FSM state)
 //   * asynchronous lines start with `EVT:` or `MON:` and interleave freely
 //     with command responses, so every reader dispatches on prefix
-//   * the modem emits no periodic SNR event, so link quality is polled
-//     from `STATUS`
+//   * `EVT:SNR <local> <remote|->` arrives when the link SNR moves by
+//     >= 1 dB while connected (not on a timer); `STATUS` polling fills in
+//     the rest of the snapshot
 
 #pragma once
 
@@ -102,6 +103,9 @@ struct VoiceStatus {
 struct ModemStatus {
     ModemState state = ModemState::Disconnected;
     LinkState link_state = LinkState::Idle;
+    // The modem's own FSM state name: IDLE, LISTENING, CALLING, CONNECTING,
+    // CONNECTED or DISCONNECTING (link_state folds these into four).
+    std::string fsm_state = "IDLE";
     std::string remote_callsign;
     std::string my_callsign;
     float snr_db = 0.0f;             // local RX SNR
@@ -166,7 +170,9 @@ using StateCallback = std::function<void(const std::string& state)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>& data)>;
 using SnrCallback = std::function<void(float snr_db)>;
 using ConnectedCallback = std::function<void(const std::string& callsign)>;
-using DisconnectedCallback = std::function<void()>;
+// `reason` is the EVT:DISCONNECTED token (NORMAL, LINK, NO_ANSWER,
+// NO_START_ACK, REFUSED, TIMEOUT; INTERFACES.md), empty if none was given.
+using DisconnectedCallback = std::function<void(const std::string& reason)>;
 using VoiceStatusCallback = std::function<void(const VoiceStatus&)>;
 using MonitorCallback = std::function<void(const MonitorFrame&)>;
 // Fires when a broadcast fragment chain (CQ/BEACON/BCAST_DATA) completes.
@@ -179,6 +185,19 @@ using EventCallback =
 // disconnect; `response` is the modem's line (empty when there was none).
 using CommandResultCallback =
     std::function<void(bool ok, const std::string& response)>;
+
+// Plain-language text for an `EVT:DISCONNECTED <reason>` token, for the
+// operator ("No answer from the called station", ...).
+std::string describeDisconnectReason(const std::string& reason);
+// Plain-language text for a failed command: `response` is the modem's
+// `ERROR:<reason>` line, or empty when the modem never answered.
+std::string describeCommandError(const std::string& cmd, const std::string& response);
+// The control commands that move the modem to `family` (WIDE|MID|NARROW|
+// ULTRA, case-insensitive; empty for an unknown family). ULTRA must be
+// permitted first (`ULTRA ON`, else `FAMILY ULTRA` is refused); leaving
+// ULTRA is a plain `FAMILY <other>` (the modem refuses `ULTRA OFF` while
+// ULTRA is the family).
+std::vector<std::string> familyChangeCommands(const std::string& family);
 
 // Outcome of a background connect started with beginConnect().
 enum class ConnectProgress { None, InProgress, Connected, Failed };
@@ -249,28 +268,35 @@ public:
     void setNonBlockingCommands(bool enabled) { nonblocking_commands_ = enabled; }
     bool nonBlockingCommands() const { return nonblocking_commands_; }
 
-    // High-level commands
-    bool setCallsign(const std::string& callsign);
-    bool connectToStation(const std::string& callsign);
+    // High-level commands. Where a `cb` is accepted it reports the modem's
+    // answer (in non-blocking mode from a later poll(); see sendCommandAsync)
+    // so the caller can tell the operator about an `ERROR:`.
+    bool setCallsign(const std::string& callsign, CommandResultCallback cb = {});
+    bool connectToStation(const std::string& callsign, CommandResultCallback cb = {});
     bool disconnectStation();
     bool abort();
     bool setCompression(bool enabled);
     bool setListenMode(bool enabled);
     bool setMonitorMode(bool enabled);
-    bool sendBeacon();
-    bool sendBroadcastData(const std::vector<uint8_t>& data);
-    bool sendCq();
+    bool sendBeacon(CommandResultCallback cb = {});
+    bool sendBroadcastData(const std::vector<uint8_t>& data, CommandResultCallback cb = {});
+    bool sendCq(CommandResultCallback cb = {});
     bool setCwId(bool enabled);
 
     // Waveform / ladder control (INTERFACES.md "Mode and Link")
-    bool setFamily(const std::string& family);       // WIDE|MID|NARROW|ULTRA
+    // Sends familyChangeCommands(family) in order, stopping at the first
+    // failure; `cb` gets the final outcome (the failing reply on error).
+    // Always asynchronous. Accepted by the modem only while IDLE/LISTENING.
+    bool setFamily(const std::string& family, CommandResultCallback cb = {});
     bool setMode(const std::string& mode);           // AUTO or M4..M14
     bool setMaxMode(const std::string& mode);
     bool setCpMode(const std::string& cp);           // AUTO|SHORT|MEDIUM|LONG
     bool setHarq(const std::string& harq);           // AUTO|CHASE|IR
     bool setAutoMode(bool enabled);
 
-    // Data interface
+    // Data interface. Session data only: refused (false) unless the station
+    // link is CONNECTED, because bytes written to the data port while no
+    // session is up sit in the modem's TX queue (TXBUF) unframed.
     bool sendData(const std::vector<uint8_t>& data);
     bool sendText(const std::string& text);
     std::optional<std::vector<uint8_t>> receiveData();
@@ -289,7 +315,7 @@ public:
     // Report the rig's dial frequency to the modem (`FREQINFO <hz>`). It
     // keys the modem's channel-memory buckets so its reconnect seeding
     // distinguishes the same peer worked on different bands. 0 clears it.
-    bool reportDialFrequency(double hz);
+    bool reportDialFrequency(double hz, CommandResultCallback cb = {});
     VoiceStatus getVoiceStatus() const {
         std::lock_guard<std::mutex> lock(status_mutex_);
         return status_.voice;
@@ -408,7 +434,9 @@ private:
     static void closeSocket(socket_t& sock);
     static bool setNonBlocking(socket_t sock);
     // A Skywave command succeeded when its response is not `ERROR:...`.
-    bool sendCommandOk(const std::string& cmd, int timeout_ms = 500);
+    bool sendCommandOk(const std::string& cmd, int timeout_ms = 500,
+                       CommandResultCallback cb = {});
+    void sendCommandChain(std::vector<std::string> cmds, CommandResultCallback cb);
     std::optional<std::string> sendCommandForResponse(const std::string& cmd,
                                                       int timeout_ms = 500);
     void clearResponseQueue();

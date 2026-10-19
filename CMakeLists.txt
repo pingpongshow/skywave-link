@@ -17,6 +17,12 @@ endif()
 # Build options
 option(SKYWAVE_LINK_BUILD_TESTS "Build test suite" OFF)
 
+# Warnings for this project's own sources; thirdparty/ is exempt (its
+# headers are included as SYSTEM, its sources keep their defaults).
+if(NOT MSVC)
+    set(SKYWAVE_LINK_WARNINGS -Wall -Wextra)
+endif()
+
 # Find dependencies
 find_package(Threads REQUIRED)
 
@@ -70,6 +76,7 @@ add_executable(skywave_link_emulator
     tools/skywave_link_emulator.cpp
 )
 target_link_libraries(skywave_link_emulator PRIVATE Threads::Threads)
+target_compile_options(skywave_link_emulator PRIVATE ${SKYWAVE_LINK_WARNINGS})
 
 # Core static library (non-GUI sources, linkable by tests)
 add_library(skywave_link_core STATIC
@@ -99,11 +106,12 @@ add_library(skywave_link_core STATIC
 target_include_directories(skywave_link_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${STB_INCLUDE_DIR}
     ${HAMLIB_INCLUDE_DIRS}
 )
+target_include_directories(skywave_link_core SYSTEM PUBLIC ${STB_INCLUDE_DIR})
 
 target_link_libraries(skywave_link_core PUBLIC Threads::Threads ${HAMLIB_LINK_TARGET})
+target_compile_options(skywave_link_core PRIVATE ${SKYWAVE_LINK_WARNINGS})
 
 if(SQLITE3_FOUND)
     target_include_directories(skywave_link_core PUBLIC ${SQLITE3_INCLUDE_DIRS})
@@ -124,6 +132,7 @@ endif()
 # Control-protocol probe against a live modem (see tools/skywave_link_probe.cpp)
 add_executable(skywave_link_probe tools/skywave_link_probe.cpp)
 target_link_libraries(skywave_link_probe PRIVATE skywave_link_core)
+target_compile_options(skywave_link_probe PRIVATE ${SKYWAVE_LINK_WARNINGS})
 
 # Find SDL2
 if(PkgConfig_FOUND)
@@ -168,10 +177,8 @@ file(CONFIGURE OUTPUT "${SKYWAVE_LINK_FONTS_CPP}"
      @ONLY)
 
 if(SDL2_FOUND AND OPENGL_FOUND AND EXISTS "${IMGUI_DIR}/imgui.cpp")
-    add_executable(skywave_link
+    set(SKYWAVE_LINK_GUI_SOURCES
         src/main.cpp
-
-        # GUI components
         src/gui/app.cpp
         src/gui/shared_state.cpp
         src/gui/chat_window.cpp
@@ -188,6 +195,13 @@ if(SDL2_FOUND AND OPENGL_FOUND AND EXISTS "${IMGUI_DIR}/imgui.cpp")
         src/gui/ping_panel.cpp
         src/gui/main_content.cpp
         src/gui/modern_style.cpp
+    )
+    # Own GUI sources only: the vendored ImGui files keep their defaults.
+    set_source_files_properties(${SKYWAVE_LINK_GUI_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "${SKYWAVE_LINK_WARNINGS}")
+
+    add_executable(skywave_link
+        ${SKYWAVE_LINK_GUI_SOURCES}
         ${SKYWAVE_LINK_FONTS_CPP}
 
         # ImGui core
@@ -200,7 +214,7 @@ if(SDL2_FOUND AND OPENGL_FOUND AND EXISTS "${IMGUI_DIR}/imgui.cpp")
         ${IMGUI_DIR}/backends/imgui_impl_opengl2.cpp
     )
 
-    target_include_directories(skywave_link PRIVATE
+    target_include_directories(skywave_link SYSTEM PRIVATE
         ${JSON_INCLUDE_DIR}
         ${IMGUI_DIR}
         ${IMGUI_DIR}/backends
