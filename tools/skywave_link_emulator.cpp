@@ -1,6 +1,25 @@
 // Skywave Link Emulator
 // Emulates a minimal modem bridge so two Skywave Link GUI instances can test
 // messaging/link workflows without RF/audio/modem hardware.
+//
+// It follows the current modem's control protocol (Modem/skywave/docs/
+// INTERFACES.md) for what the app uses:
+//   * BCAST <hex> answers `BCAST <n>`; every other station gets
+//     `EVT:BROADCAST <src> <HEX>` (the reassembled payload, as the modem's
+//     monitor delivers it, while connected or not)
+//   * BEACON / CQ answer their verb; stations with MONITOR ON get the
+//     `MON:` line carrying the whole link frame (BEACON body: call + 0xFF,
+//     CQ body: call), built like the modem's link/frame.cpp
+//   * data-port bytes only travel inside a CONNECTED session; outside one
+//     they are dropped (the modem would hold them in its TX queue)
+//   * the placeholder callsign (N0CALL or none) refuses transmissions with
+//     ERROR:STATE; CONNECT to an unknown station ends with
+//     `EVT:DISCONNECTED NO_ANSWER`
+//   * payloads are opaque: data-port bytes and BCAST payloads reach the
+//     other station unchanged, so the app's own framing (chat `0xC0|text`,
+//     station beacon `0xFA|grid_len|grid|flags|CALL text`, mail, files...)
+//     is exercised end to end without the emulator knowing it
+// There is no voice port and no RF timing.
 
 #include <algorithm>
 #include <atomic>
@@ -150,54 +169,76 @@ bool waitForReadable(socket_t sock, int timeout_ms) {
     return ready > 0;
 }
 
-bool isPotentialCommandRoutedMarker(uint8_t marker) {
-    // These payload markers are commonly sent immediately after BEACON/CQ/PING.
-    switch (marker) {
-        case 0xFA:  // Beacon payload
-        case 0xFB:  // Broadcast
-        case 0xFC:  // CQ
-        case 0xF4:  // Position beacon
-        case 0xF9:  // Pending message indicator
-        case 0xE0:  // Ping request
-        case 0xD0:  // BBS announce
-        case 0xD1:  // BBS remove announce
-            return true;
-        default:
-            return false;
+// CRC-32 (IEEE, reflected) as the modem's fec/crc.cpp.
+uint32_t crc32(const std::vector<uint8_t>& data) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint8_t b : data) {
+        crc ^= b;
+        for (int k = 0; k < 8; ++k) {
+            crc = (crc & 1u) ? (0xEDB88320u ^ (crc >> 1)) : (crc >> 1);
+        }
     }
+    return crc ^ 0xFFFFFFFFu;
 }
 
-bool isBroadcastRoutedMarker(uint8_t marker) {
-    switch (marker) {
-        case 0xFA:  // Beacon payload
-        case 0xFB:  // Broadcast text
-        case 0xFC:  // CQ
-        case 0xF4:  // Position beacon
-        case 0xF9:  // Pending-message beacon
-        case 0xD0:  // BBS announce
-        case 0xD1:  // BBS remove announce
-            return true;
-        default:
-            return false;
+// packFrame(): type, flags, session, sequence, ack_base (u16 LE), body, CRC.
+std::vector<uint8_t> packLinkFrame(uint8_t type, const std::vector<uint8_t>& body) {
+    std::vector<uint8_t> out = {type, 0, 0, 0, 0, 0, 0, 0};
+    out.insert(out.end(), body.begin(), body.end());
+    const uint32_t crc = crc32(out);
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((crc >> (8 * i)) & 0xFFu));
+    return out;
+}
+
+std::vector<uint8_t> packCall(const std::string& call) {
+    std::vector<uint8_t> out;
+    out.push_back(static_cast<uint8_t>(call.size()));
+    out.insert(out.end(), call.begin(), call.end());
+    return out;
+}
+
+std::string hexUpper(const std::vector<uint8_t>& data) {
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    for (uint8_t b : data) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0x0F]);
     }
+    return out;
 }
 
-std::vector<uint8_t> buildWrappedFrame(const std::string& from, const std::vector<uint8_t>& payload) {
-    std::vector<uint8_t> wrapped;
-    const size_t from_len = std::min<size_t>(255, from.size());
-    wrapped.reserve(payload.size() + from_len + 2);
-    wrapped.push_back(0xFA);
-    wrapped.push_back(static_cast<uint8_t>(from_len));
-    wrapped.insert(wrapped.end(), from.begin(), from.begin() + static_cast<ptrdiff_t>(from_len));
-    wrapped.insert(wrapped.end(), payload.begin(), payload.end());
-    return wrapped;
+bool hexDecode(const std::string& hex, std::vector<uint8_t>* out) {
+    if (hex.empty() || hex.size() % 2 != 0) return false;
+    out->clear();
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        int v = 0;
+        for (int k = 0; k < 2; ++k) {
+            const char c = hex[i + static_cast<size_t>(k)];
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else return false;
+            v = v * 16 + d;
+        }
+        out->push_back(static_cast<uint8_t>(v));
+    }
+    return true;
 }
 
-enum class NextTxRoute {
-    None,
-    Broadcast,
-    Directed
-};
+// A callsign the modem would transmit with (3-12 of A-Z 0-9 '/', not the
+// N0CALL placeholder).
+bool isTransmitCallsign(const std::string& call) {
+    if (call.size() < 3 || call.size() > 12 || call == "N0CALL") return false;
+    for (char c : call) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// The modem's BCAST limit: 16 fragments of 256 bytes.
+constexpr size_t kMaxBroadcastBytes = 16 * 256;
 
 struct Station {
     int id = 0;
@@ -207,14 +248,8 @@ struct Station {
     std::string callsign;
 
     int peer_id = 0;
-    NextTxRoute next_tx_route = NextTxRoute::None;
-    std::string directed_target;
-    std::chrono::steady_clock::time_point route_deadline{};
-    std::string directed_reply_target;
-    std::chrono::steady_clock::time_point directed_reply_deadline{};
-
-    uint64_t cat_frequency_hz = 7100000;
-    std::string cat_mode = "USB";
+    bool listen = true;
+    bool monitor = true;
 
     std::mutex cmd_write_mutex;
     std::mutex data_write_mutex;
@@ -223,11 +258,6 @@ struct Station {
 struct OutboundLine {
     std::shared_ptr<Station> station;
     std::string line;
-};
-
-struct TargetDataFrame {
-    std::shared_ptr<Station> station;
-    std::vector<uint8_t> payload;
 };
 
 class LinkEmulator {
@@ -369,7 +399,6 @@ private:
                 auto station = std::make_shared<Station>();
                 station->id = next_station_id_++;
                 station->endpoint_slot = i;
-                station->route_deadline = std::chrono::steady_clock::now();
                 stations_[station->id] = station;
                 endpoint_station_ids_[i] = station->id;
             }
@@ -588,7 +617,6 @@ private:
             std::lock_guard<std::mutex> lock(stations_mutex_);
             station->id = next_station_id_++;
             station->cmd_socket = cmd_socket;
-            station->route_deadline = std::chrono::steady_clock::now();
             stations_[station->id] = station;
             pending_data_attach_.push_back(station->id);
         }
@@ -685,31 +713,6 @@ private:
                 continue;
             }
 
-            // The transport is a raw TCP stream. Under bursty sends, multiple
-            // broadcast-style packets can coalesce into one recv(). Split on
-            // the next likely broadcast marker so BEACON/CQ/BBS bursts are not
-            // treated as a single payload blob.
-            if (isBroadcastRoutedMarker(chunk[0])) {
-                size_t start = 0;
-                for (size_t i = 1; i < size; ++i) {
-                    if (!isBroadcastRoutedMarker(chunk[i])) {
-                        continue;
-                    }
-                    if (i > start) {
-                        processDataChunk(
-                            station,
-                            std::vector<uint8_t>(chunk.begin() + start, chunk.begin() + i));
-                    }
-                    start = i;
-                }
-                if (start < size) {
-                    processDataChunk(
-                        station,
-                        std::vector<uint8_t>(chunk.begin() + start, chunk.begin() + size));
-                }
-                continue;
-            }
-
             processDataChunk(station, std::vector<uint8_t>(chunk.begin(), chunk.begin() + n));
         }
         onSocketClosed(station->id, false);
@@ -744,11 +747,11 @@ private:
                 if (peer_it != stations_.end()) {
                     auto peer = peer_it->second;
                     peer->peer_id = 0;
-                    outbound.push_back({peer, "EVT:DISCONNECTED normal"});
+                    outbound.push_back({peer, "EVT:DISCONNECTED NORMAL"});
                     outbound.push_back({peer, "EVT:STATE LISTENING"});
                 }
                 station->peer_id = 0;
-                outbound.push_back({station, "EVT:DISCONNECTED normal"});
+                outbound.push_back({station, "EVT:DISCONNECTED NORMAL"});
                 outbound.push_back({station, "EVT:STATE LISTENING"});
             }
 
@@ -788,8 +791,13 @@ private:
         } else if (cmd == "STATUS") {
             emitStateTelemetry(station, &outbound);
         } else if (cmd == "CONNECT") {
-            outbound.push_back({station, "CONNECT " + normalizeCallsign(arg)});
-            processConnectCommand(station, arg, &outbound);
+            if (!isTransmitCallsign(station->callsign) || normalizeCallsign(arg).empty()) {
+                outbound.push_back({station, normalizeCallsign(arg).empty() ? "ERROR:BADARG"
+                                                                             : "ERROR:STATE"});
+            } else {
+                outbound.push_back({station, "CONNECT " + normalizeCallsign(arg)});
+                processConnectCommand(station, arg, &outbound);
+            }
         } else if (cmd == "DISCONNECT" || cmd == "ABORT") {
             outbound.push_back({station, cmd});
             processDisconnectCommand(station, &outbound);
@@ -799,25 +807,32 @@ private:
             const bool linked = it != stations_.end() && it->second->peer_id != 0;
             outbound.push_back({station,
                                 std::string("STATE ") +
-                                    (linked ? "CONNECTED" : "LISTENING")});
-        } else if (cmd == "BEACON" || cmd == "CQ" || cmd == "BCAST") {
-            {
-                std::lock_guard<std::mutex> lock(stations_mutex_);
-                auto it = stations_.find(station->id);
-                if (it != stations_.end()) {
-                    it->second->next_tx_route = NextTxRoute::Broadcast;
-                    it->second->directed_target.clear();
-                    it->second->route_deadline =
-                        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-                }
+                                    (linked ? "CONNECTED"
+                                            : (station->listen ? "LISTENING" : "IDLE"))});
+        } else if (cmd == "BEACON" || cmd == "CQ") {
+            processBeaconOrCq(station, cmd, &outbound);
+        } else if (cmd == "BCAST") {
+            processBroadcast(station, arg, &outbound);
+        } else if (cmd == "LISTEN" || cmd == "MONITOR") {
+            std::lock_guard<std::mutex> lock(stations_mutex_);
+            const std::string value = upperAscii(arg);
+            if (!arg.empty() && value != "ON" && value != "OFF") {
+                outbound.push_back({station, "ERROR:BADARG"});
+            } else {
+                bool& flag = (cmd == "LISTEN") ? station->listen : station->monitor;
+                if (!arg.empty()) flag = (value == "ON");
+                outbound.push_back({station, cmd + (flag ? " ON" : " OFF")});
             }
-            outbound.push_back({station, cmd});
-        } else if (cmd == "LISTEN" || cmd == "MONITOR" || cmd == "CWID") {
-            outbound.push_back({station, cmd + " " + (arg.empty() ? "ON" : upperAscii(arg))});
+        } else if (cmd == "CWID") {
+            outbound.push_back({station, "CWID " + (arg.empty() ? std::string("OFF") : upperAscii(arg))});
         } else if (cmd == "FAMILY" || cmd == "MODE" || cmd == "MAXMODE" ||
                    cmd == "CPMODE" || cmd == "HARQ" || cmd == "CHANMEM" ||
                    cmd == "PROBE" || cmd == "MASKING" || cmd == "RESUME") {
             outbound.push_back({station, arg.empty() ? cmd : cmd + " " + upperAscii(arg)});
+        } else if (cmd == "PTTMETHOD" || cmd == "PTTPORT" || cmd == "PTTBAUD" ||
+                   cmd == "PTTLEAD" || cmd == "PTTTAIL") {
+            // Accepted and echoed; the emulator never keys anything.
+            outbound.push_back({station, cmd + " " + (arg.empty() ? std::string("-") : arg)});
         } else if (cmd == "AUDIOLEVEL") {
             outbound.push_back({station, "AUDIOLEVEL RX=-45.0 TX=-120.0"});
         } else if (cmd == "NOISEFLOOR") {
@@ -828,52 +843,8 @@ private:
                    cmd == "VOICESTOP" || cmd == "VOICEPTT" || cmd == "VOICESTATUS") {
             // The emulator has no voice media path (documented in README).
             outbound.push_back({station, "ERROR:UNSUPPORTED"});
-        } else if (cmd == "PING") {
-            std::lock_guard<std::mutex> lock(stations_mutex_);
-            auto it = stations_.find(station->id);
-            if (it != stations_.end()) {
-                it->second->next_tx_route = NextTxRoute::Directed;
-                it->second->directed_target = normalizeCallsign(arg);
-                it->second->route_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            }
-        } else if (cmd == "CATFREQ") {
-            char* end_ptr = nullptr;
-            const unsigned long long hz = std::strtoull(arg.c_str(), &end_ptr, 10);
-            if (end_ptr != nullptr && *end_ptr == '\0') {
-                std::lock_guard<std::mutex> lock(stations_mutex_);
-                auto it = stations_.find(station->id);
-                if (it != stations_.end()) {
-                    it->second->cat_frequency_hz = static_cast<uint64_t>(hz);
-                }
-            }
-        } else if (cmd == "CATGETFREQ") {
-            uint64_t hz = 7100000;
-            {
-                std::lock_guard<std::mutex> lock(stations_mutex_);
-                auto it = stations_.find(station->id);
-                if (it != stations_.end()) {
-                    hz = it->second->cat_frequency_hz;
-                }
-            }
-            outbound.push_back({station, std::to_string(hz)});
-        } else if (cmd == "CATMODE") {
-            std::lock_guard<std::mutex> lock(stations_mutex_);
-            auto it = stations_.find(station->id);
-            if (it != stations_.end() && !arg.empty()) {
-                it->second->cat_mode = upperAscii(arg);
-            }
-        } else if (cmd == "CATGETMODE") {
-            std::string mode = "USB";
-            {
-                std::lock_guard<std::mutex> lock(stations_mutex_);
-                auto it = stations_.find(station->id);
-                if (it != stations_.end()) {
-                    mode = it->second->cat_mode;
-                }
-            }
-            outbound.push_back({station, mode});
         } else if (cmd == "VERSION") {
-            outbound.push_back({station, "VERSION SKYWAVE-LINK-EMU 1.0"});
+            outbound.push_back({station, "VERSION SKYWAVE-LINK-EMU 2.0"});
         } else if (cmd == "BUFFER") {
             outbound.push_back({station, "BUFFER 0"});
         } else {
@@ -918,7 +889,12 @@ private:
                 }
             }
             if (!target) {
-                outbound->push_back({caller_station, "EVT:STATE LISTENING"});
+                // Nobody answers: the call times out (INTERFACES.md reasons).
+                outbound->push_back({caller_station, "EVT:STATE CALLING"});
+                outbound->push_back({caller_station, "EVT:DISCONNECTED NO_ANSWER"});
+                outbound->push_back({caller_station,
+                                     caller_station->listen ? "EVT:STATE LISTENING"
+                                                            : "EVT:STATE IDLE"});
                 return;
             }
 
@@ -928,11 +904,6 @@ private:
             caller_station->peer_id = target->id;
             target->peer_id = caller_station->id;
 
-            caller_station->next_tx_route = NextTxRoute::None;
-            caller_station->directed_target.clear();
-            target->next_tx_route = NextTxRoute::None;
-            target->directed_target.clear();
-
             const std::string caller_call = caller_station->callsign.empty()
                 ? ("STATION-" + std::to_string(caller_station->id))
                 : caller_station->callsign;
@@ -940,6 +911,7 @@ private:
                 ? ("STATION-" + std::to_string(target->id))
                 : target->callsign;
 
+            outbound->push_back({caller_station, "EVT:STATE CALLING"});
             outbound->push_back({caller_station, "EVT:STATE CONNECTING"});
             outbound->push_back({target, "EVT:STATE CONNECTING"});
             outbound->push_back({caller_station, "EVT:CONNECTED " + target_name + " WIDE M8"});
@@ -985,13 +957,15 @@ private:
         // Same field set and order as the modem's STATUS line
         // (Modem/skywave/docs/INTERFACES.md).
         std::string status = "STATUS STATE=";
-        status += linked ? "CONNECTED" : "LISTENING";
+        status += linked ? "CONNECTED" : (st->listen ? "LISTENING" : "IDLE");
         status += " CALL=" + (st->callsign.empty() ? std::string("-") : st->callsign);
         status += " REMOTE=" + remote;
         status += " FAMILY=WIDE MODE=AUTO(M8) NET=1200.0";
         status += linked ? " SNR=-8.0 RSNR=-8.0" : " SNR=-20.0 RSNR=-";
-        status += " CFO=0.0 RETRY=0.0 BUSY=0 LISTEN=1 COMPRESS=1 CRYPTO=0";
-        status += " EPOCH=0 RESUME=1 MASK=0 VOICE=off TXBUF=0 FOK=0 FFAIL=0";
+        status += " CFO=0.0 RETRY=0.0 BUSY=0 LISTEN=";
+        status += st->listen ? "1" : "0";
+        status += " COMPRESS=1 CRYPTO=0";
+        status += " EPOCH=0 RESUME=1 MASK=0 VOICE=off TXBUF=0 FOK=0 FFAIL=0 TURN=-";
         outbound->push_back({st, status});
     }
 
@@ -1006,121 +980,90 @@ private:
         station->peer_id = 0;
         if (peer) {
             peer->peer_id = 0;
-            outbound->push_back({peer, "EVT:DISCONNECTED normal"});
+            outbound->push_back({peer, "EVT:DISCONNECTED NORMAL"});
             outbound->push_back({peer, "EVT:STATE LISTENING"});
         }
-        outbound->push_back({station, "EVT:DISCONNECTED normal"});
+        outbound->push_back({station, "EVT:DISCONNECTED NORMAL"});
         outbound->push_back({station, "EVT:STATE LISTENING"});
     }
 
+    // Session bytes go to the linked peer only. Outside a session the modem
+    // would hold them in its TX queue; the emulator drops them.
     void processDataChunk(const std::shared_ptr<Station>& sender, const std::vector<uint8_t>& payload) {
         if (payload.empty()) {
             return;
         }
-
-        const bool route_sensitive = isPotentialCommandRoutedMarker(payload.front());
-        std::vector<TargetDataFrame> frames;
-        constexpr int kRouteSyncAttempts = 3;
-        constexpr auto kRouteSyncSleep = std::chrono::milliseconds(8);
-        for (int attempt = 0; attempt < kRouteSyncAttempts; ++attempt) {
-            bool retry_for_route_sync = false;
-            {
-                std::lock_guard<std::mutex> lock(stations_mutex_);
-                auto it = stations_.find(sender->id);
-                if (it == stations_.end()) {
-                    return;
+        std::shared_ptr<Station> peer;
+        {
+            std::lock_guard<std::mutex> lock(stations_mutex_);
+            auto it = stations_.find(sender->id);
+            if (it == stations_.end() || it->second->peer_id == 0) {
+                if (verbose_) {
+                    std::cout << "[LinkEmu] #" << sender->id << " dropped " << payload.size()
+                              << " data bytes outside a session\n";
                 }
-                auto sender_station = it->second;
-                const auto now = std::chrono::steady_clock::now();
-                if (sender_station->next_tx_route != NextTxRoute::None &&
-                    now > sender_station->route_deadline) {
-                    sender_station->next_tx_route = NextTxRoute::None;
-                    sender_station->directed_target.clear();
-                }
-                if (!sender_station->directed_reply_target.empty() &&
-                    now > sender_station->directed_reply_deadline) {
-                    sender_station->directed_reply_target.clear();
-                }
-
-                const std::string from = sender_station->callsign.empty()
-                    ? ("STATION-" + std::to_string(sender_station->id))
-                    : sender_station->callsign;
-
-                if (attempt < (kRouteSyncAttempts - 1) &&
-                    route_sensitive &&
-                    sender_station->next_tx_route == NextTxRoute::None &&
-                    sender_station->directed_reply_target.empty()) {
-                    // BEACON/CQ/PING command and data can arrive on different sockets a few ms apart.
-                    // Briefly wait so command-routed payloads are not dropped or misrouted.
-                    retry_for_route_sync = true;
-                } else if (sender_station->next_tx_route == NextTxRoute::Broadcast) {
-                    sender_station->next_tx_route = NextTxRoute::None;
-                    sender_station->directed_target.clear();
-                    const std::vector<uint8_t> wrapped = buildWrappedFrame(from, payload);
-                    for (auto& [id, station] : stations_) {
-                        if (id == sender_station->id || station->data_socket == kInvalidSocket) {
-                            continue;
-                        }
-                        frames.push_back({station, wrapped});
-                    }
-                } else {
-                    std::string target_call;
-                    if (sender_station->next_tx_route == NextTxRoute::Directed &&
-                        !sender_station->directed_target.empty()) {
-                        target_call = sender_station->directed_target;
-                        sender_station->next_tx_route = NextTxRoute::None;
-                        sender_station->directed_target.clear();
-                    } else if (!sender_station->directed_reply_target.empty()) {
-                        target_call = sender_station->directed_reply_target;
-                        sender_station->directed_reply_target.clear();
-                    }
-
-                    if (!target_call.empty()) {
-                        std::shared_ptr<Station> target;
-                        for (auto& [_, station] : stations_) {
-                            if (station->data_socket == kInvalidSocket) {
-                                continue;
-                            }
-                            if (normalizeCallsign(station->callsign) == target_call) {
-                                target = station;
-                                break;
-                            }
-                        }
-                        if (target) {
-                            frames.push_back({target, buildWrappedFrame(from, payload)});
-                            if (target->next_tx_route == NextTxRoute::None) {
-                                target->directed_reply_target = normalizeCallsign(from);
-                                target->directed_reply_deadline =
-                                    now + std::chrono::seconds(3);
-                            }
-                        }
-                    } else if (route_sensitive && isBroadcastRoutedMarker(payload.front())) {
-                        // If the command arrived late and no explicit route was set, infer
-                        // beacon/CQ class payloads as broadcast instead of dropping them.
-                        const std::vector<uint8_t> wrapped = buildWrappedFrame(from, payload);
-                        for (auto& [id, station] : stations_) {
-                            if (id == sender_station->id || station->data_socket == kInvalidSocket) {
-                                continue;
-                            }
-                            frames.push_back({station, wrapped});
-                        }
-                    } else if (sender_station->peer_id != 0) {
-                        auto peer_it = stations_.find(sender_station->peer_id);
-                        if (peer_it != stations_.end() && peer_it->second->data_socket != kInvalidSocket) {
-                            frames.push_back({peer_it->second, payload});
-                        }
-                    }
-                }
+                return;
             }
-            if (retry_for_route_sync) {
-                std::this_thread::sleep_for(kRouteSyncSleep);
-                continue;
+            auto peer_it = stations_.find(it->second->peer_id);
+            if (peer_it != stations_.end() && peer_it->second->data_socket != kInvalidSocket) {
+                peer = peer_it->second;
             }
-            break;
         }
+        if (peer) {
+            sendDataFrame(peer, payload);
+        }
+    }
 
-        for (const auto& frame : frames) {
-            sendDataFrame(frame.station, frame.payload);
+    std::string displayCall(const Station& st) const {
+        return st.callsign.empty() ? ("STATION-" + std::to_string(st.id)) : st.callsign;
+    }
+
+    // BEACON / CQ: a MON: line (whole link frame) to every monitoring station.
+    void processBeaconOrCq(const std::shared_ptr<Station>& station, const std::string& cmd,
+                           std::vector<OutboundLine>* outbound) {
+        std::lock_guard<std::mutex> lock(stations_mutex_);
+        if (!isTransmitCallsign(station->callsign) || station->peer_id != 0) {
+            outbound->push_back({station, "ERROR:STATE"});
+            return;
+        }
+        outbound->push_back({station, cmd});
+        if (cmd == "CQ") station->listen = true;  // CQ turns listening on
+        std::vector<uint8_t> body = packCall(station->callsign);
+        uint8_t type = 20;  // CQ
+        if (cmd == "BEACON") {
+            body.push_back(0xFF);  // SNR floor unknown, as the modem sends it
+            type = 19;
+        }
+        const std::string line = "MON:" + station->callsign + ":*:" + std::to_string(type) +
+                                 ":WIDE:M4:" + hexUpper(packLinkFrame(type, body));
+        for (auto& [id, other] : stations_) {
+            if (id != station->id && other->monitor && other->cmd_socket != kInvalidSocket) {
+                outbound->push_back({other, line});
+            }
+        }
+    }
+
+    // BCAST <hex>: `BCAST <n>` to the sender, `EVT:BROADCAST <src> <hex>`
+    // to everyone else.
+    void processBroadcast(const std::shared_ptr<Station>& station, const std::string& arg,
+                          std::vector<OutboundLine>* outbound) {
+        std::vector<uint8_t> payload;
+        if (arg.find(' ') != std::string::npos || !hexDecode(arg, &payload) ||
+            payload.size() > kMaxBroadcastBytes) {
+            outbound->push_back({station, "ERROR:BADARG"});
+            return;
+        }
+        std::lock_guard<std::mutex> lock(stations_mutex_);
+        if (!isTransmitCallsign(station->callsign)) {
+            outbound->push_back({station, "ERROR:STATE"});
+            return;
+        }
+        outbound->push_back({station, "BCAST " + std::to_string(payload.size())});
+        const std::string line = "EVT:BROADCAST " + displayCall(*station) + " " + hexUpper(payload);
+        for (auto& [id, other] : stations_) {
+            if (id != station->id && other->cmd_socket != kInvalidSocket) {
+                outbound->push_back({other, line});
+            }
         }
     }
 

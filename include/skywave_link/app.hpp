@@ -4,6 +4,7 @@
 
 #include <fstream>
 
+#include "notification_sound.hpp"
 #include "config.hpp"
 #include "modem_client.hpp"
 #include "message_store.hpp"
@@ -16,7 +17,13 @@
 #include "window_base.hpp"
 #include "email_gateway_job.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <optional>
+#include <unordered_set>
+#include <type_traits>
+#include <utility>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -82,6 +89,20 @@ inline bool isSessionOnlyPayload(uint8_t msg_type) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Application payload type bytes. Every payload this app sends starts with
+// one of these; anything else is dropped on receive.
+//
+// Chat text has its own type byte, 0xC0 (never a valid UTF-8 byte), so text
+// that happens to start with a UTF-8 lead byte (0xE0-0xF4: "€", CJK, emoji)
+// can no longer be mistaken for mail, ping, weather or a control frame.
+//   0xC0 | UTF-8 text                         one-frame chat line
+//   0xFD | frag_idx | total_frags | bytes     chat line in fragments
+// ---------------------------------------------------------------------------
+inline constexpr uint8_t kChatTextMarker = 0xC0;
+inline constexpr uint8_t kChatFragmentMarker = 0xFD;
+inline constexpr size_t kMaxChatFragments = 255;
+
 // Inner payloads a mesh relay packet addressed to us may deliver: chat
 // text and mail only. Never another relay packet or a control type.
 inline bool isMeshDeliverablePayload(uint8_t msg_type) {
@@ -91,12 +112,346 @@ inline bool isMeshDeliverablePayload(uint8_t msg_type) {
         case 0xE6:  // Reliable private mail
         case 0xE7:  // Reliable broadcast mail
         case 0xFB:  // Text broadcast
+        case kChatTextMarker:
             return true;
         default:
-            // Plain chat text starts with a printable ASCII character.
-            return (msg_type >= 0x20 && msg_type < 0x7F) ||
-                   msg_type == '\t' || msg_type == '\n' || msg_type == '\r';
+            return false;
     }
+}
+
+// Smallest well-formed payload for each type this app understands, or 0
+// for a type it does not know. A payload shorter than its minimum, or of an
+// unknown type, is malformed and is dropped (never shown as chat text).
+inline size_t minimumPayloadSize(uint8_t msg_type) {
+    if (msg_type >= 0x10 && msg_type <= 0x18) {
+        return 1;  // File transfer: FileTransferManager validates the rest
+    }
+    switch (msg_type) {
+        case kChatTextMarker: return 2;      // marker + at least one byte
+        case kChatFragmentMarker: return 4;  // marker, index, count, data
+        case 0xD0: return 8;   // BBS announce
+        case 0xD1: return 3;   // BBS remove
+        case 0xD2: return 3;   // BBS file request
+        case 0xE0: return 3;   // Ping request
+        case 0xE1: return 3;   // Ping response
+        case 0xE2: return 4;   // Legacy private mail
+        case 0xE3: return 2;   // Legacy broadcast mail
+        case 0xE4: return 2;   // Weather request/response
+        case 0xE5: return 2;   // Mesh relay packet (header checked by MeshRelay)
+        case 0xE6: return 6;   // Reliable private mail
+        case 0xE7: return 5;   // Reliable broadcast mail
+        case 0xE8: return 4;   // Mail ACK/NACK
+        case 0xF1: return 9;   // QSY confirm
+        case 0xF2: return 8;   // QSY suggestion
+        case 0xF3: return 2;   // Position relay ACK
+        case 0xF4: return 18;  // Position beacon
+        case 0xF5: return 18;  // Position relay request
+        case 0xF6: return 2;   // Away-mode request
+        case 0xF7: return 2;   // Away-mode response
+        case 0xF9: return 2;   // Pending-message notification
+        case 0xFA: return 3;   // Station beacon: marker, grid_len, flags
+        case 0xFB: return 2;   // Text broadcast
+        case 0xFC: return 1;   // CQ
+        default: return 0;     // Unknown (incl. the removed 0xF8 SNR and 0xFE typing frames)
+    }
+}
+
+inline bool isWellFormedPayload(const std::vector<uint8_t>& data) {
+    if (data.empty()) {
+        return false;
+    }
+    const size_t min = minimumPayloadSize(data[0]);
+    return min != 0 && data.size() >= min;
+}
+
+// Number of bytes at the front of `text` (at most `max_bytes`) that end on
+// a UTF-8 character boundary, so a fragment never splits a character.
+inline size_t utf8PrefixLength(const std::string& text, size_t start, size_t max_bytes) {
+    size_t len = std::min(max_bytes, text.size() - start);
+    if (start + len >= text.size()) {
+        return len;
+    }
+    size_t cut = len;
+    // Step back over continuation bytes (10xxxxxx) to a lead byte.
+    while (cut > 0 && (static_cast<unsigned char>(text[start + cut]) & 0xC0) == 0x80) {
+        --cut;
+    }
+    return cut > 0 ? cut : len;  // a single over-long "character": cut anyway
+}
+
+// Wire packets for one chat line: one 0xC0 packet, or 0xFD fragments of at
+// most `max_fragment_bytes` text bytes each. Empty when the text is empty
+// or needs more than kMaxChatFragments fragments.
+inline std::vector<std::vector<uint8_t>> buildChatPackets(const std::string& text,
+                                                          size_t max_fragment_bytes) {
+    std::vector<std::vector<uint8_t>> packets;
+    if (text.empty() || max_fragment_bytes == 0) {
+        return packets;
+    }
+    if (text.size() <= max_fragment_bytes) {
+        std::vector<uint8_t> packet;
+        packet.reserve(text.size() + 1);
+        packet.push_back(kChatTextMarker);
+        packet.insert(packet.end(), text.begin(), text.end());
+        packets.push_back(std::move(packet));
+        return packets;
+    }
+    std::vector<std::string> chunks;
+    for (size_t start = 0; start < text.size();) {
+        const size_t len = utf8PrefixLength(text, start, max_fragment_bytes);
+        chunks.push_back(text.substr(start, len));
+        start += len;
+        if (chunks.size() > kMaxChatFragments) {
+            return {};
+        }
+    }
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        std::vector<uint8_t> packet;
+        packet.reserve(chunks[i].size() + 3);
+        packet.push_back(kChatFragmentMarker);
+        packet.push_back(static_cast<uint8_t>(i));
+        packet.push_back(static_cast<uint8_t>(chunks.size()));
+        packet.insert(packet.end(), chunks[i].begin(), chunks[i].end());
+        packets.push_back(std::move(packet));
+    }
+    return packets;
+}
+
+// Text of a one-frame chat packet, or false when it is not one.
+inline bool decodeChatPacket(const std::vector<uint8_t>& data, std::string* text) {
+    if (data.size() < 2 || data[0] != kChatTextMarker) {
+        return false;
+    }
+    if (text) {
+        text->assign(data.begin() + 1, data.end());
+    }
+    return true;
+}
+
+inline std::string upperTrimmedCallsign(const std::string& call) {
+    const size_t a = call.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) {
+        return "";
+    }
+    const size_t b = call.find_last_not_of(" \t\r\n");
+    std::string out = call.substr(a, b - a + 1);
+    for (char& c : out) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+// Private mail to a station goes straight over the link only when that
+// station is the linked peer; otherwise the peer would refuse it ("Not
+// recipient") and the mail would be resent until it failed.
+inline bool privateMailGoesDirect(const std::string& linked_peer, const std::string& recipient) {
+    const std::string peer = upperTrimmedCallsign(linked_peer);
+    return !peer.empty() && peer != "UNKNOWN" && peer == upperTrimmedCallsign(recipient);
+}
+
+// Email gateway relay allowlist. Fails closed: with no list, nobody may
+// send internet email through this station's account.
+inline bool relaySenderAllowed(const std::vector<std::string>& allowed_relays,
+                               const std::string& sender) {
+    const std::string from = upperTrimmedCallsign(sender);
+    if (from.empty() || from == "UNKNOWN") {
+        return false;
+    }
+    for (const auto& allowed : allowed_relays) {
+        if (upperTrimmedCallsign(allowed) == from) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Away-mode email command sent as chat text by the linked station:
+//   EMAIL:<address>:<subject>:<body>
+// The body may contain ':'; address and subject may not. The verb is
+// case-insensitive.
+struct AwayEmailCommand {
+    std::string to;
+    std::string subject;
+    std::string body;
+};
+
+inline bool parseAwayEmailCommand(const std::string& text, AwayEmailCommand* out) {
+    const size_t a = text.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos || text.size() - a < 6) {
+        return false;
+    }
+    std::string verb = text.substr(a, 6);
+    for (char& c : verb) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    if (verb != "EMAIL:") {
+        return false;
+    }
+    const size_t to_start = a + 6;
+    const size_t c1 = text.find(':', to_start);
+    if (c1 == std::string::npos) {
+        return false;
+    }
+    const size_t c2 = text.find(':', c1 + 1);
+    if (c2 == std::string::npos) {
+        return false;
+    }
+    auto trim = [](std::string s) {
+        const size_t x = s.find_first_not_of(" \t\r\n");
+        if (x == std::string::npos) return std::string();
+        const size_t y = s.find_last_not_of(" \t\r\n");
+        return s.substr(x, y - x + 1);
+    };
+    AwayEmailCommand cmd;
+    cmd.to = trim(text.substr(to_start, c1 - to_start));
+    cmd.subject = trim(text.substr(c1 + 1, c2 - c1 - 1));
+    cmd.body = trim(text.substr(c2 + 1));
+    const size_t at = cmd.to.find('@');
+    if (cmd.to.empty() || at == std::string::npos || at == 0 || at + 1 >= cmd.to.size() ||
+        cmd.to.find_first_of(" \t") != std::string::npos || cmd.body.empty()) {
+        return false;
+    }
+    if (out) {
+        *out = std::move(cmd);
+    }
+    return true;
+}
+
+// Station beacon payload (0xFA). The beacon carries no SNR: nothing the
+// sender knows is a measurement of how it is heard.
+//   0xFA | grid_len | grid | flags | "<CALLSIGN> <text>"
+// flags bit 0: email gateway available.
+struct StationBeacon {
+    std::string grid;
+    bool email_gateway = false;
+    std::string text;  // callsign + beacon text
+};
+
+inline std::vector<uint8_t> encodeStationBeacon(const StationBeacon& beacon) {
+    std::string grid = beacon.grid.substr(0, 8);
+    std::vector<uint8_t> packet;
+    packet.push_back(0xFA);
+    packet.push_back(static_cast<uint8_t>(grid.size()));
+    packet.insert(packet.end(), grid.begin(), grid.end());
+    packet.push_back(beacon.email_gateway ? 0x01 : 0x00);
+    packet.insert(packet.end(), beacon.text.begin(), beacon.text.end());
+    return packet;
+}
+
+inline bool decodeStationBeacon(const std::vector<uint8_t>& data, StationBeacon* out) {
+    if (data.size() < 3 || data[0] != 0xFA) {
+        return false;
+    }
+    const size_t grid_len = data[1];
+    if (grid_len > 8 || data.size() < 2 + grid_len + 1) {
+        return false;
+    }
+    StationBeacon beacon;
+    beacon.grid.assign(data.begin() + 2, data.begin() + 2 + static_cast<std::ptrdiff_t>(grid_len));
+    const uint8_t flags = data[2 + grid_len];
+    beacon.email_gateway = (flags & 0x01) != 0;
+    beacon.text.assign(data.begin() + 3 + static_cast<std::ptrdiff_t>(grid_len), data.end());
+    if (out) {
+        *out = std::move(beacon);
+    }
+    return true;
+}
+
+// Exponential backoff for automatic gateway calls: 10 s, 20 s, 40 s ...
+// capped at 10 minutes.
+inline int gatewayRetryDelaySec(int attempts_made) {
+    int delay = 10;
+    for (int i = 1; i < attempts_made && delay < 600; ++i) {
+        delay *= 2;
+    }
+    return std::min(delay, 600);
+}
+
+// Pull "key": "value" string fields from a JSON fragment (first match).
+inline bool jsonStringField(const std::string& json, const std::string& key, std::string* value) {
+    const std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    while (pos != std::string::npos) {
+        size_t p = pos + pattern.size();
+        while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) ++p;
+        if (p < json.size() && json[p] == ':') {
+            ++p;
+            while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) ++p;
+            if (p >= json.size() || json[p] != '"') {
+                return false;  // null, number, object: not a string
+            }
+            std::string out;
+            for (size_t i = p + 1; i < json.size(); ++i) {
+                const char c = json[i];
+                if (c == '\\' && i + 1 < json.size()) {
+                    const char e = json[++i];
+                    switch (e) {
+                        case 'n': out.push_back('\n'); break;
+                        case 't': out.push_back(' '); break;
+                        case 'r': break;
+                        case 'u': i = std::min(i + 4, json.size() - 1); out.push_back('?'); break;
+                        default: out.push_back(e); break;
+                    }
+                    continue;
+                }
+                if (c == '"') {
+                    if (value) *value = out;
+                    return true;
+                }
+                out.push_back(c);
+            }
+            return false;
+        }
+        pos = json.find(pattern, pos + 1);
+    }
+    return false;
+}
+
+// Short radio-friendly text for an api.weather.gov /alerts/active answer
+// (GeoJSON FeatureCollection). Each alert becomes
+//   "<event> | Severity: <severity> | Expires: <expires>\n<headline>".
+inline std::string formatWeatherAlerts(const std::string& json, const std::string& where,
+                                       size_t max_alerts = 5, size_t max_len = 1500) {
+    if (json.find("\"features\"") == std::string::npos) {
+        return "";
+    }
+    std::string out;
+    size_t count = 0;
+    size_t total = 0;
+    size_t pos = json.find("\"properties\"");
+    while (pos != std::string::npos) {
+        const size_t next = json.find("\"properties\"", pos + 1);
+        const std::string chunk = json.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        pos = next;
+        std::string event;
+        if (!jsonStringField(chunk, "event", &event) || event.empty()) {
+            continue;
+        }
+        ++total;
+        if (count >= max_alerts) {
+            continue;
+        }
+        std::string severity, expires, headline;
+        jsonStringField(chunk, "severity", &severity);
+        jsonStringField(chunk, "expires", &expires);
+        jsonStringField(chunk, "headline", &headline);
+        if (!out.empty()) out += "\n\n";
+        out += event + " | Severity: " + (severity.empty() ? "Unknown" : severity) +
+               " | Expires: " + (expires.empty() ? "N/A" : expires);
+        if (!headline.empty()) out += "\n" + headline;
+        ++count;
+    }
+    if (total == 0) {
+        return "No active weather alerts for " + where;
+    }
+    if (total > count) {
+        out += "\n\n(+" + std::to_string(total - count) + " more)";
+    }
+    if (out.size() > max_len) {
+        out.resize(max_len);
+        out += "...";
+    }
+    return out;
 }
 
 // Prefix for chat/mail a mesh relay delivered to us. The source callsign
@@ -252,7 +607,6 @@ private:
 }  // namespace app_detail
 
 // Forward declarations for modular windows
-class ChatWindow;
 class FileWindow;
 class MessageWindow;
 class PositionWindow;
@@ -261,10 +615,9 @@ class WeatherWindow;
 class MailWindow;
 class BBSWindow;
 class FrequencyWindow;
-class BeaconPanel;
-class PingPanel;
 class MainContentRenderer;
 class StationMapWindow;
+class PskReporterClient;  // src/core/psk_reporter.hpp (R1)
 
 class App {
 public:
@@ -291,6 +644,7 @@ private:
 
     // Core components
     AppConfig config_;
+    std::string config_path_;   // where settings are saved
     std::unique_ptr<ModemClient> modem_;
     std::unique_ptr<RadioController> radio_;
     std::unique_ptr<MessageStore> store_;
@@ -303,7 +657,6 @@ private:
     SharedAppState shared_state_;
 
     // Modular windows
-    std::unique_ptr<ChatWindow> chat_window_;
     std::unique_ptr<FileWindow> file_window_;
     std::unique_ptr<MessageWindow> message_window_;
     std::unique_ptr<PositionWindow> position_window_;
@@ -312,8 +665,6 @@ private:
     std::unique_ptr<MailWindow> mail_window_;
     std::unique_ptr<BBSWindow> bbs_window_;
     std::unique_ptr<FrequencyWindow> frequency_window_;
-    std::unique_ptr<BeaconPanel> beacon_panel_;
-    std::unique_ptr<PingPanel> ping_panel_;
     std::unique_ptr<MainContentRenderer> main_content_;
     std::unique_ptr<StationMapWindow> station_map_window_;
 
@@ -333,20 +684,15 @@ private:
     std::string current_chat_partner_;
     bool chat_scroll_to_bottom_ = false;
 
-    // Typing indicator
-    bool remote_is_typing_ = false;
-    std::chrono::steady_clock::time_point last_typing_indicator_;
-    std::chrono::steady_clock::time_point last_typing_sent_;
-    bool last_input_was_empty_ = true;
-    static constexpr int TYPING_INDICATOR_TIMEOUT_MS = 3000;
-    static constexpr int TYPING_INDICATOR_INTERVAL_MS = 1500;
-
     static constexpr size_t MAX_CHAT_HISTORY = 2000;
 
     // Message fragmentation
     static constexpr size_t MAX_CHAT_FRAGMENT_SIZE = 200;
     app_detail::ChatFragmentAssembler fragment_assembler_;
-    int outgoing_fragment_counter_ = 0;
+
+    // Incoming chat/mail sound (ui.sound_notifications)
+    NotificationSound notification_sound_;
+    void playNotificationSound();
 
     // File transfer state
     std::vector<FileTransfer> transfers_;
@@ -366,8 +712,6 @@ private:
     // Settings state
     char callsign_input_[32] = {0};
     char modem_host_input_[256] = {0};
-    // Last dial frequency pushed to the modem, so FREQINFO is sent on
-    // change rather than every poll.
     // Last FREQINFO pushed to the modem; kDialUnreported forces a push (of
     // the rig-confirmed frequency, or 0 = unknown) after a modem connect.
     static constexpr uint32_t kDialUnreported = 0xFFFFFFFFu;
@@ -375,12 +719,8 @@ private:
     // Modem FSM state last announced in the log (dedupes STATE echoes).
     std::string last_logged_fsm_state_;
     int modem_port_input_ = kDefaultCommandPort;
-    int voice_port_input_ = kDefaultVoicePort;
-    char voice_capture_device_input_[256] = {0};
-    char voice_playback_device_input_[256] = {0};
 
     // Live voice state
-    uint32_t voice_status_generation_ = 0;
     bool voice_auto_started_ = false;
     bool voice_start_pending_ = false;
     bool voice_start_inflight_ = false;
@@ -397,6 +737,12 @@ private:
     uint32_t voice_capture_device_id_ = 0;
     uint32_t voice_playback_device_id_ = 0;
     bool voice_audio_ready_ = false;
+    // Uplink PCM records ModemClient::sendVoicePcm refused (backlog full or
+    // no voice socket), reported to the operator at most every 10 s (K8).
+    uint64_t voice_tx_dropped_ = 0;
+    uint64_t voice_tx_dropped_reported_ = 0;
+    std::chrono::steady_clock::time_point voice_tx_drop_reported_at_{};
+    void noteVoiceSendResult(bool queued);
     // Voice devices open on a helper thread, and only while voice can be
     // used: opening them at start-up blocked the first frame inside
     // CoreAudio (microphone permission) and kept the mic live all day.
@@ -426,16 +772,16 @@ private:
     std::chrono::steady_clock::time_point last_cq_sent_;
     static constexpr int CQ_INTERVAL_MS = 10000;
     char broadcast_message_[512] = {0};
-    std::deque<std::pair<std::string, std::string>> heard_stations_;
-    static constexpr size_t MAX_HEARD_STATIONS = 50;
+    // "Last heard CQ calls" with band/family/SNR (G19).
+    std::deque<HeardCall> heard_calls_;
+    static constexpr size_t MAX_HEARD_CALLS = 50;
 
     // Channel sniffer state
     bool channel_sniffer_active_ = false;
     int sniffer_current_slot_ = 0;
     std::string sniffer_band_ = "20m";
-    std::chrono::steady_clock::time_point sniffer_slot_start_;
-    static constexpr int SNIFFER_DWELL_MS = 5000;
     std::vector<std::pair<int, bool>> slot_status_;
+    uint64_t sniffer_return_freq_hz_ = 0;  // dial frequency to go back to
 
     // GPS state
 #ifdef _WIN32
@@ -448,6 +794,7 @@ private:
     std::string gps_buffer_;
     bool gps_fix_valid_ = false;
     std::chrono::steady_clock::time_point last_gps_update_;
+    static constexpr int GPS_FIX_STALE_MS = 10000;
 
     // Email gateway state
     std::vector<Message> email_outbox_;
@@ -459,6 +806,10 @@ private:
     std::chrono::steady_clock::time_point last_email_check_;
     std::chrono::steady_clock::time_point last_pop3_check_;
     std::chrono::steady_clock::time_point last_winlink_check_;
+    // Outbound internet mail is retried on its own timer, independent of
+    // the POP3/Winlink fetch schedule (SMTP-only setups never fetch).
+    std::chrono::steady_clock::time_point last_outbox_retry_;
+    static constexpr int EMAIL_OUTBOX_RETRY_SEC = 60;
 
     // BBS state
     struct PendingRemoteBbsDownload {
@@ -473,7 +824,6 @@ private:
     std::unordered_map<std::string, PendingRemoteBbsDownload> pending_remote_bbs_downloads_;
     std::vector<PendingBbsDownload> pending_bbs_downloads_ui_;
     static constexpr int64_t REMOTE_BBS_DOWNLOAD_REQUEST_TTL_SEC = 180;
-    int selected_bbs_file_ = -1;
     char bbs_upload_path_[512] = {0};
     char bbs_file_desc_[256] = {0};
 
@@ -506,15 +856,9 @@ private:
     std::chrono::steady_clock::time_point qsy_sideband_started_;
     std::chrono::steady_clock::time_point qsy_reconnect_due_;
     std::chrono::steady_clock::time_point qsy_connect_attempt_started_;
-    static constexpr int QSY_ACK_TIMEOUT_MS = 8000;
-    static constexpr int QSY_RECONNECT_DELAY_MS = 2500;
-    static constexpr int QSY_RECONNECT_CONNECT_TIMEOUT_MS = 12000;
-    static constexpr int QSY_RECONNECT_WINDOW_MS = 15000;
-    static constexpr int QSY_MAX_RECONNECT_ATTEMPTS = 3;
 
     // Beacon state
     std::deque<HeardBeacon> heard_beacons_;
-    std::unordered_map<std::string, int64_t> recent_cq_unix_;
     static constexpr size_t MAX_HEARD_BEACONS = 100;
     std::chrono::steady_clock::time_point last_beacon_sent_;
     bool beacon_enabled_ = false;
@@ -524,18 +868,6 @@ private:
     // QSO state
     std::chrono::steady_clock::time_point qso_start_time_;
     bool qso_active_ = false;
-    float remote_snr_db_ = 0.0f;
-    float local_snr_db_ = 0.0f;
-    bool snr_exchanged_ = false;
-    uint16_t snr_report_seq_ = 0;
-    std::chrono::steady_clock::time_point last_snr_exchange_sent_;
-    std::chrono::steady_clock::time_point last_remote_snr_update_;
-    std::chrono::steady_clock::time_point next_snr_keepalive_due_;
-    static constexpr bool SNR_KEEPALIVE_ENABLED = false;
-    static constexpr int SNR_KEEPALIVE_INTERVAL_MS = 20000;
-    static constexpr int SNR_KEEPALIVE_TX_GUARD_MS = 3000;
-    static constexpr int SNR_KEEPALIVE_LEAD_START_MS = 3000;
-    static constexpr int SNR_KEEPALIVE_FOLLOW_START_MS = 13000;
 
     // Away mode state
     bool away_mode_active_ = false;
@@ -554,6 +886,9 @@ private:
     // Legacy 0xE2/0xE3 mail has no id: sender|content-hash -> first seen.
     std::unordered_map<std::string, int64_t> legacy_mail_seen_;
     static constexpr int64_t LEGACY_MAIL_DEDUP_WINDOW_SEC = 600;
+    // Private mail handed to the mesh: no ACK can come back over a link, so
+    // it is not retried on an ACK timeout.
+    std::unordered_set<std::string> mesh_sent_mail_ids_;
     char mail_to_input_[256] = {0};
     char mail_subject_input_[128] = {0};
     char mail_body_input_[2048] = {0};
@@ -561,8 +896,14 @@ private:
     int selected_mail_ = -1;
     static constexpr int MAIL_ACK_TIMEOUT_MS = 15000;
     static constexpr int MAIL_MAX_RETRIES = 3;
-    static constexpr int GATEWAY_CONNECT_RETRY_MS = 10000;
-    std::chrono::steady_clock::time_point last_gateway_connect_attempt_;
+    // Automatic gateway calls (queued internet mail): never while a link
+    // or call is in progress, at most GATEWAY_MAX_CALL_ATTEMPTS per batch,
+    // with exponential backoff (app_detail::gatewayRetryDelaySec).
+    static constexpr int GATEWAY_MAX_CALL_ATTEMPTS = 5;
+    int gateway_call_attempts_ = 0;
+    bool gateway_gave_up_logged_ = false;
+    bool gateway_waiting_logged_ = false;
+    std::chrono::steady_clock::time_point gateway_next_call_{};
     std::string auto_gateway_target_;
     struct GatewayStats {
         float snr_accum = 0.0f;
@@ -573,6 +914,25 @@ private:
     };
     std::map<std::string, GatewayStats> gateway_stats_;
     RelayDiagnostics relay_diagnostics_;
+    void recordGatewaySighting(const std::string& callsign, std::optional<float> snr_db,
+                               int64_t when);
+    bool tryAutoConnectGateway(const std::string& why);
+
+    // Mesh relay: forwards that could not be handed to the modem are
+    // retried a few times before they are dropped (with a message).
+    struct MeshRetry {
+        RelayQueueEntry entry;
+        int attempts = 0;
+        std::chrono::steady_clock::time_point next_try{};
+    };
+    std::deque<MeshRetry> mesh_retry_;
+    static constexpr int MESH_MAX_SEND_ATTEMPTS = 3;
+    std::chrono::steady_clock::time_point last_mesh_prune_{};
+    static constexpr int MESH_ROUTE_MAX_AGE_SEC = 1800;
+
+    // Store maintenance (store.auto_cleanup / message_expiry_days)
+    std::chrono::steady_clock::time_point next_store_maintenance_{};
+    void runStoreMaintenance();
 
     // Timing
     std::chrono::steady_clock::time_point last_poll_;
@@ -591,16 +951,20 @@ private:
     void setModemFamily(const std::string& family);
     // Read the modem's FAMILY into the settings (the modem is the authority).
     void syncFamilyFromModem();
+    // Tell the modem to key the rig through this app's PTT server.
+    void pushPttSettingsToModem();
     // Log a refused/unanswered modem command in plain words.
     void logCommandFailure(const std::string& what, const std::string& cmd,
                            const std::string& response);
     bool setVoicePttState(bool enabled);
     bool handleVoiceHotkeyEvent(const SDL_KeyboardEvent& key, bool pressed);
+    bool handleShortcutKey(const SDL_KeyboardEvent& key);
     bool openVoiceAudioDevices();
     void closeVoiceAudioDevices();
     void setupStyle();
     void initializeWindows();
     void initializeSharedState();
+    bool saveConfig(bool announce);
 
     // Main loop
     void processEvents();
@@ -646,6 +1010,7 @@ private:
     void connectToModem();
     void pollModemConnect();   // finishes a background connectToModem()
     void pollAPRSConnect();    // finishes a background APRS-IS login
+    void applyAPRSConfig();    // (re)connect APRS-IS per the settings
     // Native pickers run on a helper thread; the result is handed back to
     // the GUI thread by pollPathPicker(). One picker at a time.
     std::string imgui_ini_path_;   // must outlive the ImGui context
@@ -657,8 +1022,11 @@ private:
     void onModemConnected();
     void disconnectFromModem();
     void connectToStation(const std::string& callsign);
-    void sendChatMessage(const std::string& text);
-    void sendFile(const std::string& path);
+    bool sendChatMessage(const std::string& text);
+    // Offers a file to the linked station; kind BbsUpload asks it to store
+    // the file in its BBS folder (K21). False, with the reason logged, when
+    // no transfer was started.
+    bool sendFile(const std::string& path, FileOfferKind kind = FileOfferKind::Direct);
     void updatePosition(double lat, double lon);
     void applyRadioConfig();
 
@@ -688,6 +1056,8 @@ private:
     void processIncomingMessage(const std::vector<uint8_t>& data, const std::string& from_override = "",
                                 RxOrigin origin = RxOrigin::Link, int relay_depth = 0,
                                 const std::string& relayed_by = "");
+    void receiveChatText(const std::string& from, const std::string& text,
+                         const std::string& relayed_by, bool via_link);
     bool isLinkConnected() const;
     std::string linkedPeerCallsign() const;
     void appendSystemChat(const std::string& text);
@@ -699,10 +1069,8 @@ private:
     void pruneFragmentBuffers();
     void gracefulDisconnectModem();
 
-    // Chat typing and fragmentation
-    void sendTypingIndicator();
-    void processTypingIndicator(const std::string& from);
-    void sendFragmentedMessage(const std::string& text);
+    // Chat fragmentation
+    bool sendFragmentedMessage(const std::string& text);
     void processMessageFragment(const std::string& from, const std::vector<uint8_t>& data);
 
     // CQ and broadcast
@@ -710,7 +1078,7 @@ private:
     void stopCQ();
     void updateCQ();
     void sendBroadcast(const std::string& message);
-    void processCQResponse(const std::string& from);
+    void processCQResponse(const std::string& from, const std::string& family = "");
     bool sendBroadcastPayload(const std::vector<uint8_t>& payload);
     void sendQsySuggestion(const std::string& band, int slot, uint32_t frequency_hz);
     void processQsySuggestion(const std::string& from, const std::vector<uint8_t>& data);
@@ -718,17 +1086,28 @@ private:
     void respondToQsySuggestion(bool accept);
     void updateQsyWorkflow();
     void resetQsyWorkflow(bool clear_peer);
-    bool executeQsyTarget(const std::string& band, int slot, uint32_t frequency_hz);
+    bool executeQsyTarget(const std::string& band, int slot, uint32_t frequency_hz,
+                          std::string* why = nullptr);
     bool qsyTargetInBand(const std::string& band, int slot, uint32_t frequency_hz) const;
-    void returnToCallingFrequency(const std::string& reason);
+    bool returnToCallingFrequency(const std::string& reason);
     bool buildAutoQsyTarget(std::string* band_out, int* slot_out, uint32_t* freq_hz_out) const;
-    void addHeardStation(const std::string& callsign);
+    void recordHeardCall(const std::string& callsign, const std::string& family,
+                         std::optional<float> snr);
+
+    // Radio tuning. radioCanTune() is true only for a rig that really
+    // moves (connected CAT control, not dry-run); `why` says what is missing.
+    bool radioCanTune(std::string* why = nullptr) const;
+    // The rig-confirmed dial frequency, if there is one.
+    std::optional<uint64_t> knownDialFrequencyHz() const;
+    bool tuneOperatingFrequency(uint64_t freq_hz, bool update_selection = true,
+                                std::string* why = nullptr);
+    bool setOperatingFrequencyFromUi(uint64_t freq_hz);
 
     // Channel sniffer
     void startChannelSniffer();
     void stopChannelSniffer();
+    void finishChannelSniffer(const std::string& message);
     void updateChannelSniffer();
-    bool tuneOperatingFrequency(uint64_t freq_hz, bool update_selection = true);
 
     // GPS
     bool openGPSPort(const std::string& port, int baud);
@@ -742,10 +1121,15 @@ private:
     void stopEmailGateway();
     void updateEmailGateway();
     void processIncomingEmail();
-    void relayEmailToRadio(const Message& email);
     void keepInboundLocally(const std::string& from, const std::string& to, const std::string& subject,
                             const std::string& body, const std::string& message_id);
     void relayRadioToEmail(const Message& msg);
+    // Queue an internet email from this station (Messages window). Returns
+    // true only when it was validated and queued; otherwise false with the
+    // reason in *error (when given) and in the log.
+    bool queueOutgoingEmail(const std::string& to, const std::string& subject,
+                            const std::string& body, const std::string& from,
+                            std::string* error = nullptr);
     // Gateway network I/O runs on email_worker_; these run on the GUI thread.
     bool startEmailGatewayJob(bool poll_pop3, bool poll_winlink, bool send_outbox);
     void pollEmailGatewayJob();
@@ -758,7 +1142,8 @@ private:
     void sendBeacon();
     void updateBeacon();
     void processReceivedBeacon(const std::string& from, const std::string& grid_square,
-                                  const std::string& message, float snr, bool email_gateway = false);
+                               const std::string& message, std::optional<float> snr,
+                               bool email_gateway = false, const std::string& family = "");
     void checkPendingMessagesForStation(const std::string& callsign);
     void recordStationLocation(const std::string& callsign,
                                bool has_coordinates,
@@ -767,7 +1152,7 @@ private:
                                const std::string& grid_square,
                                const std::string& details,
                                StationLocationSource source,
-                               float snr = 0.0f,
+                               std::optional<float> snr = std::nullopt,
                                bool email_gateway = false,
                                int64_t timestamp = 0);
     void seedStationLocationsFromHistory();
@@ -776,17 +1161,16 @@ private:
     // QSO management
     void startQSO(const std::string& callsign);
     void endQSO();
-    void exchangeSNR(bool force = false);
-    void processSNRReport(float remote_snr);
-    void updateSNRKeepAlive();
-    bool canSendSNRKeepAlive() const;
-    std::string formatQSODuration() const;
 
     // Away mode
     void enableAwayMode();
     void disableAwayMode();
     void processAwayModeRequest(const std::string& from, const std::vector<uint8_t>& data);
     void sendAwayModeResponse(const std::string& to, const std::string& response);
+    // EMAIL:<to>:<subject>:<body> from the linked station while away.
+    // Returns the reply sent to the requester.
+    std::string handleAwayEmailCommand(const std::string& from, const app_detail::AwayEmailCommand& cmd);
+    std::string awayCommandHelp() const;
 
     // Ping
     void sendPing(const std::string& callsign);
@@ -823,21 +1207,25 @@ private:
 
     // File transfer helpers
     void syncTransfersFromManager();
-    bool isImageFile(const std::string& filename) const;
-    std::string getFileTypeDescription(const std::string& filename) const;
 
-    // Weather functions
-    void requestWeatherForecast(const std::string& location);
-    void requestMETAR(const std::string& airport_code);
-    void requestTAF(const std::string& airport_code);
-    void requestMarineWeather(const std::string& zone);
+    // Weather functions. ALERT (0x05) asks the linked station for the
+    // active weather alerts at a location (grid, "lat,lon", place name or
+    // two-letter US state).
+    bool requestWeather(uint8_t type, const std::string& query);
+    void requestWeatherForecast(const std::string& location) { requestWeather(0x01, location); }
+    void requestMETAR(const std::string& airport_code) { requestWeather(0x02, airport_code); }
+    void requestTAF(const std::string& airport_code) { requestWeather(0x03, airport_code); }
+    void requestMarineWeather(const std::string& zone) { requestWeather(0x04, zone); }
+    void requestWeatherAlerts(const std::string& location) { requestWeather(0x05, location); }
+    void cancelWeatherRequest();
     bool isStationLinkConnected(bool refresh = false);
     void processWeatherMessage(const std::string& from, const std::vector<uint8_t>& data);
     void handleWeatherRequest(uint8_t request_type, const std::string& query, const std::string& requester);
-    void sendWeatherResponse(uint8_t type, const std::string& location, const std::string& report);
+    bool sendWeatherResponse(uint8_t type, const std::string& location, const std::string& report);
     void fetchWeatherAsync(uint8_t type, const std::string& query, const std::string& requester);
     static std::string fetchWeatherReport(uint8_t type, const std::string& query);
     void processWeatherFetchResult();
+    void loadWeatherCache();
 
     // Weather helpers
     static bool gridSquareToLatLon(const std::string& grid, double& lat, double& lon);
@@ -854,11 +1242,6 @@ private:
     std::chrono::steady_clock::time_point weather_request_time_;
     static constexpr int WEATHER_TIMEOUT_MS = 30000;
 
-    // Async weather fetch state (exposed to SharedAppState; unused by the
-    // remote-request worker below).
-    std::mutex weather_fetch_mutex_;
-    std::unique_ptr<PendingWeatherFetch> pending_weather_fetch_;
-
     // Remote weather requests: one worker thread drains a bounded queue,
     // one job per requester. The thread holds a shared_ptr to this state,
     // never to App, so shutdown with a fetch in flight is safe.
@@ -873,29 +1256,30 @@ private:
         std::mutex mutex;
         std::deque<WeatherJob> queue;
         std::vector<WeatherJob> done;
-        std::vector<std::string> rejected;
+        std::vector<WeatherJob> rejected;
         std::string active_requester;
         bool running = false;
     };
     std::shared_ptr<WeatherWorker> weather_worker_ = std::make_shared<WeatherWorker>();
 
-    // PSK Reporter state
-    std::vector<PSKReporterSpot> psk_reporter_queue_;
-    std::mutex psk_reporter_mutex_;
-    std::chrono::steady_clock::time_point last_psk_reporter_upload_;
-    uint32_t current_frequency_hz_ = 14078000;
+    // PSK Reporter (R1): spots go to PskReporterClient, which uploads IPFIX
+    // on its own cadence from a helper thread. psk_status_ is its state for
+    // the Settings status line.
+    std::unique_ptr<PskReporterClient> psk_client_;
+    PskReporterStatus psk_status_;
+    void refreshPskStatus();
+    std::string psk_last_error_shown_;
+    std::string psk_receiver_key_;
+    uint64_t psk_last_upload_shown_ = 0;
+    std::chrono::steady_clock::time_point last_psk_poll_{};
+    // Rig-confirmed dial frequency (0 = unknown), for display.
+    uint32_t current_frequency_hz_ = 0;
 
     // PSK Reporter functions
     void queuePSKReporterSpot(const std::string& callsign, const std::string& grid,
-                               float snr, uint32_t freq_hz = 0);
+                              std::optional<float> snr);
     void uploadPSKReporterSpots();
     void updatePSKReporter();
-    std::vector<std::pair<std::string, float>> computeBandRecommendations() const;
-    static std::string generatePSKReporterPayload(const std::string& reporter_call,
-                                                   const std::string& reporter_grid,
-                                                   const std::string& antenna,
-                                                   const std::vector<PSKReporterSpot>& spots);
-    static bool sendPSKReporterUDP(const std::string& payload);
 };
 
 } // namespace skylink

@@ -21,11 +21,20 @@ struct SMTPDeliveryRequest {
     std::string password;
 
     std::string from;
+    // Display name in the From header (station.name); empty: address only.
+    std::string from_name;
     std::string to;
     std::string subject;
     std::string body;
 };
 
 bool sendSMTPDelivery(const SMTPDeliveryRequest& req, std::string* error = nullptr);
+
+// Header helpers (exposed for testing). A header value that is not plain
+// printable ASCII becomes an RFC 2047 encoded word (=?UTF-8?B?...?=); CR/LF
+// never survive.
+std::string encodeHeaderText(const std::string& text);
+// `"Display Name" <addr>`, `=?UTF-8?B?...?= <addr>`, or just `addr`.
+std::string formatFromHeader(const std::string& display_name, const std::string& address);
 
 }  // namespace skylink

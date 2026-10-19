@@ -1,16 +1,56 @@
 // MessageWindow - Store-and-forward messages + email tab
 
 #include "skywave_link/message_window.hpp"
+#include "skywave_link/gui_util.hpp"
 #include "skywave_link/message_store.hpp"
+#include "skywave_link/modern_style.hpp"
 #include "imgui.h"
 #include <cstring>
 #include <chrono>
 
 namespace skylink {
 
+namespace {
+
+constexpr double kRefreshIntervalSec = 2.0;
+
+// Same rule as the App's gateway check: one '@', something on both sides,
+// a dot in the domain, no whitespace.
+bool plausibleEmailAddress(const std::string& input) {
+    const std::string addr = gui::trimCopy(input);
+    const size_t at = addr.find('@');
+    if (at == std::string::npos || at == 0 || at + 1 >= addr.size()) return false;
+    if (addr.find('@', at + 1) != std::string::npos) return false;
+    if (addr.find_first_of(" \t\r\n") != std::string::npos) return false;
+    const size_t dot = addr.find('.', at + 1);
+    return dot != std::string::npos && dot + 1 < addr.size() && dot > at + 1;
+}
+
+}  // namespace
+
 MessageWindow::MessageWindow(SharedAppState& state) : WindowBase(state) {}
 
+// The lists come from SQLite; reloading them every frame cost two queries
+// per frame. Reload when the window (re)opens, every couple of seconds,
+// and on demand.
+void MessageWindow::refreshIfDue(bool force) {
+    const int frame = ImGui::GetFrameCount();
+    const double now = ImGui::GetTime();
+    const bool reopened = last_render_frame_ < 0 || frame - last_render_frame_ > 1;
+    last_render_frame_ = frame;
+    if (!onRefreshMessages) return;
+    if (force || reopened || last_refresh_ < 0.0 || now - last_refresh_ >= kRefreshIntervalSec) {
+        onRefreshMessages();
+        last_refresh_ = now;
+    }
+}
+
 void MessageWindow::render() {
+    refreshIfDue(false);
+    ui::StatusLine(status_);
+    if (ImGui::SmallButton("Refresh")) {
+        refreshIfDue(true);
+    }
     if (ImGui::BeginTabBar("MessageTabs")) {
         if (ImGui::BeginTabItem("Inbox")) {
             renderInbox();
@@ -37,10 +77,12 @@ void MessageWindow::renderInbox() {
     ImGui::Columns(2, "MessageColumns", true);
 
     ImGui::Text("Inbox");
-    if (ImGui::BeginChild("MessageList", ImVec2(-1, -1), true)) {
-        if (onRefreshMessages) onRefreshMessages();
+    if (ImGui::BeginChild("MessageList", ImVec2(-1, -1), ImGuiChildFlags_Borders)) {
         if (selected >= static_cast<int>(inbox.size())) {
             selected = static_cast<int>(inbox.size()) - 1;
+        }
+        if (inbox.empty()) {
+            ImGui::TextDisabled("No messages");
         }
 
         for (size_t i = 0; i < inbox.size(); ++i) {
@@ -60,7 +102,7 @@ void MessageWindow::renderInbox() {
     ImGui::NextColumn();
 
     ImGui::Text("Message Content");
-    if (ImGui::BeginChild("MessageContent", ImVec2(-1, -1), true)) {
+    if (ImGui::BeginChild("MessageContent", ImVec2(-1, -1), ImGuiChildFlags_Borders)) {
         if (selected >= 0 && selected < static_cast<int>(inbox.size())) {
             const auto& msg = inbox[selected];
             ImGui::Text("From: %s", msg.from_callsign.c_str());
@@ -72,11 +114,12 @@ void MessageWindow::renderInbox() {
                 const int64_t id_to_delete = msg.id;
                 if (onDeleteMessage) {
                     onDeleteMessage(id_to_delete);
+                    postStatus("Message deleted", StatusKind::Info);
                 }
                 selected = -1;
             }
         } else {
-            ImGui::Text("Select a message to view");
+            ImGui::TextDisabled("Select a message to view");
         }
     }
     ImGui::EndChild();
@@ -91,10 +134,12 @@ void MessageWindow::renderOutbox() {
     ImGui::Columns(2, "MessageOutboxColumns", true);
 
     ImGui::Text("Outbox");
-    if (ImGui::BeginChild("OutboxList", ImVec2(-1, -1), true)) {
-        if (onRefreshMessages) onRefreshMessages();
+    if (ImGui::BeginChild("OutboxList", ImVec2(-1, -1), ImGuiChildFlags_Borders)) {
         if (selected_outbox_ >= static_cast<int>(outbox.size())) {
             selected_outbox_ = static_cast<int>(outbox.size()) - 1;
+        }
+        if (outbox.empty()) {
+            ImGui::TextDisabled("No messages");
         }
 
         for (size_t i = 0; i < outbox.size(); ++i) {
@@ -114,7 +159,7 @@ void MessageWindow::renderOutbox() {
     ImGui::NextColumn();
 
     ImGui::Text("Sent Message");
-    if (ImGui::BeginChild("OutboxContent", ImVec2(-1, -1), true)) {
+    if (ImGui::BeginChild("OutboxContent", ImVec2(-1, -1), ImGuiChildFlags_Borders)) {
         if (selected_outbox_ >= 0 && selected_outbox_ < static_cast<int>(outbox.size())) {
             const auto& msg = outbox[selected_outbox_];
             ImGui::Text("From: %s", msg.from_callsign.c_str());
@@ -126,11 +171,12 @@ void MessageWindow::renderOutbox() {
                 const int64_t id_to_delete = msg.id;
                 if (onDeleteMessage) {
                     onDeleteMessage(id_to_delete);
+                    postStatus("Message deleted", StatusKind::Info);
                 }
                 selected_outbox_ = -1;
             }
         } else {
-            ImGui::Text("Select a sent message to view");
+            ImGui::TextDisabled("Select a sent message to view");
         }
     }
     ImGui::EndChild();
@@ -152,34 +198,31 @@ void MessageWindow::renderEmailTab() {
                               ImVec2(ImGui::CalcItemWidth(), ImGui::GetTextLineHeight() * 13.0f));
 
     if (ImGui::Button("Send Email")) {
-        if (std::strlen(to_addr) > 0 && std::strlen(subject) > 0) {
-            if (onSendEmail) {
-                onSendEmail(to_addr, subject, body,
-                            state_.config ? state_.config->station.callsign : "");
+        const std::string to = gui::trimCopy(to_addr);
+        const std::string from = state_.config ? state_.config->station.callsign : "";
+        if (to.empty() || gui::trimCopy(subject).empty()) {
+            postStatus("Fill in To and Subject", StatusKind::Error);
+        } else if (!plausibleEmailAddress(to)) {
+            postStatus("\"" + to + "\" is not an email address", StatusKind::Error);
+        } else if (from.empty()) {
+            postStatus("Set your callsign in Settings first", StatusKind::Error);
+        } else if (onQueueEmail) {
+            std::string error;
+            if (onQueueEmail(to, subject, body, from, error)) {
+                postStatus("Email to " + to + " queued for the internet gateway",
+                           StatusKind::Success);
+                to_addr[0] = '\0';
+                subject[0] = '\0';
+                body[0] = '\0';
+            } else {
+                // Keep the draft.
+                postStatus("Email not queued: " + (error.empty() ? std::string("unknown error")
+                                                                 : error),
+                           StatusKind::Error);
             }
-            to_addr[0] = '\0';
-            subject[0] = '\0';
-            body[0] = '\0';
-            ImGui::OpenPopup("Email Queued");
         } else {
-            ImGui::OpenPopup("Email Error");
+            postStatus("Email gateway is not available", StatusKind::Error);
         }
-    }
-
-    if (ImGui::BeginPopupModal("Email Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Please fill in To and Subject fields.");
-        if (ImGui::Button("OK")) {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-
-    if (ImGui::BeginPopupModal("Email Queued", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Email has been queued for delivery.");
-        if (ImGui::Button("OK")) {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
     }
 }
 

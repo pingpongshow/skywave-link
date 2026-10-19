@@ -3,6 +3,7 @@
 #pragma once
 
 #include "imgui.h"
+#include "window_base.hpp"
 
 namespace skylink::ui {
 
@@ -17,7 +18,6 @@ struct Palette {
     ImVec4 info;          // secondary highlight (gateways, outgoing calls)
     ImVec4 muted;         // secondary text
     ImVec4 heading;       // section headers
-    ImVec4 text_on_color; // text on success/danger/accent buttons
 };
 
 // Loads the embedded UI and monospace fonts into the current context's
@@ -48,5 +48,16 @@ void SectionHeader(const char* label);
 
 // Height reserved for the main window's status bar.
 float statusBarHeight();
+
+// Palette colour for a status kind (Info uses the normal text colour).
+ImVec4 statusColor(StatusKind kind);
+
+// A window's status line: the last result in its colour, with a dismiss
+// button. Draws nothing while the status is empty.
+void StatusLine(WindowStatus& status);
+
+// Wrapped text in the warning colour, for conditions the operator must
+// notice (dry-run radio, no voice media, unsaved settings).
+void WarningText(const char* text);
 
 } // namespace skylink::ui

@@ -27,8 +27,8 @@ Everything below is written against the modem's own documentation in
 | control port | 8301 | **9101** |
 | voice port | 8302 | **9102** |
 
-Configs carrying the old ports (in either command/data order) are migrated on
-load by `normalizeLegacyModemPorts()`.
+Configs carrying the old ports are not migrated (Skywave Link was never
+released with them): set the ports in Settings > Modem.
 
 The voice socket is now **optional**. A Skywave build without `ENABLE_VOICE`
 never binds the port, and the link emulator has no voice path at all;
@@ -157,9 +157,15 @@ and the app now depends on the fixed behaviour:
 
 ## 7. What the emulator now does
 
-`skywave_link_emulator` was taught the same dialect: verb-echo responses,
-`EVT:` notifications, a Skywave-shaped `STATUS` line, `BCAST`, and
-`ERROR:UNKNOWN` / `ERROR:UNSUPPORTED` for unknown and gated verbs. It still
-routes application data over the data sockets rather than synthesising
-monitor records, so it exercises the connected paths, not the passive-monitor
-path.
+`skywave_link_emulator` follows the current modem's control dialect for
+what the app uses: verb-echo responses, `EVT:` notifications, a
+Skywave-shaped `STATUS` line, and `ERROR:UNKNOWN` / `ERROR:UNSUPPORTED` for
+unknown and gated verbs. `BCAST <hex>` answers `BCAST <n>` and reaches every
+other station as `EVT:BROADCAST <src> <HEX>`; `BEACON` and `CQ` reach
+stations with `MONITOR ON` as `MON:` lines carrying the whole link frame
+(BEACON body: call + `0xFF`, CQ body: call), so the passive-monitor path is
+exercised too. Data-port bytes travel only inside a connected session, and
+`CONNECT` to an unknown station ends with `EVT:DISCONNECTED NO_ANSWER`.
+Payloads are opaque: the app's own framing (chat `0xC0|text`, station
+beacon `0xFA|grid_len|grid|flags|CALL text`, mail, files) passes unchanged.
+It has no voice port.

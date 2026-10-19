@@ -41,6 +41,10 @@ if(NOT SQLITE3_FOUND)
         set(SQLITE3_FOUND TRUE)
     endif()
 endif()
+if(NOT SQLITE3_FOUND)
+    # The message store is SQLite only; there is no other storage backend.
+    message(FATAL_ERROR "SQLite3 not found. Install sqlite3 (development files).")
+endif()
 
 # Find OpenSSL for SMTP TLS
 find_package(OpenSSL QUIET)
@@ -95,13 +99,16 @@ add_library(skywave_link_core STATIC
     src/email/pop3_client.cpp
     src/email/winlink_telnet_client.cpp
     src/email/email_gateway_job.cpp
-    src/messaging/message_router.cpp
-    src/core/channel_scanner.cpp
     src/core/image_preview.cpp
-    src/core/voice_message.cpp
     src/core/mesh_relay.cpp
-    src/core/web_server.cpp
+    src/core/notification_sound.cpp
+    src/core/secret_store.cpp
+    src/core/psk_reporter.cpp
 )
+
+if(APPLE)
+    target_link_libraries(skywave_link_core PUBLIC "-framework Security" "-framework CoreFoundation")
+endif()
 
 target_include_directories(skywave_link_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -111,15 +118,13 @@ target_include_directories(skywave_link_core PUBLIC
 target_include_directories(skywave_link_core SYSTEM PUBLIC ${STB_INCLUDE_DIR})
 
 target_link_libraries(skywave_link_core PUBLIC Threads::Threads ${HAMLIB_LINK_TARGET})
+# One version string for the app, About box, APRS-IS login and PSK Reporter.
+target_compile_definitions(skywave_link_core PUBLIC SKYWAVE_LINK_VERSION="${PROJECT_VERSION}")
 target_compile_options(skywave_link_core PRIVATE ${SKYWAVE_LINK_WARNINGS})
 
-if(SQLITE3_FOUND)
-    target_include_directories(skywave_link_core PUBLIC ${SQLITE3_INCLUDE_DIRS})
-    target_link_libraries(skywave_link_core PUBLIC ${SQLITE3_LIBRARIES})
-    target_compile_definitions(skywave_link_core PUBLIC SKYWAVE_LINK_HAS_SQLITE)
-else()
-    message(WARNING "SQLite3 not found - message store will use file-based storage")
-endif()
+target_include_directories(skywave_link_core PUBLIC ${SQLITE3_INCLUDE_DIRS})
+target_link_directories(skywave_link_core PUBLIC ${SQLITE3_LIBRARY_DIRS})
+target_link_libraries(skywave_link_core PUBLIC ${SQLITE3_LIBRARIES})
 
 if(OPENSSL_FOUND)
     target_include_directories(skywave_link_core PUBLIC ${OPENSSL_INCLUDE_DIR})
@@ -181,7 +186,6 @@ if(SDL2_FOUND AND OPENGL_FOUND AND EXISTS "${IMGUI_DIR}/imgui.cpp")
         src/main.cpp
         src/gui/app.cpp
         src/gui/shared_state.cpp
-        src/gui/chat_window.cpp
         src/gui/file_window.cpp
         src/gui/message_window.cpp
         src/gui/position_window.cpp
@@ -191,8 +195,6 @@ if(SDL2_FOUND AND OPENGL_FOUND AND EXISTS "${IMGUI_DIR}/imgui.cpp")
         src/gui/bbs_window.cpp
         src/gui/frequency_window.cpp
         src/gui/station_map_window.cpp
-        src/gui/beacon_panel.cpp
-        src/gui/ping_panel.cpp
         src/gui/main_content.cpp
         src/gui/modern_style.cpp
     )
@@ -262,9 +264,6 @@ if(SDL2_FOUND AND OPENGL_FOUND AND EXISTS "${IMGUI_DIR}/imgui.cpp")
     )
 
     message(STATUS "Skywave Link: Building with SDL2 + OpenGL")
-    if(SQLITE3_FOUND)
-        message(STATUS "  SQLite3: Found")
-    endif()
     if(OPENSSL_FOUND)
         message(STATUS "  OpenSSL: Found")
     endif()

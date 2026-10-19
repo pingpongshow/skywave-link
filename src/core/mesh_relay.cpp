@@ -49,9 +49,9 @@ void MeshRelay::setMaxHopCount(uint8_t max_hops) {
     max_hop_count_ = std::max<uint8_t>(1, max_hops);
 }
 
-uint8_t MeshRelay::getMaxHopCount() const {
+void MeshRelay::setRouteMaxAgeSec(int64_t max_age_sec) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return max_hop_count_;
+    route_max_age_sec_ = std::max<int64_t>(60, max_age_sec);
 }
 
 void MeshRelay::setDedupWindowSec(int64_t dedup_window_sec) {
@@ -68,6 +68,7 @@ int64_t MeshRelay::getDedupWindowSec() const {
 // Wire format:
 // [0xE5][TTL:1][hop_count:1][path_count:1]
 // [src_len:1][src:N][dst_len:1][dst:N][msg_id_len:1][msg_id:N]
+// [next_hop_len:1][next_hop:N]          (0 = flood)
 // [path entries: for each: len:1, callsign:N]
 // [payload_len:2 LE][payload:N]
 
@@ -75,7 +76,9 @@ std::vector<uint8_t> MeshRelay::serializeHeader(const RelayHeader& header) {
     // #3: Validate string fields <= 255 bytes
     if (header.source.size() > 255 ||
         header.destination.size() > 255 ||
-        header.message_id.size() > 255) {
+        header.message_id.size() > 255 ||
+        header.next_hop.size() > 255 ||
+        header.path.size() > 255) {
         return {};
     }
     for (const auto& p : header.path) {
@@ -101,6 +104,10 @@ std::vector<uint8_t> MeshRelay::serializeHeader(const RelayHeader& header) {
     // Message ID
     out.push_back(static_cast<uint8_t>(header.message_id.size()));
     out.insert(out.end(), header.message_id.begin(), header.message_id.end());
+
+    // Next hop
+    out.push_back(static_cast<uint8_t>(header.next_hop.size()));
+    out.insert(out.end(), header.next_hop.begin(), header.next_hop.end());
 
     // Path entries
     for (const auto& p : header.path) {
@@ -142,6 +149,13 @@ bool MeshRelay::deserializeHeader(const uint8_t* data, size_t size,
     header.message_id.assign(reinterpret_cast<const char*>(data + pos), id_len);
     pos += id_len;
 
+    // Next hop
+    if (pos >= size) return false;
+    uint8_t hop_len = data[pos++];
+    if (pos + hop_len > size) return false;
+    header.next_hop.assign(reinterpret_cast<const char*>(data + pos), hop_len);
+    pos += hop_len;
+
     // Reject packets with empty source or message_id
     if (header.source.empty() || header.destination.empty() || header.message_id.empty()) return false;
 
@@ -164,7 +178,7 @@ bool MeshRelay::deserializeHeader(const uint8_t* data, size_t size,
 // #11: Takes optional received_snr_db
 RelayResult MeshRelay::processRelayPacket(const std::vector<uint8_t>& data,
                                            std::vector<uint8_t>& payload_out,
-                                           float received_snr_db) {
+                                           std::optional<float> received_snr_db) {
     std::lock_guard<std::mutex> lock(mutex_);
     stats_.packets_received++;
 
@@ -216,6 +230,34 @@ RelayResult MeshRelay::processRelayPacket(const std::vector<uint8_t>& data,
     // #5: Only cleanup periodically instead of every call
     if (process_call_count_ % 100 == 0 || dedup_cache_.size() > 1000) {
         cleanupDedup();
+        pruneLocked(route_max_age_sec_);
+    }
+
+    // Every packet heard teaches the way back to its source: through the
+    // station that transmitted it (the last relay, or the source itself).
+    {
+        const std::string heard_from = header.path.empty() ? header.source : header.path.back();
+        const int64_t now = now_sec();
+        if (header.source != my_callsign_) {
+            RouteEntry back;
+            back.destination = header.source;
+            back.next_hop = heard_from;
+            back.hop_count = static_cast<uint8_t>(std::min<int>(255, header.hop_count + 1));
+            back.snr_known = received_snr_db.has_value();
+            back.snr_db = received_snr_db.value_or(0.0f);
+            back.last_seen = now;
+            learnRouteLocked(back);
+        }
+        if (heard_from != my_callsign_ && heard_from != header.source) {
+            RouteEntry neighbour;
+            neighbour.destination = heard_from;
+            neighbour.next_hop = heard_from;
+            neighbour.hop_count = 1;
+            neighbour.snr_known = received_snr_db.has_value();
+            neighbour.snr_db = received_snr_db.value_or(0.0f);
+            neighbour.last_seen = now;
+            learnRouteLocked(neighbour);
+        }
     }
 
     // #4: Broadcast relay - for broadcast ("*"), deliver locally AND relay
@@ -224,19 +266,6 @@ RelayResult MeshRelay::processRelayPacket(const std::vector<uint8_t>& data,
 
     if (is_for_us) {
         payload_out = payload;  // copy (may also relay for broadcast)
-
-        // Learn route back to source
-        // #11: Use received_snr_db instead of hardcoded 0
-        RouteEntry route;
-        route.destination = header.source;
-        route.next_hop = header.path.empty() ? header.source : header.path.back();
-        route.hop_count = header.hop_count;
-        route.snr_db = received_snr_db;
-        route.last_seen = now_sec();
-        auto it = routes_.find(route.destination);
-        if (it == routes_.end() || isBetterRoute(it->second, route)) {
-            routes_[route.destination] = route;
-        }
 
         // #4: For unicast, return immediately. For broadcast, fall through to relay.
         if (!is_broadcast) {
@@ -247,6 +276,12 @@ RelayResult MeshRelay::processRelayPacket(const std::vector<uint8_t>& data,
 
     // Not for us (or broadcast that should also be relayed) - should we relay?
     if (!enabled_) {
+        return is_for_us ? RelayResult::ForUs : RelayResult::Dropped;
+    }
+
+    // Directed packet: only the designated next hop forwards it.
+    if (!is_broadcast && !header.next_hop.empty() && header.next_hop != my_callsign_) {
+        stats_.packets_not_next_hop++;
         return is_for_us ? RelayResult::ForUs : RelayResult::Dropped;
     }
 
@@ -274,6 +309,18 @@ RelayResult MeshRelay::processRelayPacket(const std::vector<uint8_t>& data,
         return is_for_us ? RelayResult::ForUs : RelayResult::Dropped;
     }
     header.path.push_back(my_callsign_);
+
+    // Onward: along a fresh route when one is known (never back into the
+    // path), flooded otherwise.
+    header.next_hop.clear();
+    if (!is_broadcast) {
+        if (auto route = freshRouteLocked(header.destination)) {
+            if (!isInPath(header, route->next_hop) || route->next_hop == header.destination) {
+                header.next_hop = route->next_hop;
+                stats_.packets_directed++;
+            }
+        }
+    }
 
     // Build relay packet
     auto hdr_bytes = serializeHeader(header);
@@ -326,6 +373,12 @@ std::vector<uint8_t> MeshRelay::createRelayPacket(const std::string& destination
     header.source = my_callsign_;
     header.destination = destination;
     header.message_id = relay_message_id.empty() ? generateMessageId() : relay_message_id;
+    if (destination != "*") {
+        if (auto route = freshRouteLocked(destination)) {
+            header.next_hop = route->next_hop;
+            stats_.packets_directed++;
+        }
+    }
 
     auto hdr_bytes = serializeHeader(header);
     // #3: serializeHeader may return empty on validation failure
@@ -345,25 +398,38 @@ std::vector<uint8_t> MeshRelay::createRelayPacket(const std::string& destination
 
 void MeshRelay::addRoute(const RouteEntry& route) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (route.destination.empty() || route.next_hop.empty()) return;
+    learnRouteLocked(route);
+}
+
+void MeshRelay::learnRouteLocked(const RouteEntry& route) {
+    if (route.destination.empty() || route.next_hop.empty() ||
+        route.destination == my_callsign_) {
+        return;
+    }
     auto it = routes_.find(route.destination);
     if (it == routes_.end() || isBetterRoute(it->second, route)) {
         routes_[route.destination] = route;
+    } else if (it->second.next_hop == route.next_hop &&
+               it->second.hop_count == route.hop_count) {
+        // Same path heard again: it is still alive.
+        it->second.last_seen = std::max(it->second.last_seen, route.last_seen);
+        if (route.snr_known) {
+            it->second.snr_known = true;
+            it->second.snr_db = route.snr_db;
+        }
     }
 }
 
-void MeshRelay::processBeaconRoute(const std::string& callsign, float snr_db) {
+void MeshRelay::processBeaconRoute(const std::string& callsign, std::optional<float> snr_db) {
     std::lock_guard<std::mutex> lock(mutex_);
     RouteEntry route;
     route.destination = callsign;
     route.next_hop = callsign;  // Direct
     route.hop_count = 1;
-    route.snr_db = snr_db;
+    route.snr_known = snr_db.has_value();
+    route.snr_db = snr_db.value_or(0.0f);
     route.last_seen = now_sec();
-    auto it = routes_.find(callsign);
-    if (it == routes_.end() || isBetterRoute(it->second, route)) {
-        routes_[callsign] = route;
-    }
+    learnRouteLocked(route);
 }
 
 std::vector<RouteEntry> MeshRelay::getRouteTable() const {
@@ -375,8 +441,19 @@ std::vector<RouteEntry> MeshRelay::getRouteTable() const {
     return result;
 }
 
-void MeshRelay::pruneStaleRoutes(int64_t max_age_sec) {
+std::optional<RouteEntry> MeshRelay::freshRouteLocked(const std::string& destination) const {
+    auto it = routes_.find(destination);
+    if (it == routes_.end()) return std::nullopt;
+    if (now_sec() - it->second.last_seen > route_max_age_sec_) return std::nullopt;
+    return it->second;
+}
+
+std::optional<RouteEntry> MeshRelay::getRoute(const std::string& destination) const {
     std::lock_guard<std::mutex> lock(mutex_);
+    return freshRouteLocked(destination);
+}
+
+void MeshRelay::pruneLocked(int64_t max_age_sec) {
     int64_t cutoff = now_sec() - max_age_sec;
     for (auto it = routes_.begin(); it != routes_.end(); ) {
         if (it->second.last_seen < cutoff) {
@@ -385,6 +462,16 @@ void MeshRelay::pruneStaleRoutes(int64_t max_age_sec) {
             ++it;
         }
     }
+}
+
+void MeshRelay::pruneStaleRoutes(int64_t max_age_sec) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pruneLocked(max_age_sec);
+}
+
+void MeshRelay::pruneStaleRoutes() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pruneLocked(route_max_age_sec_);
 }
 
 bool MeshRelay::hasRelayQueue() const {
@@ -418,15 +505,6 @@ RelayStats MeshRelay::getStats() const {
     return stats_;
 }
 
-std::vector<uint8_t> MeshRelay::buildRelayBeaconPayload() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    // Flag byte: bit 0 = relay enabled
-    std::vector<uint8_t> payload;
-    payload.push_back(enabled_ ? 0x01 : 0x00);
-    payload.push_back(default_ttl_);
-    return payload;
-}
-
 bool MeshRelay::isDuplicate(const std::string& message_id) {
     auto it = dedup_cache_.find(message_id);
     if (it == dedup_cache_.end()) return false;
@@ -451,19 +529,23 @@ std::string MeshRelay::generateMessageId() const {
 bool MeshRelay::isBetterRoute(const RouteEntry& existing, const RouteEntry& candidate) const {
     // Reject routes that exceed max hop count
     if (candidate.hop_count > max_hop_count_) return false;
-    // Stale route (>300s) is always replaced
-    if (now_sec() - existing.last_seen > 300) {
+    // A stale route is always replaced
+    if (now_sec() - existing.last_seen > route_max_age_sec_) {
         return true;
     }
     // Fewer hops is better
     if (candidate.hop_count < existing.hop_count) {
         return true;
     }
-    // Same hop count but higher SNR is better
-    if (candidate.hop_count == existing.hop_count && candidate.snr_db > existing.snr_db) {
-        return true;
+    if (candidate.hop_count > existing.hop_count) {
+        return false;
     }
-    return false;
+    // Same hop count: a measured, stronger last hop is better; a measured
+    // one beats an unmeasured one.
+    if (candidate.snr_known && existing.snr_known) {
+        return candidate.snr_db > existing.snr_db;
+    }
+    return candidate.snr_known && !existing.snr_known;
 }
 
 void MeshRelay::cleanupDedup() {

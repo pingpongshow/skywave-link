@@ -76,121 +76,10 @@ TEST(is_image_file) {
     PASS();
 }
 
-TEST(cache_store_get) {
-    ImagePreviewCache cache;
-    ASSERT_EQ(cache.size(), size_t(0));
-
-    ImageData img;
-    img.width = 10;
-    img.height = 10;
-    img.pixels.resize(400, 0xFF);
-    img.valid = true;
-
-    cache.store("test.png", img);
-    ASSERT_EQ(cache.size(), size_t(1));
-    ASSERT_TRUE(cache.has("test.png"));
-
-    auto got = cache.get("test.png");
-    ASSERT_TRUE(got.has_value());
-    ASSERT_EQ(got->width, 10);
-    ASSERT_EQ(got->height, 10);
-    ASSERT_TRUE(got->valid);
-    PASS();
-}
-
-TEST(cache_miss) {
-    ImagePreviewCache cache;
-    ASSERT_FALSE(cache.has("missing.png"));
-    ASSERT_FALSE(cache.get("missing.png").has_value());
-    PASS();
-}
-
-TEST(cache_remove) {
-    ImagePreviewCache cache;
-    ImageData img;
-    img.valid = true;
-    cache.store("a.png", img);
-    cache.store("b.png", img);
-    ASSERT_EQ(cache.size(), size_t(2));
-
-    cache.remove("a.png");
-    ASSERT_FALSE(cache.has("a.png"));
-    ASSERT_TRUE(cache.has("b.png"));
-    ASSERT_EQ(cache.size(), size_t(1));
-    PASS();
-}
-
-TEST(cache_clear) {
-    ImagePreviewCache cache;
-    ImageData img;
-    img.valid = true;
-    cache.store("a.png", img);
-    cache.store("b.png", img);
-
-    cache.clear();
-    ASSERT_EQ(cache.size(), size_t(0));
-    ASSERT_FALSE(cache.has("a.png"));
-    PASS();
-}
-
 TEST(decode_invalid_data) {
     uint8_t garbage[] = {0x00, 0x01, 0x02, 0x03, 0x04};
     auto img = decodeImage(garbage, sizeof(garbage));
     ASSERT_FALSE(img.valid);
-    PASS();
-}
-
-TEST(cache_eviction_when_full) {
-    ImagePreviewCache cache;
-    cache.setMaxEntries(3);
-
-    ImageData img;
-    img.valid = true;
-    img.width = 1;
-    img.height = 1;
-    img.pixels = {0xFF, 0xFF, 0xFF, 0xFF};
-
-    cache.store("a.png", img);
-    cache.store("b.png", img);
-    cache.store("c.png", img);
-    ASSERT_EQ(cache.size(), size_t(3));
-
-    // Adding a 4th should evict the oldest (a.png)
-    cache.store("d.png", img);
-    ASSERT_EQ(cache.size(), size_t(3));
-    ASSERT_FALSE(cache.has("a.png"));
-    ASSERT_TRUE(cache.has("b.png"));
-    ASSERT_TRUE(cache.has("c.png"));
-    ASSERT_TRUE(cache.has("d.png"));
-
-    // Adding a 5th should evict b.png
-    cache.store("e.png", img);
-    ASSERT_EQ(cache.size(), size_t(3));
-    ASSERT_FALSE(cache.has("b.png"));
-    ASSERT_TRUE(cache.has("c.png"));
-    ASSERT_TRUE(cache.has("d.png"));
-    ASSERT_TRUE(cache.has("e.png"));
-    PASS();
-}
-
-TEST(set_max_entries_evicts_surplus) {
-    ImagePreviewCache cache;
-
-    ImageData img;
-    img.valid = true;
-    cache.store("a.png", img);
-    cache.store("b.png", img);
-    cache.store("c.png", img);
-    cache.store("d.png", img);
-    ASSERT_EQ(cache.size(), size_t(4));
-
-    // Reduce max to 2 - should evict oldest two
-    cache.setMaxEntries(2);
-    ASSERT_EQ(cache.size(), size_t(2));
-    ASSERT_FALSE(cache.has("a.png"));
-    ASSERT_FALSE(cache.has("b.png"));
-    ASSERT_TRUE(cache.has("c.png"));
-    ASSERT_TRUE(cache.has("d.png"));
     PASS();
 }
 
@@ -203,30 +92,6 @@ TEST(detect_null_data) {
 TEST(decode_null_data) {
     auto img = decodeImage(nullptr, 0);
     ASSERT_FALSE(img.valid);
-    PASS();
-}
-
-TEST(with_image_callback) {
-    ImagePreviewCache cache;
-    ImageData img;
-    img.width = 32;
-    img.height = 32;
-    img.valid = true;
-
-    cache.store("test.png", img);
-
-    int called = 0;
-    bool found = cache.withImage("test.png", [&](const ImageData& data) {
-        called++;
-        ASSERT_EQ(data.width, 32);
-    });
-    ASSERT_TRUE(found);
-    ASSERT_EQ(called, 1);
-
-    // Missing key returns false
-    found = cache.withImage("missing.png", [&](const ImageData&) { called++; });
-    ASSERT_FALSE(found);
-    ASSERT_EQ(called, 1);
     PASS();
 }
 

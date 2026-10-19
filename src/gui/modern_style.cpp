@@ -124,7 +124,6 @@ void setDarkColors(ImGuiStyle& style) {
     g_palette.info = rgb(86, 196, 230);
     g_palette.muted = rgb(140, 147, 160);
     g_palette.heading = rgb(150, 170, 205);
-    g_palette.text_on_color = rgb(255, 255, 255);
 }
 
 void setLightColors(ImGuiStyle& style) {
@@ -204,7 +203,6 @@ void setLightColors(ImGuiStyle& style) {
     g_palette.info = rgb(0, 120, 170);
     g_palette.muted = rgb(105, 112, 125);
     g_palette.heading = rgb(70, 90, 130);
-    g_palette.text_on_color = rgb(255, 255, 255);
 }
 
 } // namespace
@@ -303,6 +301,45 @@ void SectionHeader(const char* label) {
 
 float statusBarHeight() {
     return ImGui::GetTextLineHeight() + 2.0f * 6.0f + 2.0f;
+}
+
+ImVec4 statusColor(StatusKind kind) {
+    switch (kind) {
+        case StatusKind::Success: return g_palette.success;
+        case StatusKind::Warning: return g_palette.warning;
+        case StatusKind::Error: return g_palette.danger;
+        case StatusKind::Info:
+        default: return ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    }
+}
+
+void StatusLine(WindowStatus& status) {
+    if (status.empty()) {
+        return;
+    }
+    ImGui::PushID(&status);
+    if (ImGui::SmallButton("x")) {
+        status = WindowStatus{};
+        ImGui::PopID();
+        return;
+    }
+    ImGui::SetItemTooltip("Dismiss");
+    ImGui::SameLine();
+    const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - status.posted_at).count();
+    ImGui::PushStyleColor(ImGuiCol_Text, statusColor(status.kind));
+    ImGui::TextWrapped("%s", status.text.c_str());
+    ImGui::PopStyleColor();
+    if (age >= 5 && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%llds ago", static_cast<long long>(age));
+    }
+    ImGui::PopID();
+}
+
+void WarningText(const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, g_palette.warning);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
 }
 
 } // namespace skylink::ui

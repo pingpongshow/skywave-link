@@ -16,8 +16,12 @@ namespace skylink {
 // Forward declarations
 class ModemClient;
 
-// Maximum file size (50 KB)
+// Default limit on a file's size (files.max_file_size; 50 KB). The limit
+// in force is FileTransferManager::setMaxFileSize().
 constexpr size_t MAX_FILE_SIZE = 50 * 1024;
+// Hard ceiling for any configured limit (the offer carries a u32 and the
+// whole file is held in memory).
+constexpr size_t MAX_FILE_SIZE_CEILING = 16u * 1024u * 1024u;
 
 // Payload bytes per FileChunk message. The modem's ARQ session is reliable
 // and ordered, so chunks are streamed back to back with no per-chunk
@@ -64,6 +68,9 @@ struct TransferProgress {
     int64_t started_at = 0;
     int64_t last_activity = 0;
     std::string error_message;
+    // Download: a remote station's upload into this station's BBS folder
+    // (FileOfferKind::BbsUpload). Upload: we offered it as one.
+    bool bbs_upload = false;
 
     float progressPercent() const {
         return total_bytes > 0 ? (100.0f * transferred_bytes / total_bytes) : 0.0f;
@@ -79,6 +86,7 @@ struct TransferProgress {
 // File transfer protocol messages (session data, framed by ModemClient).
 // Every message starts with type(1) + id_len(1) + id; integers are LE.
 //   FileOffer    + name_len(1) + name + payload_size(4) + file_crc32(4)
+//                  + flags(1)  (bit 0: BBS upload)
 //   FileAccept / FileReject / FileCancel   (id only)
 //   FileChunk    + offset(4) + data          (data length = rest of message)
 //   FileComplete + payload_size(4) + payload_crc32(4)   (after the last chunk)
@@ -95,6 +103,25 @@ enum class FileMessageType : uint8_t {
     FileCancel = 0x17,      // Cancel transfer
     FileLast = 0x18         // End of the reserved file-transfer range
 };
+
+// What an outgoing offer is: a file for the operator at the other end, or
+// an upload into the remote station's BBS folder.
+enum class FileOfferKind { Direct, BbsUpload };
+inline constexpr uint8_t kFileOfferFlagBbsUpload = 0x01;
+
+// When this station accepts remote BBS uploads: allow_uploads AND the
+// sender in allowed_uploaders (an empty list admits nobody), and no larger
+// than max_upload_size. Accepted uploads need no operator decision and are
+// written to `directory` (never overwriting a file).
+struct BbsUploadPolicy {
+    bool allow_uploads = false;
+    std::string directory;
+    std::vector<std::string> allowed_uploaders;
+    size_t max_upload_size = 50 * 1024;
+};
+// Empty when allowed, else the reason given to the sender.
+std::string bbsUploadRefusal(const BbsUploadPolicy& policy, const std::string& from,
+                             size_t file_size);
 
 // Callbacks
 using TransferProgressCallback = std::function<void(const TransferProgress&)>;
@@ -133,11 +160,18 @@ public:
     // trimmed and case-insensitively.
     void setTrustedCallsigns(const std::vector<std::string>& callsigns);
     void addTrustedCallsign(const std::string& callsign);
-    void removeTrustedCallsign(const std::string& callsign);
+    // files.max_file_size: the largest file sent or accepted (clamped to
+    // 1 KB .. MAX_FILE_SIZE_CEILING).
+    void setMaxFileSize(size_t bytes);
+    size_t maxFileSize() const { return max_file_size_; }
+    void setBbsUploadPolicy(const BbsUploadPolicy& policy) { bbs_policy_ = policy; }
 
-    // Initiate outbound transfer
+    // Initiate outbound transfer. Returns the transfer id, or "" with the
+    // reason in lastSendError().
     std::string sendFile(ModemClient& modem, const std::string& remote_callsign,
-                         const std::string& filepath);
+                         const std::string& filepath,
+                         FileOfferKind kind = FileOfferKind::Direct);
+    const std::string& lastSendError() const { return last_send_error_; }
 
     // Handle incoming file offer
     void acceptTransfer(ModemClient& modem, const std::string& transfer_id);
@@ -202,6 +236,8 @@ private:
         size_t next_offset = 0;              // Upload: payload bytes written to the modem
         bool complete_sent = false;          // Upload: FileComplete written
         bool complete_received = false;      // Download: FileComplete seen
+        size_t max_original_size = 0;        // Download: limit on the decompressed file
+        std::string target_dir;              // Download: where the file goes
         Clock::time_point last_activity;
     };
 
@@ -222,6 +258,9 @@ private:
     std::map<std::string, Transfer> transfers_;
     std::string download_path_;
     bool auto_accept_ = false;
+    size_t max_file_size_ = MAX_FILE_SIZE;
+    BbsUploadPolicy bbs_policy_;
+    std::string last_send_error_;
     std::vector<std::string> trusted_callsigns_;
     // Deferred offers: transfer id -> time offered. The offer itself lives in
     // transfers_ in state Negotiating.

@@ -94,6 +94,9 @@ struct VoiceStatus {
     // open voice service's unit length / whether it keeps up with real
     // time (UNIT=, RT=; a manual codec the mode cannot stream says NO).
     bool broadcast_rx = false;
+    // Sender tag (hex) of the broadcast playing out, from
+    // `EVT:VOICE BCAST <tag>`; empty when none / after `EVT:VOICE BCAST END`.
+    std::string broadcast_tag;
     bool real_time = true;
     double unit_sec = 0.0;
     std::string last_event = "IDLE";
@@ -111,6 +114,9 @@ struct ModemStatus {
     float snr_db = 0.0f;             // local RX SNR
     float remote_snr_db = 0.0f;      // peer's report, -99 when unknown
     bool remote_snr_valid = false;
+    // The modem is keying the transmitter: set by the owner from the PTT
+    // server's KEY/UNKEY (setPttActive()), since the control port has no
+    // PTT notification.
     bool ptt_active = false;
     bool busy_detected = false;
     bool listening = false;
@@ -124,6 +130,15 @@ struct ModemStatus {
     float retry_ratio = 0.0f;
     float tx_align_hz = 0.0f;        // CFO: TX frequency-alignment shift
     bool compression = false;
+    // STATUS TURN=: this station's role in scheduled turn-taking, "ISS"
+    // (sending), "IRS" (receiving) or "-" (no schedule active).
+    std::string turn = "-";
+    // STATUS VOICE=: off | open | talking | bcastrx (lower case, as sent).
+    std::string voice_summary = "off";
+    // Last answers to `MAXMODE` / `CWID` (requestModeSettings() or a set).
+    std::string max_mode;            // "M10"; empty until known
+    bool cw_id_known = false;
+    bool cw_id = false;
     bool encryption = false;
     int crypto_epoch = 0;
     bool resume = false;
@@ -152,7 +167,8 @@ struct FrequencyInfo {
 
 // A frame observed by the modem's passive monitor. `payload` is the LINK
 // FRAME BODY with the 12-byte envelope stripped; `truncated` is set when
-// the source was a `MON:` line, which the modem caps at 64 bytes.
+// its CRC did not check. The modem reports no per-frame SNR for monitored
+// frames: nothing here is a signal measurement.
 struct MonitorFrame {
     std::string src_callsign;
     std::string dst_callsign;
@@ -168,7 +184,6 @@ struct MonitorFrame {
 // Callback types
 using StateCallback = std::function<void(const std::string& state)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>& data)>;
-using SnrCallback = std::function<void(float snr_db)>;
 using ConnectedCallback = std::function<void(const std::string& callsign)>;
 // `reason` is the EVT:DISCONNECTED token (NORMAL, LINK, NO_ANSWER,
 // NO_START_ACK, REFUSED, TIMEOUT; INTERFACES.md), empty if none was given.
@@ -201,6 +216,17 @@ std::vector<std::string> familyChangeCommands(const std::string& family);
 
 // Outcome of a background connect started with beginConnect().
 enum class ConnectProgress { None, InProgress, Connected, Failed };
+
+// The optional voice media socket (port 9102).
+enum class VoiceMediaState {
+    Disconnected,   // no modem connection
+    Connected,
+    Reconnecting,   // lost or never opened; poll() retries periodically
+};
+
+// `VOICECODEC` values the modem accepts (VOICE.md); case-insensitive.
+// Returns the canonical spelling, or empty for anything else.
+std::string normalizeVoiceCodec(const std::string& codec);
 
 class ModemClient {
 public:
@@ -235,7 +261,14 @@ public:
     static constexpr int kConnectTimeoutMs = 3000;
     // False when the modem was built without ENABLE_VOICE (it never binds
     // the port) or the media socket dropped; the session is unaffected.
+    // poll() reopens a lost voice socket in the background every
+    // kVoiceReconnectInterval.
     bool hasVoiceMedia() const;
+    VoiceMediaState voiceMediaState() const;
+    static constexpr std::chrono::milliseconds kVoiceReconnectInterval{5000};
+    void setVoiceReconnectInterval(std::chrono::milliseconds interval) {
+        voice_reconnect_interval_ = interval;
+    }
     ModemState getState() const {
         std::lock_guard<std::mutex> lock(status_mutex_);
         return status_.state;
@@ -248,8 +281,11 @@ public:
     // Polling (call from main loop)
     void poll();
 
-    // Command interface
+    // Command interface. Every command is tracked in send order, so each
+    // reply (including `ERROR:`) is matched to the command it answers, in
+    // blocking and non-blocking mode alike.
     bool sendCommand(const std::string& cmd);
+    // A control line no tracked command claimed (normally none).
     std::optional<std::string> getResponse(int timeout_ms = 100);
     // Sends `cmd` and returns at once; `cb` (optional) runs from poll() when
     // the verb echo / `ERROR:` arrives, or with ok=false on timeout or
@@ -257,16 +293,17 @@ public:
     bool sendCommandAsync(const std::string& cmd,
                           CommandResultCallback cb = {},
                           int timeout_ms = 3000);
-    size_t pendingAsyncCommands() const { return async_commands_.size(); }
+    // Commands still waiting for their reply (timed-out ones excluded).
+    size_t pendingAsyncCommands() const;
     // (In non-blocking mode sendCommand() is tracked the same way, without
     // a callback, so replies stay matched to the right command.)
     // When enabled, the high-level action/setting commands below
     // (connectToStation, abort, setVoicePtt, ...) go through
     // sendCommandAsync() and return whether the command was sent instead of
     // waiting for the modem's reply. Off by default; the GUI turns it on.
-    // Query commands (getVersion, refreshStatus, ...) always block.
+    // Query commands (getVersion, refreshStatus, ...) always block, but are
+    // queued behind (and correlated with) pending async commands.
     void setNonBlockingCommands(bool enabled) { nonblocking_commands_ = enabled; }
-    bool nonBlockingCommands() const { return nonblocking_commands_; }
 
     // High-level commands. Where a `cb` is accepted it reports the modem's
     // answer (in non-blocking mode from a later poll(); see sendCommandAsync)
@@ -275,31 +312,40 @@ public:
     bool connectToStation(const std::string& callsign, CommandResultCallback cb = {});
     bool disconnectStation();
     bool abort();
-    bool setCompression(bool enabled);
     bool setListenMode(bool enabled);
     bool setMonitorMode(bool enabled);
     bool sendBeacon(CommandResultCallback cb = {});
     bool sendBroadcastData(const std::vector<uint8_t>& data, CommandResultCallback cb = {});
     bool sendCq(CommandResultCallback cb = {});
-    bool setCwId(bool enabled);
+    // Post-disconnect CW identification (`CWID ON|OFF`).
+    bool setCwId(bool enabled, CommandResultCallback cb = {});
+
+    // Keying: tell the modem to key through this app's PTT server
+    // (`PTTMETHOD TCP`, then `PTTPORT <host>:<port>`). Call on every modem
+    // connect while the PTT server runs. Always asynchronous; `cb` gets the
+    // final outcome (the failing reply on error).
+    bool usePttServer(const std::string& host, uint16_t port, CommandResultCallback cb = {});
+    // The modem's keying state as seen by the PTT server (KEY/UNKEY). Safe
+    // from any thread; read back through ModemStatus::ptt_active.
+    void setPttActive(bool active);
 
     // Waveform / ladder control (INTERFACES.md "Mode and Link")
     // Sends familyChangeCommands(family) in order, stopping at the first
     // failure; `cb` gets the final outcome (the failing reply on error).
     // Always asynchronous. Accepted by the modem only while IDLE/LISTENING.
     bool setFamily(const std::string& family, CommandResultCallback cb = {});
-    bool setMode(const std::string& mode);           // AUTO or M4..M14
-    bool setMaxMode(const std::string& mode);
+    bool setMode(const std::string& mode, CommandResultCallback cb = {});    // AUTO or M4..M14
+    bool setMaxMode(const std::string& mode, CommandResultCallback cb = {}); // M4..M14
     bool setCpMode(const std::string& cp);           // AUTO|SHORT|MEDIUM|LONG
-    bool setHarq(const std::string& harq);           // AUTO|CHASE|IR
-    bool setAutoMode(bool enabled);
+    // Queries `MAXMODE` and `CWID` (async); the answers land in
+    // ModemStatus::max_mode / cw_id. MODE itself comes with STATUS.
+    void requestModeSettings();
 
     // Data interface. Session data only: refused (false) unless the station
     // link is CONNECTED, because bytes written to the data port while no
     // session is up sit in the modem's TX queue (TXBUF) unframed.
     bool sendData(const std::vector<uint8_t>& data);
     bool sendText(const std::string& text);
-    std::optional<std::vector<uint8_t>> receiveData();
     int64_t millisSinceLastDataSend() const;
     // Bytes accepted by sendData() but not yet written to the data socket
     // (flushed by poll()). Messages are queued whole, never truncated.
@@ -307,7 +353,6 @@ public:
 
     // Query commands
     std::string getVersion();
-    size_t getBufferSize();
     bool refreshStatus(int timeout_ms = 500);   // STATUS -> ModemStatus
     std::optional<NoiseFloorReading> getNoiseFloor();
     std::optional<AudioLevels> getAudioLevels();
@@ -322,19 +367,27 @@ public:
     }
 
     // Voice control/media
-    bool setVoiceCodec(const std::string& codec);   // AUTO|700C|1300|2400|3200
+    // `VOICECODEC <codec>`; false (nothing sent) for a value the modem does
+    // not accept (see normalizeVoiceCodec).
+    bool setVoiceCodec(const std::string& codec, CommandResultCallback cb = {});
     bool setVoiceMode(VoiceMode mode);              // VOICE OFF|CONNECTED|BROADCAST
     bool voiceStart();
     bool voiceStop();
     bool setVoicePtt(bool enabled);
     std::optional<VoiceStatus> queryVoiceStatus();
+    // Queues one uplink record (whole, never split) and writes what the
+    // socket takes without blocking; poll() flushes the rest. False when
+    // there is no voice socket, the input is empty or too large for one
+    // record, or the backlog already holds kMaxVoiceBacklogBytes (the
+    // record is dropped whole, so the stream never desynchronises).
     bool sendVoicePcm(const int16_t* samples, size_t sample_count);
+    size_t pendingVoiceBytes() const;
+    static constexpr size_t kMaxVoiceBacklogBytes = 32u * 1024u;  // ~2 s of PCM
     std::vector<int16_t> receiveVoicePcm(size_t max_samples = 1600);
 
     // Callbacks
     void onStateChange(StateCallback cb) { state_callback_ = std::move(cb); }
     void onDataReceived(DataCallback cb) { data_callback_ = std::move(cb); }
-    void onSnrUpdate(SnrCallback cb) { snr_callback_ = std::move(cb); }
     void onConnected(ConnectedCallback cb) { connected_callback_ = std::move(cb); }
     void onDisconnected(DisconnectedCallback cb) { disconnected_callback_ = std::move(cb); }
     void onVoiceStatus(VoiceStatusCallback cb) { voice_callback_ = std::move(cb); }
@@ -376,6 +429,17 @@ private:
     mutable std::mutex voice_mutex_;
     uint32_t voice_tx_sequence_ = 0;
     uint64_t voice_tx_sample_counter_ = 0;
+    // Uplink bytes the voice socket has not taken yet: whole records, minus
+    // a written prefix of the first.
+    std::vector<uint8_t> voice_tx_pending_;
+    mutable std::mutex voice_tx_mutex_;
+    bool flushVoiceLocked();
+    void dropVoiceSocket(const char* why);
+    void maybeReopenVoice();
+    struct VoiceJob;
+    std::shared_ptr<VoiceJob> voice_job_;
+    std::chrono::steady_clock::time_point voice_retry_at_{};
+    std::chrono::milliseconds voice_reconnect_interval_{kVoiceReconnectInterval};
 
     // Outbound data-port bytes the socket has not accepted yet. Always holds
     // whole messages/frames (minus a written prefix), see sendData().
@@ -397,7 +461,6 @@ private:
     // Callbacks
     StateCallback state_callback_;
     DataCallback data_callback_;
-    SnrCallback snr_callback_;
     ConnectedCallback connected_callback_;
     DisconnectedCallback disconnected_callback_;
     VoiceStatusCallback voice_callback_;
@@ -413,7 +476,13 @@ private:
         CommandResultCallback cb;
         std::chrono::steady_clock::time_point deadline;
         bool silent = false;   // fire-and-forget sendCommand(): never logged
+        // Timed out: `cb` already ran. Kept until `discard_at` so a late
+        // reply is absorbed here instead of being taken as the answer to a
+        // later command.
+        bool expired = false;
+        std::chrono::steady_clock::time_point discard_at;
     };
+    static constexpr std::chrono::milliseconds kLateReplyGrace{10000};
     std::deque<PendingCommand> async_commands_;
     bool nonblocking_commands_ = false;
     bool writeCommandLine(const std::string& cmd);

@@ -43,6 +43,29 @@ uint16_t closedPort() {
 
 } // namespace
 
+// Retries of one outbox item reuse its Winlink message id (the CMS then
+// rejects the duplicate); different items get different ids.
+TEST(winlink_message_id_is_stable_per_item) {
+    const std::string a = stableWinlinkMessageId("N0CALL|MID1|42|1000");
+    ASSERT_EQ(a.size(), size_t(12));
+    for (char c : a) {
+        ASSERT_TRUE((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'));
+    }
+    ASSERT_EQ(a, stableWinlinkMessageId("N0CALL|MID1|42|1000"));
+    ASSERT_TRUE(a != stableWinlinkMessageId("N0CALL|MID1|43|1000"));
+    ASSERT_EQ(stableWinlinkMessageId("").size(), size_t(12));
+
+    EmailGatewayJobInput input;
+    input.winlink_send.callsign = "N0CALL";
+    EmailGatewayOutgoing msg{1, "test@example.com", "Subject", "Body"};
+    msg.winlink_message_id = a;
+    const WinlinkTelnetRequest req = winlinkRequestFor(input, msg);
+    ASSERT_EQ(req.message_id, a);
+    ASSERT_EQ(req.to, std::string("test@example.com"));
+    ASSERT_EQ(req.callsign, std::string("N0CALL"));
+    PASS();
+}
+
 // The real runner against TEST-NET-1 (RFC 5737, never routed): starting the
 // job returns at once and the caller can abandon it without waiting.
 TEST(unreachable_server_does_not_block_caller) {

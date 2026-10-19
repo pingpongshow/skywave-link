@@ -88,6 +88,7 @@ std::string formatDateHeader() {
 
 struct EmailMessage {
     std::string from;
+    std::string from_name;
     std::string to;
     std::string subject;
     std::string body;
@@ -369,9 +370,9 @@ public:
         }
 
         // Headers (sanitized against CRLF injection)
-        sendLine("From: " + safe_from);
+        sendLine("From: " + formatFromHeader(message.from_name, safe_from));
         sendLine("To: " + safe_to);
-        sendLine("Subject: " + safe_subject);
+        sendLine("Subject: " + encodeHeaderText(safe_subject));
         sendLine("Date: " + formatDateHeader());
         sendLine("MIME-Version: 1.0");
 
@@ -516,6 +517,61 @@ private:
     }
 };
 
+std::string encodeHeaderText(const std::string& raw) {
+    const std::string text = sanitizeHeader(raw);
+    bool plain = true;
+    for (char c : text) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc > 0x7E) { plain = false; break; }
+    }
+    if (plain) return text;
+    static const char kB64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    // Encoded words stay short (RFC 2047: 75 chars); split on UTF-8
+    // character boundaries, 45 bytes of text per word.
+    std::string out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = std::min(text.size(), pos + 45);
+        while (end < text.size() && end > pos &&
+               (static_cast<unsigned char>(text[end]) & 0xC0u) == 0x80u) {
+            --end;
+        }
+        if (end == pos) end = std::min(text.size(), pos + 45);
+        std::string b64;
+        for (size_t i = pos; i < end; i += 3) {
+            uint32_t v = static_cast<uint32_t>(static_cast<unsigned char>(text[i])) << 16;
+            if (i + 1 < end) v |= static_cast<uint32_t>(static_cast<unsigned char>(text[i + 1])) << 8;
+            if (i + 2 < end) v |= static_cast<uint32_t>(static_cast<unsigned char>(text[i + 2]));
+            b64 += kB64[(v >> 18) & 0x3F];
+            b64 += kB64[(v >> 12) & 0x3F];
+            b64 += (i + 1 < end) ? kB64[(v >> 6) & 0x3F] : '=';
+            b64 += (i + 2 < end) ? kB64[v & 0x3F] : '=';
+        }
+        if (!out.empty()) out += " ";
+        out += "=?UTF-8?B?" + b64 + "?=";
+        pos = end;
+    }
+    return out;
+}
+
+std::string formatFromHeader(const std::string& display_name, const std::string& address) {
+    const std::string addr = sanitizeHeader(address);
+    std::string name = sanitizeHeader(display_name);
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    while (!name.empty() && name.front() == ' ') name.erase(0, 1);
+    if (name.empty()) return addr;
+    const std::string encoded = encodeHeaderText(name);
+    if (encoded != name) return encoded + " <" + addr + ">";
+    std::string quoted = "\"";
+    for (char c : name) {
+        if (c == '"' || c == '\\') quoted += '\\';
+        quoted += c;
+    }
+    quoted += "\"";
+    return quoted + " <" + addr + ">";
+}
+
 bool sendSMTPDelivery(const SMTPDeliveryRequest& req, std::string* error) {
     if (req.host.empty()) {
         if (error) *error = "SMTP host is not configured";
@@ -554,6 +610,7 @@ bool sendSMTPDelivery(const SMTPDeliveryRequest& req, std::string* error) {
 
     EmailMessage msg;
     msg.from = req.from;
+    msg.from_name = req.from_name;
     msg.to = req.to;
     msg.subject = req.subject;
     msg.body = req.body;

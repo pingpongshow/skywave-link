@@ -5,6 +5,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -22,16 +23,20 @@ struct RelayHeader {
     std::string source;
     std::string destination;
     std::string message_id;
+    // Directed relay: only this station may forward the packet (every relay
+    // is a broadcast on air). Empty: flood - any relay station forwards.
+    std::string next_hop;
     std::vector<std::string> path;  // Callsigns traversed
 };
 
-// Route table entry
+// Route table entry. hop_count counts transmissions: 1 = heard directly.
 struct RouteEntry {
     std::string destination;
     std::string next_hop;
-    uint8_t hop_count;
-    float snr_db;
-    int64_t last_seen;
+    uint8_t hop_count = 1;
+    bool snr_known = false;      // snr_db is a measurement of the last hop
+    float snr_db = 0.0f;
+    int64_t last_seen = 0;
 };
 
 // Relay queue entry
@@ -54,6 +59,8 @@ struct RelayStats {
     uint64_t packets_dropped_dedup = 0;
     uint64_t packets_dropped_queue_full = 0;  // #8: new counter
     uint64_t packets_dropped_nested = 0;      // payload was itself a relay packet
+    uint64_t packets_not_next_hop = 0;        // directed to another relay station
+    uint64_t packets_directed = 0;            // sent/relayed along a known route
 };
 
 class MeshRelay {
@@ -72,18 +79,22 @@ public:
     void setDefaultTTL(uint8_t ttl);
     uint8_t getDefaultTTL() const;
     void setMaxHopCount(uint8_t max_hops);
-    uint8_t getMaxHopCount() const;
     void setDedupWindowSec(int64_t dedup_window_sec);
     int64_t getDedupWindowSec() const;
+    // Routes older than this are neither used nor kept (pruneStaleRoutes()).
+    void setRouteMaxAgeSec(int64_t max_age_sec);
+    static constexpr int64_t DEFAULT_ROUTE_MAX_AGE_SEC = 1800;
 
-    // Packet processing
-    // #12: Returns RelayResult enum instead of bool
-    // #11: Optional received_snr_db parameter for route learning
+    // Packet processing. Every packet heard teaches a route back to its
+    // source through the station it was heard from. `received_snr_db` is
+    // the measured SNR of the frame when the modem reported one.
     RelayResult processRelayPacket(const std::vector<uint8_t>& data,
                                    std::vector<uint8_t>& payload_out,
-                                   float received_snr_db = 0.0f);
+                                   std::optional<float> received_snr_db = std::nullopt);
 
-    // Create a relay packet for sending via mesh
+    // Create a relay packet for sending via mesh: directed through the next
+    // hop of a fresh route to `destination` when one is known, flooded
+    // otherwise.
     std::vector<uint8_t> createRelayPacket(const std::string& destination,
                                            const std::vector<uint8_t>& payload,
                                            const std::string& relay_message_id = "");
@@ -95,9 +106,14 @@ public:
 
     // Route management
     void addRoute(const RouteEntry& route);
-    void processBeaconRoute(const std::string& callsign, float snr_db);
+    // A station heard directly (beacon, CQ, ...): a one-hop route.
+    void processBeaconRoute(const std::string& callsign,
+                            std::optional<float> snr_db = std::nullopt);
     std::vector<RouteEntry> getRouteTable() const;
+    // A fresh route to `destination`, if any.
+    std::optional<RouteEntry> getRoute(const std::string& destination) const;
     void pruneStaleRoutes(int64_t max_age_sec);
+    void pruneStaleRoutes();   // with the configured route max age; call periodically
 
     // Relay queue management
     bool hasRelayQueue() const;
@@ -106,9 +122,6 @@ public:
 
     // Statistics
     RelayStats getStats() const;
-
-    // Build beacon payload with relay capability flag
-    std::vector<uint8_t> buildRelayBeaconPayload() const;
 
     static constexpr int MAX_RELAY_QUEUE = 50;
     static constexpr int64_t DEDUP_WINDOW_SEC = 300;  // 5 minutes
@@ -120,6 +133,7 @@ private:
     uint8_t default_ttl_ = 3;
     uint8_t max_hop_count_ = 6;
     int64_t dedup_window_sec_ = DEDUP_WINDOW_SEC;
+    int64_t route_max_age_sec_ = DEFAULT_ROUTE_MAX_AGE_SEC;
 
     // #1: Member RNG instead of static locals (mutable for use in const method)
     mutable std::mt19937 gen_;
@@ -146,6 +160,9 @@ private:
     std::string generateMessageId() const;
     void cleanupDedup();
     bool isBetterRoute(const RouteEntry& existing, const RouteEntry& candidate) const;
+    void learnRouteLocked(const RouteEntry& route);
+    std::optional<RouteEntry> freshRouteLocked(const std::string& destination) const;
+    void pruneLocked(int64_t max_age_sec);
 };
 
 } // namespace skylink

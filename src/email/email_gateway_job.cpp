@@ -3,6 +3,7 @@
 #include "skywave_link/email_gateway_job.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <exception>
 #include <mutex>
@@ -19,6 +20,32 @@ bool stopRequested(const std::atomic<bool>* stop) {
 }
 
 } // namespace
+
+std::string stableWinlinkMessageId(const std::string& seed) {
+    // FNV-1a 64-bit, then base 36; 12 digits hold ~62 bits.
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : seed) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    static constexpr char kDigits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    std::string id(12, '0');
+    for (size_t i = id.size(); i-- > 0;) {
+        id[i] = kDigits[h % 36];
+        h /= 36;
+    }
+    return id;
+}
+
+WinlinkTelnetRequest winlinkRequestFor(const EmailGatewayJobInput& input,
+                                       const EmailGatewayOutgoing& msg) {
+    WinlinkTelnetRequest req = input.winlink_send;
+    req.to = msg.to;
+    req.subject = msg.subject;
+    req.body = msg.body;
+    req.message_id = msg.winlink_message_id;
+    return req;
+}
 
 EmailGatewayJobOutput runEmailGatewayJob(const EmailGatewayJobInput& input,
                                          const EmailInboundSink& sink,
@@ -92,10 +119,7 @@ EmailGatewayJobOutput runEmailGatewayJob(const EmailGatewayJobInput& input,
         }
         result.attempted = true;
         if (input.winlink_send_ready) {
-            WinlinkTelnetRequest req = input.winlink_send;
-            req.to = msg.to;
-            req.subject = msg.subject;
-            req.body = msg.body;
+            WinlinkTelnetRequest req = winlinkRequestFor(input, msg);
             result.winlink_tried = true;
             result.sent = sendWinlinkTelnetDelivery(req,
                                                     &result.error,
@@ -107,6 +131,7 @@ EmailGatewayJobOutput runEmailGatewayJob(const EmailGatewayJobInput& input,
         }
         if (!result.sent && input.smtp_ready) {
             SMTPDeliveryRequest req = input.smtp;
+            if (!msg.from_name.empty()) req.from_name = msg.from_name;
             req.to = msg.to;
             req.subject = msg.subject;
             req.body = msg.body;

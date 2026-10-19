@@ -49,13 +49,17 @@ enum class SkywaveFrameType : uint8_t {
     VoicePttEnd = 27,
     VoiceData = 28,
     KeyUpdate = 29,
+    TurnGrant = 30,     // scheduled turn-taking handover (body: epoch u8)
+    BcastVoice = 31,    // connectionless voice: VOICE_DATA body outside a session
 };
 
-// Envelope flag bits (PROTOCOL.md byte 1).
-inline constexpr uint8_t kSkywaveFlagCompressed = 1u << 0;
+// Envelope flag bits (PROTOCOL.md byte 1; modem link/frame.hpp). Bit 0 is
+// unused (compression is stated by the proto message's marker byte); every
+// bit other than these two is reserved and must be zero.
 inline constexpr uint8_t kSkywaveFlagEncrypted = 1u << 1;
 inline constexpr uint8_t kSkywaveFlagMoreFragments = 1u << 2;
-inline constexpr uint8_t kSkywaveFlagResumeContext = 1u << 3;
+inline constexpr uint8_t kSkywaveFlagsReservedMask =
+    static_cast<uint8_t>(~(kSkywaveFlagEncrypted | kSkywaveFlagMoreFragments));
 
 inline constexpr size_t kSkywaveEnvelopeBytes = 8;
 inline constexpr size_t kSkywaveFrameOverhead = 12;  // envelope + CRC-32
@@ -76,30 +80,37 @@ struct SkywaveFrame {
     bool truncated = false;
 };
 
-// Split a raw link frame into envelope + body. `allow_truncated` accepts a
-// frame whose tail (and therefore CRC) is missing, which is the normal case
-// for `MON:` lines - the modem caps their hex payload at 64 bytes.
+// Split a raw link frame into envelope + body. Like the modem's parseFrame
+// it rejects unknown frame types and reserved flag bits. `allow_truncated`
+// accepts a frame whose CRC does not check, for a `MON:` payload that may
+// have lost its tail.
 std::optional<SkywaveFrame> parseSkywaveFrame(const std::vector<uint8_t>& raw,
                                               bool allow_truncated);
 
-// BEACON body: callsign, SNR floor (+20 dB bias), family index, sw version.
+// BEACON body (modem link/frame.cpp BeaconBody): length-prefixed callsign
+// plus one byte, the sender's SNR-floor estimate as dB + 20. The modem has no
+// calibrated floor and sends 0xFF, "unknown". It is the SENDER's advertised
+// floor, never a measurement of how well this station hears the beacon.
+inline constexpr uint8_t kSkywaveBeaconSnrUnknown = 0xFF;
 struct SkywaveBeacon {
     std::string callsign;
-    float snr_floor_db = 0.0f;
-    uint8_t family = 0;
-    uint8_t sw_version = 0;
+    bool snr_floor_known = false;
+    float snr_floor_db = 0.0f;   // only meaningful when snr_floor_known
 };
 std::optional<SkywaveBeacon> parseSkywaveBeacon(const std::vector<uint8_t>& body);
 
-// CQ body: callsign + capability bitmap.
+// CQ body (modem CqBody): the length-prefixed callsign and nothing else.
 struct SkywaveCq {
     std::string callsign;
-    uint16_t caps = 0;
 };
 std::optional<SkywaveCq> parseSkywaveCq(const std::vector<uint8_t>& body);
 
+// TURN_GRANT body (modem TurnGrantBody): one epoch byte.
+std::optional<uint8_t> parseSkywaveTurnGrant(const std::vector<uint8_t>& body);
+
 // BCAST_DATA body: 0x5B 0x01, u16le length, packed 4-bit fragment index and
-// (count - 1), then the fragment bytes.
+// (count - 1), then the fragment bytes (at most 256 per frame).
+inline constexpr size_t kSkywaveBcastMaxPayload = 256;
 struct SkywaveBcastFragment {
     uint8_t index = 0;
     uint8_t count = 1;
@@ -121,12 +132,12 @@ private:
     std::vector<std::vector<uint8_t>> frags_;
 };
 
-// Family index as carried in BEACON bodies and 0xFB monitor records.
+// Family index as carried in 0xFB monitor records.
 const char* skywaveFamilyName(uint8_t family);
 
 // A control-port monitor notification, minus its `MON:` prefix:
 //   <src>:<dst|*>:<frame_type>:<family>:<Mx>:<hex_payload>
-// The hex payload is the raw link frame, which the modem caps at 64 bytes.
+// The hex payload is the whole raw link frame (envelope + body + CRC).
 struct SkywaveMonitorLine {
     std::string src;
     std::string dst;

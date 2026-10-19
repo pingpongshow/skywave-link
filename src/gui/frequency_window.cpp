@@ -1,5 +1,7 @@
 #include "skywave_link/frequency_window.hpp"
+#include "skywave_link/gui_util.hpp"
 #include "skywave_link/modern_style.hpp"
+#include "skywave_link/radio_controller.hpp"
 #include "imgui.h"
 
 #include <algorithm>
@@ -14,21 +16,10 @@ namespace skylink {
 
 namespace {
 
-std::string slotLabel(int slot) {
-    return (slot >= 0 ? "+" : "") + std::to_string(slot);
-}
+using BandRecommendation = FrequencyWindow::BandRecommendation;
+using gui::slotLabel;
 
-struct BandRecommendation {
-    std::string band;
-    float score = -99.0f;
-    float avg_snr = -30.0f;
-    float link_success = 0.0f;  // 0..1
-    float occupancy = 0.0f;     // 0..1
-    float propagation_score = 0.0f;
-    float path_km = 0.0f;
-    float luf_mhz = 0.0f;
-    float muf_mhz = 0.0f;
-};
+constexpr double kRecommendationRefreshSec = 10.0;
 
 std::vector<BandRecommendation> computeBandRecommendations(MessageStore* store,
                                                            FrequencyManager* freq_mgr,
@@ -75,8 +66,10 @@ std::vector<BandRecommendation> computeBandRecommendations(MessageStore* store,
         const double weight = time_weight * decay_weight;
 
         auto& acc = by_band[b.band];
-        acc.weighted_snr += static_cast<double>(b.snr_db) * weight;
-        acc.snr_weight += weight;
+        if (std::isfinite(b.snr_db)) {  // unmeasured beacons carry no SNR
+            acc.weighted_snr += static_cast<double>(b.snr_db) * weight;
+            acc.snr_weight += weight;
+        }
         acc.occupancy_weight += weight;
 
         if (!config->station.grid_square.empty() && !b.grid_square.empty()) {
@@ -117,9 +110,11 @@ std::vector<BandRecommendation> computeBandRecommendations(MessageStore* store,
         acc.ping_weight += weight;
         acc.occupancy_weight += 0.5 * weight;
 
-        const double ping_snr = p.online ? static_cast<double>(p.snr_db) : -22.0;
-        acc.weighted_snr += ping_snr * (0.5 * weight);
-        acc.snr_weight += (0.5 * weight);
+        if (!p.online || std::isfinite(p.snr_db)) {  // a reply without SNR adds none
+            const double ping_snr = p.online ? static_cast<double>(p.snr_db) : -22.0;
+            acc.weighted_snr += ping_snr * (0.5 * weight);
+            acc.snr_weight += (0.5 * weight);
+        }
     }
 
     double max_occupancy = 0.0;
@@ -236,84 +231,156 @@ std::vector<SlotRecommendation> computeSlotRecommendationsForBand(
 
 }  // namespace
 
+
 FrequencyWindow::FrequencyWindow(SharedAppState& state)
     : WindowBase(state) {}
 
-bool FrequencyWindow::requestSlotChange(const std::string& band, int slot) {
-    if (!state_.freq_mgr || !state_.radio) {
+const std::vector<BandRecommendation>& FrequencyWindow::bandRecommendations() {
+    const double now = ImGui::GetTime();
+    if (recs_computed_at_ < 0.0 || now - recs_computed_at_ >= kRecommendationRefreshSec) {
+        recs_cache_ = computeBandRecommendations(state_.store, state_.freq_mgr, state_.config);
+        recs_computed_at_ = now;
+    }
+    return recs_cache_;
+}
+
+bool FrequencyWindow::tuneToSlot(const std::string& band, int slot) {
+    if (!state_.freq_mgr) {
+        postStatus("Frequency manager unavailable", StatusKind::Error);
+        return false;
+    }
+    const uint64_t freq_hz = state_.freq_mgr->getSlotFrequency(band, slot);
+    if (freq_hz == 0) {
+        postStatus("Slot " + slotLabel(slot) + " does not exist on " + band, StatusKind::Error);
         return false;
     }
 
-    std::string target_band = band;
-    if (target_band.empty() && state_.current_band) {
-        target_band = *state_.current_band;
+    bool ok = false;
+    std::string why;
+    if (onTuneFrequency) {
+        ok = onTuneFrequency(freq_hz);
+    } else if (state_.radio && state_.radio->isConnected()) {
+        ok = state_.radio->setFrequency(freq_hz);
+    } else {
+        why = "the radio is not connected (Settings > Radio)";
     }
-    if (target_band.empty()) {
+    if (!ok && why.empty()) {
+        why = state_.radio ? state_.radio->getStatus().last_error : std::string();
+        if (why.empty()) why = "the radio did not accept the frequency";
+    }
+    const std::string where = gui::formatDialFrequency(freq_hz) + " (" + band + " " +
+                              (slot == 0 ? std::string("calling") : "slot " + slotLabel(slot)) + ")";
+    if (!ok) {
+        postStatus("Not tuned to " + where + ": " + why, StatusKind::Error);
         return false;
     }
 
-    int target_slot = std::clamp(slot, -120, 120);
-    if (target_slot == 0) {
-        target_slot = 1;
+    // Moved: now record where we are.
+    if (state_.current_band && state_.current_slot && *state_.current_band == band &&
+        *state_.current_slot != 0 && *state_.current_slot != slot) {
+        const auto old = state_.freq_mgr->getSlot(band, *state_.current_slot);
+        if (old && old->status == SlotStatus::MySlot) {
+            state_.freq_mgr->updateSlotStatus(band, *state_.current_slot, SlotStatus::Unknown);
+        }
     }
+    if (slot != 0) {
+        state_.freq_mgr->updateSlotStatus(band, slot, SlotStatus::MySlot);
+    }
+    if (state_.current_band) *state_.current_band = band;
+    if (state_.current_slot) *state_.current_slot = slot;
+    if (state_.current_frequency_hz) *state_.current_frequency_hz = static_cast<uint32_t>(freq_hz);
 
-    const ModemStatus st = state_.modem->getStatus();
-    const bool station_link = (st.link_state == LinkState::Connected);
-    if (station_link && onSendQsySuggestion) {
-        const uint64_t freq_hz = state_.freq_mgr->getSlotFrequency(target_band, target_slot);
-        onSendQsySuggestion(target_band, target_slot, static_cast<uint32_t>(freq_hz));
-        return true;
+    if (state_.radio && state_.radio->isDryRun()) {
+        postStatus("Dry-run radio: " + where + " recorded, but no rig was tuned",
+                   StatusKind::Warning);
+    } else {
+        postStatus("Tuned to " + where, StatusKind::Success);
     }
+    return true;
+}
 
-    if (state_.current_band) {
-        *state_.current_band = target_band;
+void FrequencyWindow::requestSlotChange(const std::string& band, int slot) {
+    if (band.empty()) {
+        postStatus("Choose a band first", StatusKind::Error);
+        return;
     }
-    if (state_.current_slot) {
-        *state_.current_slot = target_slot;
+    if (gui::isStationLinked(state_.modem)) {
+        // Moving alone would drop the link: ask the peer to move with us.
+        if (!onSendQsySuggestion || !state_.freq_mgr) {
+            postStatus("Linked: QSY coordination is not available, so the rig was not moved",
+                       StatusKind::Error);
+            return;
+        }
+        const uint64_t freq_hz = state_.freq_mgr->getSlotFrequency(band, slot);
+        if (freq_hz == 0) {
+            postStatus("Slot " + slotLabel(slot) + " does not exist on " + band, StatusKind::Error);
+            return;
+        }
+        const size_t log_mark = state_.chatHistorySize();
+        onSendQsySuggestion(band, slot, static_cast<uint32_t>(freq_hz));
+        const std::string logged = state_.systemMessageSince(log_mark);
+        const std::string peer = state_.modem->getStatus().remote_callsign;
+        postStatus(logged.empty() ? "QSY to " + band + " " + slotLabel(slot) + " suggested to " +
+                                        peer + "; both stations move once it accepts"
+                                  : logged,
+                   StatusKind::Info);
+        return;
     }
-    const bool ok = state_.freq_mgr->qsyToSlot(*state_.radio, target_band, target_slot);
-    if (ok && state_.current_frequency_hz) {
-        *state_.current_frequency_hz = static_cast<uint32_t>(
-            state_.freq_mgr->getSlotFrequency(target_band, target_slot));
-    }
-    return ok;
+    (void)tuneToSlot(band, slot);
 }
 
 void FrequencyWindow::render() {
+    const ui::Palette& pal = ui::palette();
+    if (!state_.current_band) return;
+
     ImGui::Text("Frequency Channel Management");
     ImGui::Separator();
+    ui::StatusLine(status_);
 
-    // Band selection
-    ImGui::Text("Band:");
-    ImGui::SameLine();
-
-    static const char* bands[] = {"80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m"};
-    static int current_band_idx = 3;  // Default 20m
-
-    // Find current band index
-    for (int i = 0; i < 8; ++i) {
-        if (*state_.current_band == bands[i]) {
-            current_band_idx = i;
-            break;
+    // Where the rig is (changes only after a successful tune).
+    {
+        const uint32_t hz = state_.current_frequency_hz ? *state_.current_frequency_hz : 0;
+        const int slot = state_.current_slot ? *state_.current_slot : 0;
+        ImGui::Text("Tuned: %s %s  %s", state_.current_band->c_str(),
+                    slot == 0 ? "calling" : ("slot " + slotLabel(slot)).c_str(),
+                    hz ? gui::formatDialFrequency(hz).c_str() : "(frequency unknown)");
+        if (state_.radio && state_.radio->isDryRun()) {
+            ui::WarningText("Dry-run radio: tuning is simulated, the rig does not move.");
+        } else if (!onTuneFrequency && !(state_.radio && state_.radio->isConnected())) {
+            ImGui::TextDisabled("No radio control: set up Settings > Radio to tune from here.");
         }
     }
 
-    if (ImGui::Combo("##BandSelect", &current_band_idx, bands, 8)) {
-        *state_.current_band = bands[current_band_idx];
+    // Band whose slots are shown (viewing does not tune).
+    if (view_band_.empty()) view_band_ = *state_.current_band;
+    std::vector<BandConfig> bands;
+    if (state_.freq_mgr) bands = gui::enabledBands(*state_.freq_mgr);
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Show band:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6.0f);
+    if (ImGui::BeginCombo("##BandSelect", view_band_.c_str())) {
+        for (const auto& band : bands) {
+            if (ImGui::Selectable(band.name.c_str(), band.name == view_band_)) {
+                view_band_ = band.name;
+            }
+        }
+        ImGui::EndCombo();
     }
 
-    // Show calling frequency
+    // Calling frequency of the shown band
     if (state_.freq_mgr) {
-        uint64_t calling_freq = state_.freq_mgr->getCallingFrequency(*state_.current_band);
-        ImGui::Text("Calling Frequency: %.3f MHz", calling_freq / 1000000.0);
-
-        // QSY to calling frequency button
+        const uint64_t calling_freq = state_.freq_mgr->getCallingFrequency(view_band_);
+        ImGui::SameLine();
+        ImGui::Text("Calling: %s", gui::formatDialFrequency(calling_freq).c_str());
+        ImGui::SameLine();
         if (ImGui::Button("QSY to Calling Freq")) {
-            if (state_.radio) {
-                if (state_.freq_mgr->qsyToCallingFrequency(*state_.radio, *state_.current_band) &&
-                    state_.current_frequency_hz) {
-                    *state_.current_frequency_hz = static_cast<uint32_t>(calling_freq);
-                }
+            if (gui::isStationLinked(state_.modem)) {
+                postStatus("Linked to " + state_.modem->getStatus().remote_callsign +
+                               ": disconnect first, or the link drops when the rig moves",
+                           StatusKind::Error);
+            } else {
+                (void)tuneToSlot(view_band_, 0);
             }
         }
     }
@@ -323,17 +390,17 @@ void FrequencyWindow::render() {
 
     // Slot grid
     if (state_.freq_mgr) {
-        auto slots = state_.freq_mgr->getSlots(*state_.current_band);
+        auto slots = state_.freq_mgr->getSlots(view_band_);
 
-        if (ImGui::BeginChild("SlotGrid", ImVec2(-1, ImGui::GetFontSize() * 14.0f), true)) {
-            ImGui::Columns(4, "SlotColumns");
+        if (ImGui::BeginChild("SlotGrid", ImVec2(-1, ImGui::GetFontSize() * 14.0f), ImGuiChildFlags_Borders)) {
+            ImGui::Columns(4, "SlotColumns", false);
 
             for (const auto& slot : slots) {
-                const std::string label = slotLabel(slot.slot_number);
+                const std::string label = slot.slot_number == 0 ? std::string("0 (call)")
+                                                                : slotLabel(slot.slot_number);
 
                 // Color based on status (theme palette; unknown keeps the
                 // theme's neutral button colour)
-                const ui::Palette& pal = ui::palette();
                 ImVec4 color = ImGui::GetStyleColorVec4(ImGuiCol_Button);
                 switch (slot.status) {
                     case SlotStatus::Available:
@@ -352,14 +419,13 @@ void FrequencyWindow::render() {
                 ui::PushButtonColor(color);
                 if (ImGui::Button(label.c_str(),
                                   ImVec2(ImGui::GetFontSize() * 4.5f, ImGui::GetFrameHeight() * 1.15f))) {
-                    requestSlotChange(state_.current_band ? *state_.current_band : std::string{},
-                                      slot.slot_number);
+                    requestSlotChange(view_band_, slot.slot_number);
                 }
                 ui::PopButtonColor();
 
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("%.3f MHz\nStatus: %s%s",
-                                      slot.frequency_hz / 1000000.0,
+                    ImGui::SetTooltip("%s\nStatus: %s%s",
+                                      gui::formatDialFrequency(slot.frequency_hz).c_str(),
                                       slot.status == SlotStatus::Available ? "Available" :
                                       slot.status == SlotStatus::InUse ? "Busy" :
                                       slot.status == SlotStatus::MySlot ? "My Slot" : "Unknown",
@@ -373,45 +439,9 @@ void FrequencyWindow::render() {
         ImGui::EndChild();
     }
 
-    ImGui::Separator();
-
-    // Channel sniffer
-    ImGui::Text("Channel Sniffer:");
-    if (*state_.channel_sniffer_active) {
-        if (ImGui::Button("Stop Sniffer")) {
-            if (onStopSniffer) onStopSniffer();
-        }
-        ImGui::SameLine();
-        std::string scanning_slot = "?";
-        if (state_.slot_status && *state_.sniffer_current_slot >= 0 &&
-            *state_.sniffer_current_slot < static_cast<int>(state_.slot_status->size())) {
-            scanning_slot = slotLabel((*state_.slot_status)[*state_.sniffer_current_slot].first);
-        }
-        ImGui::Text("Scanning slot %s...", scanning_slot.c_str());
-    } else {
-        if (ImGui::Button("Start Sniffer")) {
-            if (onStartSniffer) onStartSniffer();
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("Scans all slots in current band to detect activity");
-    }
-
-    // Find best slot button
-    if (ImGui::Button("Find Best Slot")) {
-        if (state_.freq_mgr) {
-            int best = state_.freq_mgr->findBestSlot(*state_.current_band);
-            *state_.current_slot = best;
-        }
-    }
-
-    // Sniffer results
-    renderSnifferResults();
-
     // Slot legend
-    ImGui::Separator();
-    ImGui::Text("Legend:");
+    ImGui::TextDisabled("Legend:");
     ImGui::SameLine();
-    const ui::Palette& pal = ui::palette();
     ImGui::TextColored(pal.success, "Available");
     ImGui::SameLine();
     ImGui::TextColored(pal.danger, "Busy");
@@ -419,6 +449,65 @@ void FrequencyWindow::render() {
     ImGui::TextColored(pal.accent, "My Slot");
     ImGui::SameLine();
     ImGui::TextColored(pal.muted, "Unknown");
+
+    ImGui::Separator();
+
+    // Channel sniffer (scans the tuned band)
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Channel Sniffer:");
+    ImGui::SameLine();
+    if (state_.channel_sniffer_active && *state_.channel_sniffer_active) {
+        if (ImGui::Button("Stop Sniffer")) {
+            if (onStopSniffer) onStopSniffer();
+            postStatus("Sniffer stopped", StatusKind::Info);
+        }
+        ImGui::SameLine();
+        std::string scanning_slot = "?";
+        if (state_.slot_status && state_.sniffer_current_slot && *state_.sniffer_current_slot >= 0 &&
+            *state_.sniffer_current_slot < static_cast<int>(state_.slot_status->size())) {
+            scanning_slot = slotLabel((*state_.slot_status)[*state_.sniffer_current_slot].first);
+        }
+        ImGui::Text("Scanning slot %s...", scanning_slot.c_str());
+    } else {
+        if (ImGui::Button("Start Sniffer")) {
+            if (!onStartSniffer) {
+                postStatus("Channel sniffer not available", StatusKind::Error);
+            } else {
+                const size_t log_mark = state_.chatHistorySize();
+                onStartSniffer();
+                if (state_.channel_sniffer_active && *state_.channel_sniffer_active) {
+                    postStatus("Sniffer scanning " + *state_.current_band, StatusKind::Info);
+                } else {
+                    const std::string why = state_.systemMessageSince(log_mark);
+                    postStatus(why.empty() ? std::string("Sniffer did not start (needs the modem "
+                                                         "and radio control)")
+                                           : why,
+                               StatusKind::Error);
+                }
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Steps the rig through the tuned band (%s) to find busy slots",
+                            state_.current_band->c_str());
+    }
+
+    // Find best slot: QSY to it (a suggestion to the peer while linked).
+    if (ImGui::Button("QSY to Best Slot")) {
+        if (state_.freq_mgr) {
+            const int best = state_.freq_mgr->findBestSlot(view_band_);
+            const auto info = state_.freq_mgr->getSlot(view_band_, best);
+            requestSlotChange(view_band_, best);
+            if (info && info->status != SlotStatus::Available && status_.kind != StatusKind::Error) {
+                postStatus(status_.text + " (no slot is known to be clear yet; run the sniffer "
+                                          "to check)",
+                           StatusKind::Warning);
+            }
+        }
+    }
+    ImGui::SetItemTooltip("Picks the best slot on the shown band and moves there.");
+
+    // Sniffer results
+    renderSnifferResults();
 
     renderRecommendations();
 }
@@ -441,7 +530,7 @@ void FrequencyWindow::renderRecommendations() {
     ImGui::Separator();
     ImGui::Text("Band/Slot Recommendations:");
 
-    auto band_recs = computeBandRecommendations(state_.store, state_.freq_mgr, state_.config);
+    const auto& band_recs = bandRecommendations();
     if (band_recs.empty()) {
         ImGui::TextDisabled("No beacon/ping history yet. Hear stations to build recommendations.");
         return;
@@ -466,47 +555,22 @@ void FrequencyWindow::renderRecommendations() {
         }
     }
 
-    if (state_.freq_mgr && state_.modem && ImGui::Button("QSY Best Band+Slot")) {
-        const std::string& best_band = band_recs.front().band;
+    const std::string best_band = band_recs.front().band;
+    int best_slot = 0;
+    if (state_.freq_mgr) {
         const auto slot_recs = computeSlotRecommendationsForBand(
-            best_band,
-            state_.freq_mgr,
-            state_.slot_status,
-            band_recs.front().score);
+            best_band, state_.freq_mgr, state_.slot_status, band_recs.front().score);
+        best_slot = slot_recs.empty() ? state_.freq_mgr->findBestSlot(best_band)
+                                      : slot_recs.front().slot;
+    }
+    const bool station_link = gui::isStationLinked(state_.modem);
 
-        int best_slot = 0;
-        if (!slot_recs.empty()) {
-            best_slot = slot_recs.front().slot;
-        } else {
-            best_slot = state_.freq_mgr->findBestSlot(best_band);
-        }
-
+    if (state_.freq_mgr && ImGui::Button(station_link ? "Suggest Best Band+Slot to Peer"
+                                                      : "QSY Best Band+Slot")) {
         requestSlotChange(best_band, best_slot);
     }
-
-    if (state_.freq_mgr && state_.modem && onSendQsySuggestion) {
-        const std::string& best_band = band_recs.front().band;
-        const auto best_slot_recs = computeSlotRecommendationsForBand(
-            best_band,
-            state_.freq_mgr,
-            state_.slot_status,
-            band_recs.front().score);
-        int best_slot = best_slot_recs.empty() ? state_.freq_mgr->findBestSlot(best_band)
-                                               : best_slot_recs.front().slot;
-        const uint32_t best_freq_hz = static_cast<uint32_t>(state_.freq_mgr->getSlotFrequency(best_band, best_slot));
-        ModemStatus st = state_.modem->getStatus();
-        const bool station_link = (st.link_state == LinkState::Connected);
-        if (!station_link) {
-            ImGui::BeginDisabled();
-        }
-        if (ImGui::Button("Suggest Best QSY to Peer")) {
-            onSendQsySuggestion(best_band, best_slot, best_freq_hz);
-        }
-        if (!station_link) {
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("Connect to a station to send QSY coordination.");
-        }
-    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s %s", best_band.c_str(), slotLabel(best_slot).c_str());
 
     if (state_.qsy_suggestion_pending && *state_.qsy_suggestion_pending &&
         state_.qsy_suggestion_from && state_.qsy_suggestion_band &&
@@ -514,17 +578,24 @@ void FrequencyWindow::renderRecommendations() {
         onRespondQsySuggestion) {
         ImGui::Separator();
         ImGui::Text("Incoming QSY Suggestion:");
-        ImGui::Text("%s suggests %s slot %+d (%.3f MHz)",
+        ImGui::Text("%s suggests %s slot %s (%s)",
                     state_.qsy_suggestion_from->c_str(),
                     state_.qsy_suggestion_band->c_str(),
-                    *state_.qsy_suggestion_slot,
-                    static_cast<double>(*state_.qsy_suggestion_frequency_hz) / 1000000.0);
+                    slotLabel(*state_.qsy_suggestion_slot).c_str(),
+                    gui::formatDialFrequency(*state_.qsy_suggestion_frequency_hz).c_str());
+        auto respond = [&](bool accept) {
+            const size_t log_mark = state_.chatHistorySize();
+            onRespondQsySuggestion(accept);
+            const std::string logged = state_.systemMessageSince(log_mark);
+            postStatus(logged.empty() ? (accept ? "QSY accepted" : "QSY declined") : logged,
+                       StatusKind::Info);
+        };
         if (ImGui::Button("Accept and QSY")) {
-            onRespondQsySuggestion(true);
+            respond(true);
         }
         ImGui::SameLine();
         if (ImGui::Button("Decline")) {
-            onRespondQsySuggestion(false);
+            respond(false);
         }
     }
 
@@ -532,19 +603,20 @@ void FrequencyWindow::renderRecommendations() {
         return;
     }
 
-    const float current_band_score = bandScoreFor(band_recs, *state_.current_band);
+    const float view_band_score = bandScoreFor(band_recs, view_band_);
     auto slot_recs = computeSlotRecommendationsForBand(
-        *state_.current_band,
+        view_band_,
         state_.freq_mgr,
-        state_.slot_status,
-        current_band_score);
+        // Sniffer results describe the tuned band only.
+        view_band_ == *state_.current_band ? state_.slot_status : nullptr,
+        view_band_score);
 
     if (slot_recs.empty()) {
-        ImGui::TextDisabled("No slot data for %s", state_.current_band->c_str());
+        ImGui::TextDisabled("No slot data for %s", view_band_.c_str());
         return;
     }
 
-    ImGui::TextDisabled("Current band %s recommendations:", state_.current_band->c_str());
+    ImGui::TextDisabled("%s recommendations:", view_band_.c_str());
     int limit = 0;
     for (const auto& rec : slot_recs) {
         if (limit++ >= 5) {
@@ -552,17 +624,15 @@ void FrequencyWindow::renderRecommendations() {
         }
 
         const std::string slot_id = slotLabel(rec.slot);
-        ImGui::Text("Slot %s  %.3f MHz  score %.1f  %s",
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("Slot %s  %s  score %.1f  %s",
                     slot_id.c_str(),
-                    rec.frequency_hz / 1000000.0,
+                    gui::formatDialFrequency(rec.frequency_hz).c_str(),
                     rec.score,
                     rec.busy ? "BUSY" : "CLEAR");
-        if (state_.modem && ImGui::SmallButton(("QSY##rec_slot_" + slot_id).c_str())) {
-            requestSlotChange(state_.current_band ? *state_.current_band : std::string{},
-                              rec.slot);
-        }
-        if (limit < 5) {
-            ImGui::Separator();
+        ImGui::SameLine();
+        if (ImGui::SmallButton(("QSY##rec_slot_" + slot_id).c_str())) {
+            requestSlotChange(view_band_, rec.slot);
         }
     }
 }

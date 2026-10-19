@@ -42,11 +42,16 @@ uint32_t crc32(const uint8_t* data, size_t len) {
 }
 
 // Length-prefixed callsign (frame.cpp putCall/getCall: u8 length, 3..12
-// bytes of uppercase ASCII).
+// bytes; the wire form must already be canonical: A-Z, 0-9, '/').
 bool readCall(const std::vector<uint8_t>& b, size_t& off, std::string* out) {
     if (off >= b.size()) return false;
     const size_t len = b[off];
     if (len < 3 || len > 12 || off + 1 + len > b.size()) return false;
+    for (size_t i = 0; i < len; ++i) {
+        const char c = static_cast<char>(b[off + 1 + i]);
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/';
+        if (!ok) return false;
+    }
     out->assign(reinterpret_cast<const char*>(b.data() + off + 1), len);
     off += 1 + len;
     return true;
@@ -85,6 +90,8 @@ std::string skywaveFrameTypeName(uint8_t type) {
         case SkywaveFrameType::VoicePttEnd:   return "VOICE_PTT_END";
         case SkywaveFrameType::VoiceData:     return "VOICE_DATA";
         case SkywaveFrameType::KeyUpdate:     return "KEY_UPDATE";
+        case SkywaveFrameType::TurnGrant:     return "TURN_GRANT";
+        case SkywaveFrameType::BcastVoice:    return "BCAST_VOICE";
     }
     return "TYPE" + std::to_string(static_cast<int>(type));
 }
@@ -106,11 +113,12 @@ std::optional<SkywaveFrame> parseSkywaveFrame(const std::vector<uint8_t>& raw,
     SkywaveFrame f;
     f.type = raw[0];
     if (f.type < static_cast<uint8_t>(SkywaveFrameType::Call) ||
-        f.type > static_cast<uint8_t>(SkywaveFrameType::KeyUpdate)) {
+        f.type > static_cast<uint8_t>(SkywaveFrameType::BcastVoice)) {
         return std::nullopt;
     }
     f.type_name = skywaveFrameTypeName(f.type);
     f.flags = raw[1];
+    if ((f.flags & kSkywaveFlagsReservedMask) != 0) return std::nullopt;
     f.session_id = loadU16Le(raw.data() + 2);
     f.sequence = loadU16Le(raw.data() + 4);
     f.ack_base = loadU16Le(raw.data() + 6);
@@ -126,9 +134,9 @@ std::optional<SkywaveFrame> parseSkywaveFrame(const std::vector<uint8_t>& raw,
         }
     }
 
-    // No valid CRC. A `MON:` line is capped at 64 hex-decoded bytes by the
-    // modem, so a longer frame legitimately arrives without its tail; take
-    // the body we can see and mark it.
+    // No valid CRC. The modem emits whole frames on `MON:` lines, but a
+    // payload that does not check is still useful for its callsign; take the
+    // body we can see and mark it.
     if (!allow_truncated) return std::nullopt;
     f.truncated = true;
     f.body.assign(raw.begin() + kSkywaveEnvelopeBytes, raw.end());
@@ -212,25 +220,31 @@ std::optional<SkywaveMonitorLine> parseSkywaveMonitorLine(
     return line;
 }
 
+// BeaconBody::parse: call + exactly one byte.
 std::optional<SkywaveBeacon> parseSkywaveBeacon(
     const std::vector<uint8_t>& body) {
     size_t off = 0;
     SkywaveBeacon b;
     if (!readCall(body, off, &b.callsign)) return std::nullopt;
-    if (off + 3 > body.size()) return std::nullopt;
-    b.snr_floor_db = static_cast<float>(body[off]) - 20.0f;
-    b.family = body[off + 1];
-    b.sw_version = body[off + 2];
+    if (body.size() != off + 1) return std::nullopt;
+    const uint8_t floor = body[off];
+    b.snr_floor_known = (floor != kSkywaveBeaconSnrUnknown);
+    b.snr_floor_db = b.snr_floor_known ? static_cast<float>(floor) - 20.0f : 0.0f;
     return b;
 }
 
+// CqBody::parse: call and nothing after it.
 std::optional<SkywaveCq> parseSkywaveCq(const std::vector<uint8_t>& body) {
     size_t off = 0;
     SkywaveCq c;
     if (!readCall(body, off, &c.callsign)) return std::nullopt;
-    if (off + 2 > body.size()) return std::nullopt;
-    c.caps = loadU16Le(body.data() + off);
+    if (off != body.size()) return std::nullopt;
     return c;
+}
+
+std::optional<uint8_t> parseSkywaveTurnGrant(const std::vector<uint8_t>& body) {
+    if (body.size() != 1) return std::nullopt;
+    return body[0];
 }
 
 std::optional<SkywaveBcastFragment> parseSkywaveBcast(
@@ -242,7 +256,8 @@ std::optional<SkywaveBcastFragment> parseSkywaveBcast(
     f.index = static_cast<uint8_t>(body[4] >> 4);
     f.count = static_cast<uint8_t>((body[4] & 0x0Fu) + 1u);
     if (f.index >= f.count) return std::nullopt;
-    if (body.size() < 5u + len) return std::nullopt;
+    // BcastDataBody::parse: at most 256 bytes and exactly `len` of them.
+    if (len > kSkywaveBcastMaxPayload || body.size() != 5u + len) return std::nullopt;
     f.payload.assign(body.begin() + 5, body.begin() + 5 + len);
     return f;
 }

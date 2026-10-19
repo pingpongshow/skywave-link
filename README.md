@@ -23,21 +23,22 @@ against modem **v1.2.7**; both stations' modems must run the same release.
 - Core static library: `skywave_link_core`
 - No-RF/no-modem test bridge: `skywave_link_emulator`
 - Control-protocol probe: `skywave_link_probe`
-- Optional unit/integration-style test suite: 16 tests when `SKYWAVE_LINK_BUILD_TESTS=ON`
+- Optional unit/integration-style test suite: 22 tests when `SKYWAVE_LINK_BUILD_TESTS=ON`
 
 ALE support has been removed from the codebase, UI, and configuration.
 
 ## Feature Summary
 
-- Live station-to-station chat with typing indicator, fragmentation/reassembly, CQ, broadcast, ping, and QSO timing
-- File transfer up to 50 KiB with CRC validation, resume/cancel support, and file-type detection. Offers are accepted automatically only with `auto_accept`, from a trusted callsign, or as a requested BBS download; any other offer opens an **Incoming File** accept/decline prompt (declined automatically after 120 s, at most 8 waiting)
-- Radio mail with inbox/sent views, broadcast mail, message priority, and compose templates for free text, ICS-213, and radiogram traffic
-- Email relay support through SMTP, POP3 polling, and Winlink CMS Telnet
-- HF store-and-forward mesh relay controls with deduplication, TTL, hop limits, and relay diagnostics. Relayed chat and mail are limited to one hop, can trigger no session-only action, and are shown as "[relayed via X, sender unverified]"
-- APRS-IS direct reporting, APRS relay via connected stations, GPS serial input, and station map display
-- BBS file hosting, remote listing sync, and remote file fetch workflow
+- Live station-to-station chat (each line framed `0xC0 | UTF-8 text`, long lines fragmented and reassembled), CQ with a x1-x10 repeat, broadcast, ping, and QSO timing
+- File transfer up to `files.max_file_size` (default 50 KiB, enforced on both ends) with an end-to-end size/CRC check, cancel, and file-type labels. Offers are accepted automatically only with `auto_accept`, from a trusted callsign, or as a requested BBS download; any other offer opens an **Incoming File** accept/decline prompt (declined automatically after 120 s, at most 8 waiting)
+- Radio mail with inbox/sent views, broadcast mail, message priority, and compose templates for free text, ICS-213, and radiogram traffic. Private mail is sent over a link only to its addressee; otherwise it waits in the outbox or goes by mesh relay
+- Email relay through SMTP, POP3 polling, and Winlink CMS (B2F with secure login over TLS); only stations on the relay allowlist may use it (an empty list admits nobody)
+- HF store-and-forward mesh relay with deduplication, TTL, hop limits, directed relaying over fresh learned routes (route table in Settings -> Email), and relay diagnostics. Relayed chat and mail are limited to one hop, can trigger no session-only action, and are shown as "[relayed via X, sender unverified]"
+- APRS-IS reporting with a server-side filter and inbound APRS messages, APRS relay via connected stations, GPS serial input (checksummed NMEA), and station map display
+- BBS file hosting, remote listing sync, remote file fetch, and uploads to a linked station's BBS when it allows them
 - Frequency/channel management with slot grid, channel sniffer, QSY suggestion/accept flow, and recommendation scoring from beacon/ping history
-- Beaconing, away mode, PSK Reporter uploads, and live voice control/PTT over the modem voice socket
+- Weather forecast, METAR/TAF, marine and US weather-alert requests through a linked station
+- Beaconing, away mode, PSK Reporter uploads (IPFIX, at most every 5 minutes), and live voice control/PTT over the modem voice socket
 
 ## Build Requirements
 
@@ -46,12 +47,13 @@ Required:
 - CMake 3.16+
 - C++20 compiler
 - Threads
+- SQLite3 (message store; CMake stops without it)
+- Hamlib (rig control)
 
 Recommended:
 
 - SDL2 and OpenGL for the GUI executable
-- SQLite3 for persistent message storage
-- OpenSSL for SMTP TLS, Winlink helpers, and OpenSSL-gated core features
+- OpenSSL for TLS (SMTP, POP3, Winlink CMS)
 
 Bundled in-tree:
 
@@ -61,7 +63,16 @@ Bundled in-tree:
 
 If SDL2 or OpenGL is missing, CMake still builds `skywave_link_core` and `skywave_link_emulator`, but it skips the GUI executable.
 
-If SQLite is missing, the build continues, but `MessageStore` cannot open a database. The old README claim about a file-storage fallback is no longer true.
+SQLite is required: there is no file-storage fallback, and a build without
+it would lose mail, so CMake refuses to configure.
+
+## Passwords
+
+SMTP, POP3 and Winlink account passwords are stored in the system keychain
+where one is available (macOS); `config.toml` then only notes that the
+password is in the keychain. Elsewhere they are written to `config.toml`,
+which is saved owner-only (mode 0600). The Winlink password is never sent
+to the CMS: it only answers the secure-login challenge.
 
 ## Build
 
@@ -98,8 +109,8 @@ The voice port is optional: a modem built without `ENABLE_VOICE` never binds
 it, and the app continues without live voice media rather than failing the
 whole connection.
 
-Configs carrying the ancestor application's ports (`8300`/`8301`/`8302`, in
-either command/data order) are migrated to the Skywave defaults on load.
+Configs carrying the ancestor application's ports (`8300`/`8301`/`8302`) are
+not migrated: set the Skywave ports (9100/9101/9102) in Settings > Modem.
 
 ## Running With A Modem
 
@@ -138,13 +149,24 @@ modem upgrade.
 
 `skywave_link_emulator` bridges two GUI instances over TCP command/data sockets so you can test chat, CQ, ping, mail, file transfer, BBS, weather requests, and link-state behavior without RF hardware.
 
-It speaks the same control dialect as the modem (verb-echo responses,
-`EVT:STATE` / `EVT:CONNECTED` / `EVT:DISCONNECTED` notifications, a `STATUS`
-line with the modem's field set), so the app needs no special mode.
+It follows the current modem's control dialect for what the app uses:
 
-It does not emulate the live voice media socket, the passive monitor, or any
-waveform behaviour: voice verbs answer `ERROR:UNSUPPORTED`, and mode/family
-commands are accepted and ignored.
+- verb-echo responses, `EVT:STATE` / `EVT:CONNECTED` / `EVT:DISCONNECTED`
+  notifications and a `STATUS` line with the modem's field set
+- `BCAST <hex>` answers `BCAST <n>`; every other station gets
+  `EVT:BROADCAST <src> <HEX>`, linked or not
+- `BEACON` / `CQ` answer their verb; stations with `MONITOR ON` get a `MON:`
+  line with the whole link frame (BEACON body: call + `0xFF`, CQ body: call)
+- data-port bytes travel only inside a connected session; outside one they
+  are dropped. Payloads are opaque, so the app's own framing (chat
+  `0xC0|text`, station beacon `0xFA...`, mail, files) is passed unchanged
+- the placeholder callsign (N0CALL or none) refuses transmissions with
+  `ERROR:STATE`; `CONNECT` to an unknown station ends with
+  `EVT:DISCONNECTED NO_ANSWER`
+
+It does not emulate the voice media socket or any waveform behaviour: voice
+verbs answer `ERROR:UNSUPPORTED`, and mode/family commands are accepted and
+ignored. `tests/test_emulator.cpp` drives the real binary with two clients.
 
 Build the emulator:
 
@@ -243,21 +265,27 @@ auto_connect = true
 
 [voice]
 auto_start = false
-codec = "AUTO"
+codec = "AUTO"             # AUTO | 700C | 1300 | 2400 | 3200
 mode = "CONNECTED"
-family = "AUTO"
 
 [aprs]
 enabled = false
 server = "rotate.aprs.net"
 port = 14580
 beacon_interval_sec = 900
+auto_beacon = true
+filter = ""                # empty: r/<lat>/<lon>/<filter_range_km> plus your call
+filter_range_km = 100
 gps_enabled = false
 gps_baud = 9600
 
 [email]
 gateway_enabled = false
+allowed_relays = ""        # stations allowed to relay email; empty: nobody
 winlink_telnet_enabled = false
+winlink_telnet_host = "cms.winlink.org"
+winlink_telnet_port = 8773
+winlink_telnet_use_tls = true
 weak_signal_profile_enabled = true
 hf_store_forward_enabled = true
 
@@ -271,25 +299,26 @@ trusted_callsigns = ""     # e.g. "W1AW, K6XYZ-2": accepted without the prompt
 enabled = false
 bbs_path = "bbs"
 allow_uploads = false
+allowed_uploaders = ""     # stations whose uploads are accepted
 
 [beacon]
 enabled = false
 interval_sec = 600
 beacon_text = "Skywave Link"
 
-[away]
-enabled = false
+[away]                     # away mode itself is a runtime toggle, not saved
 auto_reply = true
 
 [psk_reporter]
 enabled = false
 antenna = "Dipole"
-upload_interval_sec = 300
+min_snr = -20
 
 [ui]
 dark_mode = true
 font_size = 14
 show_timestamps = true
+sound_notifications = true
 ```
 
 ## Known Gaps
@@ -315,10 +344,10 @@ The core `FrequencyManager` also defines `60m`, but the current GUI pickers do n
 
 ```text
 include/skywave_link/   public headers
-src/core/           config, modem, file transfer, mesh relay, web server, utilities
+src/core/           config, modem, radio/PTT, file transfer, mesh relay, message
+                    store, PSK Reporter, keychain, notification sound
 src/gui/            app and modular ImGui windows
-src/email/          SMTP, POP3, Winlink Telnet clients
-src/messaging/      message router
+src/email/          SMTP, POP3, Winlink CMS clients, email gateway job
 src/position/       APRS client and NMEA parser
 src/protocol/       B2F and LZH codecs, Skywave link-frame decoding
 tests/              optional test targets

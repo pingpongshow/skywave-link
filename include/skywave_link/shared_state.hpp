@@ -19,6 +19,7 @@
 namespace skylink {
 
 class RadioController;
+class MeshRelay;
 
 // Chat message for display
 struct ChatMessage {
@@ -30,10 +31,12 @@ struct ChatMessage {
     bool is_broadcast = false;
     bool delivered = false;
     std::string via;             // Mesh relay that delivered it ("" = heard directly)
+    std::string band;            // Band it was sent/heard on ("" = not recorded)
 };
 
 // File transfer state
 struct FileTransfer {
+    std::string transfer_id;     // FileTransferManager id (needed to cancel)
     std::string filename;
     std::string remote_callsign;
     size_t total_bytes = 0;
@@ -41,6 +44,7 @@ struct FileTransfer {
     bool is_upload = false;
     bool completed = false;
     bool failed = false;
+    bool cancelled = false;
     std::string error;
     int64_t started_at = 0;
 };
@@ -73,9 +77,22 @@ struct HeardBeacon {
     std::string grid_square;
     std::string message;
     float snr_db = 0.0f;
+    bool snr_valid = false;      // snr_db is the modem's measurement of this frame
+    std::string band;            // band it was heard on ("" = not recorded)
+    std::string family;          // sender's bandwidth family ("" = unknown)
     int64_t timestamp = 0;
     bool has_pending_messages = false;
     bool email_gateway = false;
+};
+
+// CQ call heard from another station (main panel "Last heard CQ calls").
+struct HeardCall {
+    std::string callsign;
+    int64_t timestamp = 0;       // Unix seconds
+    std::string band;            // "" = not recorded
+    std::string family;          // "" = unknown
+    float snr_db = 0.0f;
+    bool snr_valid = false;      // measured SNR of the CQ frame
 };
 
 // Ping result
@@ -162,16 +179,18 @@ struct WeatherReport {
     std::string severity;
     std::string expires_utc;
     int64_t timestamp = 0;
-    bool is_request_pending = false;
 };
 
-// PSK Reporter spot
-struct PSKReporterSpot {
-    std::string callsign;
-    std::string grid_square;
-    float snr_db = 0.0f;
-    uint32_t frequency_hz = 0;
-    int64_t timestamp = 0;
+// PSK Reporter client status for Settings (App refreshes it about once a
+// second while PSK Reporter is enabled).
+struct PskReporterStatus {
+    bool active = false;            // client running (enabled and a callsign set)
+    size_t queued_spots = 0;
+    uint64_t spots_sent = 0;
+    uint64_t last_upload_unix = 0;  // 0 = nothing uploaded yet this session
+    uint64_t next_upload_unix = 0;  // 0 = not scheduled
+    bool upload_in_progress = false;
+    std::string last_error;
 };
 
 // BBS file entry
@@ -192,15 +211,6 @@ struct PendingBbsDownload {
     bool request_sent = false;
 };
 
-// Pending async weather fetch
-struct PendingWeatherFetch {
-    uint8_t type = 0;
-    std::string query;
-    std::string result;
-    bool complete = false;
-    bool success = false;
-};
-
 // SharedAppState holds all data that windows need to access.
 // The App class owns the actual data; windows get a pointer to this struct.
 struct SharedAppState {
@@ -217,11 +227,11 @@ struct SharedAppState {
     FrequencyManager* freq_mgr = nullptr;
     APRSClient* aprs = nullptr;
     FileTransferManager* file_transfer_mgr = nullptr;
+    const MeshRelay* mesh_relay = nullptr;     // read-only: route table display
 
     // UI state
     AppTab* current_tab = nullptr;
     bool* show_settings = nullptr;
-    bool* running = nullptr;
 
     // Chat state
     std::vector<ChatMessage>* chat_history = nullptr;
@@ -229,16 +239,6 @@ struct SharedAppState {
     size_t chat_input_size = 0;
     std::string* current_chat_partner = nullptr;
     bool* chat_scroll_to_bottom = nullptr;
-
-    // Typing indicator
-    bool* remote_is_typing = nullptr;
-    std::chrono::steady_clock::time_point* last_typing_indicator = nullptr;
-    std::chrono::steady_clock::time_point* last_typing_sent = nullptr;
-    bool* last_input_was_empty = nullptr;
-
-    // Message fragmentation
-    std::map<std::string, std::vector<std::pair<int, std::string>>>* fragment_buffer = nullptr;
-    int* outgoing_fragment_counter = nullptr;
 
     // File transfers
     std::vector<FileTransfer>* transfers = nullptr;
@@ -270,7 +270,7 @@ struct SharedAppState {
     int* cq_current_repeat = nullptr;
     char* broadcast_message = nullptr;
     size_t broadcast_message_size = 0;
-    std::deque<std::pair<std::string, std::string>>* heard_stations = nullptr;
+    std::deque<HeardCall>* heard_calls = nullptr;
 
     // Channel sniffer
     bool* channel_sniffer_active = nullptr;
@@ -283,15 +283,12 @@ struct SharedAppState {
     int* gps_baud = nullptr;
 
     // Email gateway
-    std::vector<Message>* email_outbox = nullptr;
-    std::vector<Message>* radio_outbox = nullptr;
     bool* email_gateway_active = nullptr;
     RelayDiagnostics* relay_diagnostics = nullptr;
 
     // BBS
     std::vector<BBSFile>* bbs_files = nullptr;
     std::vector<PendingBbsDownload>* pending_bbs_downloads = nullptr;
-    int* selected_bbs_file = nullptr;
     char* bbs_upload_path = nullptr;
     size_t bbs_upload_path_size = 0;
     char* bbs_file_desc = nullptr;
@@ -315,9 +312,6 @@ struct SharedAppState {
 
     // QSO
     bool* qso_active = nullptr;
-    float* remote_snr_db = nullptr;
-    float* local_snr_db = nullptr;
-    bool* snr_exchanged = nullptr;
     std::chrono::steady_clock::time_point* qso_start_time = nullptr;
 
     // Away mode
@@ -326,7 +320,6 @@ struct SharedAppState {
     // Ping
     std::deque<PingResult>* ping_results = nullptr;
     bool* ping_in_progress = nullptr;
-    std::string* ping_target = nullptr;
 
     // Mail
     std::vector<MailMessage>* mail_inbox = nullptr;
@@ -350,12 +343,9 @@ struct SharedAppState {
     size_t weather_zone_input_size = 0;
     bool* weather_request_pending = nullptr;
     std::chrono::steady_clock::time_point* weather_request_time = nullptr;
-    std::mutex* weather_fetch_mutex = nullptr;
-    std::unique_ptr<PendingWeatherFetch>* pending_weather_fetch = nullptr;
 
     // PSK Reporter
-    std::vector<PSKReporterSpot>* psk_reporter_queue = nullptr;
-    std::mutex* psk_reporter_mutex = nullptr;
+    const PskReporterStatus* psk_status = nullptr;
     uint32_t* current_frequency_hz = nullptr;
 
     // ---- Helper methods ----
@@ -363,17 +353,32 @@ struct SharedAppState {
     // Add a system message to chat history
     void addSystemMessage(const std::string& text);
 
-    // Sync file transfers from the manager
-    void syncTransfers();
+    // Windows report the outcome of App actions they trigger: these look
+    // at what the action appended to chat_history from index `since` on.
+    size_t chatHistorySize() const { return chat_history ? chat_history->size() : 0; }
+    // Text of the newest SYSTEM line added since `since` ("" if none).
+    std::string systemMessageSince(size_t since) const {
+        if (!chat_history) return {};
+        for (size_t i = chat_history->size(); i > since; --i) {
+            const ChatMessage& msg = (*chat_history)[i - 1];
+            if (msg.from == "SYSTEM") return msg.text;
+        }
+        return {};
+    }
+    // True if an outgoing (non-SYSTEM) line was added since `since`.
+    bool outgoingMessageSince(size_t since) const {
+        if (!chat_history) return false;
+        for (size_t i = since; i < chat_history->size(); ++i) {
+            const ChatMessage& msg = (*chat_history)[i];
+            if (msg.is_outgoing && msg.from != "SYSTEM") return true;
+        }
+        return false;
+    }
 
-    // Format QSO duration string
+    // QSO duration "HH:MM:SS" ("--:--:--" while no QSO is running).
+    // File type helpers live in gui_util.hpp (gui::isImageFile,
+    // gui::fileTypeDescription).
     std::string formatQSODuration() const;
-
-    // Check if a file is an image
-    static bool isImageFile(const std::string& filename);
-
-    // Get file type description
-    static std::string getFileTypeDescription(const std::string& filename);
 };
 
 } // namespace skylink

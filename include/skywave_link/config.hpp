@@ -12,7 +12,9 @@ namespace skylink {
 struct StationConfig {
     std::string callsign;
     std::string grid_square;        // Maidenhead locator
-    std::string name;               // Operator name
+    // Operator name: the display name in the From header of gateway email
+    // (SMTPDeliveryRequest::from_name) and in the away-mode reply.
+    std::string name;
     double latitude = 0.0;
     double longitude = 0.0;
     double altitude_m = 0.0;
@@ -37,6 +39,7 @@ struct VoiceConfig {
     std::string codec = "AUTO";
     std::string mode = "CONNECTED";
     std::string ptt_hotkey;
+    // (codec above is sent to the modem as `VOICECODEC <codec>`.)
     std::string capture_device;
     std::string playback_device;
     int capture_gain_percent = 100;
@@ -56,7 +59,7 @@ struct RadioConfig {
     bool auto_connect = true;
     bool ptt_server_enabled = true;
     std::string ptt_server_bind = "127.0.0.1";
-    uint16_t ptt_server_port = 4533;
+    uint16_t ptt_server_port = 4532;  // the modem's PTTPORT default
     std::string default_band = "40m";
     bool auto_qsy = true;           // Auto QSY after CQ response
     int qsy_ack_timeout_ms = 8000;      // Wait for QSY ACK before rollback
@@ -76,6 +79,14 @@ struct APRSConfig {
     char symbol_table = '/';
     char symbol = '-';              // House by default
     std::string comment = "Skywave Link HF Digital";
+    // Periodic position beacons to APRS-IS while connected.
+    bool auto_beacon = true;
+    // APRS-IS server-side filter (port 14580 sends nothing without one).
+    // Empty: `r/<lat>/<lon>/<filter_range_km>` around the station position
+    // plus `b/<callsign>`, or just `b/<callsign>` without a position (see
+    // APRSClient::defaultFilter).
+    std::string filter;
+    int filter_range_km = 100;
     bool gps_enabled = false;
     std::string gps_port;           // Serial port for NMEA GPS
     int gps_baud = 9600;            // Serial baud for NMEA GPS
@@ -101,13 +112,16 @@ struct EmailConfig {
 
     // Gateway mode
     bool gateway_enabled = false;   // Act as email gateway for other stations
-    std::vector<std::string> allowed_relays;  // Callsigns allowed to relay
+    // Stations allowed to send email through this gateway. Persisted as
+    // `allowed_relays = "K1AAA, K1BBB"`. Empty means no station may relay
+    // (the gateway fails closed).
+    std::vector<std::string> allowed_relays;
 
     // Winlink CMS Telnet (internet) relay
     bool winlink_telnet_enabled = false;
-    std::string winlink_telnet_host = "server.winlink.org";
-    uint16_t winlink_telnet_port = 8772;
-    bool winlink_telnet_use_tls = false;
+    std::string winlink_telnet_host = "cms.winlink.org";  // CMS over TLS
+    uint16_t winlink_telnet_port = 8773;
+    bool winlink_telnet_use_tls = true;
     std::string winlink_telnet_callsign;
     std::string winlink_telnet_password;
     int winlink_fetch_interval_sec = 300;
@@ -155,10 +169,12 @@ std::string joinCallsignList(const std::vector<std::string>& calls);
 struct BBSConfig {
     bool enabled = false;           // Enable BBS mode
     std::string bbs_path = "bbs";   // Directory for BBS files
-    std::string welcome_message = "Welcome to Skywave Link BBS";
-    bool allow_uploads = false;     // Allow remote stations to upload
+    std::string welcome_message = "Welcome to Skywave Link BBS";  // sent when a BBS session starts
+    // Remote uploads into bbs_path need allow_uploads AND the sender in
+    // allowed_uploaders (empty list: nobody); see BbsUploadPolicy.
+    bool allow_uploads = false;
     size_t max_upload_size = 50 * 1024;  // 50 KB max upload
-    std::vector<std::string> allowed_uploaders;  // Callsigns allowed to upload
+    std::vector<std::string> allowed_uploaders;  // persisted like allowed_relays
 };
 
 // Beacon configuration
@@ -170,8 +186,9 @@ struct BeaconConfig {
 };
 
 // Away mode configuration
+// Away mode itself is a runtime toggle (Settings > Away Mode buttons,
+// App::enableAwayMode), never saved; these are its persisted options.
 struct AwayConfig {
-    bool enabled = false;           // Enable away mode
     std::string away_message = "Station is unattended. Leave a message.";
     bool allow_message_query = true;   // Allow remote query of messages
     bool allow_email_gateway = true;   // Allow email gateway access
@@ -184,16 +201,14 @@ struct PSKReporterConfig {
     bool enabled = false;           // Enable automatic PSK Reporter uploads
     std::string antenna = "Dipole"; // Antenna description
     int min_snr = -20;              // Minimum SNR to report (filter weak/false decodes)
-    int upload_interval_sec = 300;  // Batch upload interval (5 min default)
 };
 
 // UI preferences
 struct UIConfig {
     bool dark_mode = true;
     int font_size = 15;
-    bool show_timestamps = true;
-    bool sound_notifications = true;
-    std::string notification_sound;
+    bool show_timestamps = true;      // timestamps in chat and log views
+    bool sound_notifications = true;  // system sound on incoming chat/mail
     int window_width = 0;   // 0 = size to the display on first run
     int window_height = 0;
 };

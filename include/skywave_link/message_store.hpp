@@ -18,7 +18,7 @@ struct BeaconRecord {
     int64_t id = 0;
     std::string callsign;
     std::string grid_square;
-    float snr_db = 0.0f;
+    float snr_db = 0.0f;              // NaN = not measured (stored as NULL)
     std::string message;
     bool has_pending = false;
     bool email_gateway = false;
@@ -30,7 +30,7 @@ struct BeaconRecord {
 struct PingRecord {
     int64_t id = 0;
     std::string callsign;
-    float snr_db = 0.0f;
+    float snr_db = 0.0f;              // NaN = not reported (stored as NULL)
     std::string grid_square;
     std::string band;
     bool online = true;
@@ -80,6 +80,23 @@ struct Message {
     int priority = 0;            // 0=routine, 1=priority, 2=emergency
     int retry_count = 0;
     std::string message_id;      // Unique ID for deduplication
+};
+
+// Periodic store maintenance (StoreConfig). Received and delivered mail is
+// never deleted by it.
+struct MaintenancePolicy {
+    int message_expiry_days = 7;    // undelivered outgoing mail expires after this
+    int max_pending_messages = 100; // older pending mail beyond this expires
+    bool auto_cleanup = true;       // delete expired/failed mail and old history
+    int history_days = 30;          // beacon/ping/weather history kept this long
+};
+
+struct MaintenanceReport {
+    int expired = 0;           // Pending/Sent -> Expired (age)
+    int trimmed = 0;           // Pending -> Expired (over max_pending_messages)
+    int deleted_messages = 0;  // expired/failed mail removed
+    int deleted_history = 0;   // beacon/ping/weather/read-state rows removed
+    bool vacuumed = false;
 };
 
 // Query filters
@@ -134,9 +151,12 @@ public:
     bool markRelayedAndDequeue(int64_t id);   // markAsSent + dequeue, atomically
     std::vector<Message> loadInternetRelayQueue();
 
-    // Maintenance
-    int deleteExpiredMessages();
-    int deleteOldMessages(int64_t before_timestamp);
+    // Maintenance. New Pending/Sent/Draft messages without an expiry get
+    // created_at + days (0 = never). runMaintenance() is meant for a
+    // periodic call (a few times an hour) from the owner's main loop; mail
+    // waiting in the internet relay queue is never expired or trimmed.
+    void setDefaultExpiryDays(int days);
+    MaintenanceReport runMaintenance(const MaintenancePolicy& policy, int64_t now_unix = 0);
     void vacuum();
 
     // Generate unique message ID
@@ -157,7 +177,8 @@ public:
     std::optional<bool> getMailReadState(const std::string& message_id);
     std::map<std::string, bool> loadMailReadStates(int limit = 5000);
 
-    // Weather cache
+    // Weather cache: one row per (type, location), the latest report; it
+    // survives restarts (loadWeatherReports at start-up).
     struct WeatherCacheEntry {
         int64_t id = 0;
         std::string type;
@@ -176,6 +197,8 @@ public:
 private:
     void* db_ = nullptr;  // sqlite3* (opaque to avoid header dependency)
     mutable std::mutex mutex_;
+    int default_expiry_days_ = 0;
+    int execCount(const char* sql, int64_t a, int64_t b = 0);
 
     bool createTables();
     bool executeQuery(const std::string& sql);

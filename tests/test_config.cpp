@@ -34,7 +34,7 @@ TEST(config_defaults) {
     ASSERT_TRUE(cfg.radio.auto_connect);
     ASSERT_TRUE(cfg.radio.ptt_server_enabled);
     ASSERT_EQ(cfg.radio.ptt_server_bind, std::string("127.0.0.1"));
-    ASSERT_EQ(cfg.radio.ptt_server_port, (uint16_t)4533);
+    ASSERT_EQ(cfg.radio.ptt_server_port, (uint16_t)4532);
     ASSERT_EQ(cfg.radio.default_band, std::string("40m"));
     ASSERT_TRUE(cfg.radio.auto_qsy);
     ASSERT_EQ(cfg.radio.qsy_ack_timeout_ms, 8000);
@@ -48,9 +48,9 @@ TEST(config_defaults) {
     ASSERT_EQ(cfg.store.message_expiry_days, 7);
     ASSERT_FALSE(cfg.email.winlink_compat_mode);
     ASSERT_FALSE(cfg.email.winlink_telnet_enabled);
-    ASSERT_EQ(cfg.email.winlink_telnet_host, std::string("server.winlink.org"));
-    ASSERT_EQ(cfg.email.winlink_telnet_port, (uint16_t)8772);
-    ASSERT_FALSE(cfg.email.winlink_telnet_use_tls);
+    ASSERT_EQ(cfg.email.winlink_telnet_host, std::string("cms.winlink.org"));
+    ASSERT_EQ(cfg.email.winlink_telnet_port, (uint16_t)8773);
+    ASSERT_TRUE(cfg.email.winlink_telnet_use_tls);
     ASSERT_EQ(cfg.email.pop3_poll_interval_sec, 300);
     ASSERT_EQ(cfg.email.pop3_max_messages, 50);
     ASSERT_EQ(cfg.email.winlink_fetch_interval_sec, 300);
@@ -76,8 +76,8 @@ TEST(config_save_load_roundtrip) {
 
     skylink::AppConfig cfg;
     cfg.setDefaults();
-    cfg.station.callsign = "W1ABC";
-    cfg.station.name = "John Doe";
+    cfg.station.callsign = "K1AAA";
+    cfg.station.name = "Test Operator";
     cfg.station.latitude = 42.3601;
     cfg.station.longitude = -71.0589;
     cfg.modem.command_port = 9000;
@@ -88,7 +88,7 @@ TEST(config_save_load_roundtrip) {
     cfg.radio.baud = 57600;
     cfg.radio.hamlib_model = 3073;
     cfg.radio.hamlib_manufacturer = "Kenwood";
-    cfg.radio.kenwood_host = "192.168.50.10";
+    cfg.radio.kenwood_host = "192.0.2.10";
     cfg.radio.kenwood_port = 5002;
     cfg.radio.auto_connect = false;
     cfg.radio.ptt_server_enabled = true;
@@ -108,8 +108,8 @@ TEST(config_save_load_roundtrip) {
     skylink::AppConfig loaded;
     ASSERT_TRUE(loaded.load(path));
 
-    ASSERT_EQ(loaded.station.callsign, std::string("W1ABC"));
-    ASSERT_EQ(loaded.station.name, std::string("John Doe"));
+    ASSERT_EQ(loaded.station.callsign, std::string("K1AAA"));
+    ASSERT_EQ(loaded.station.name, std::string("Test Operator"));
     ASSERT_NEAR(loaded.station.latitude, 42.3601, 0.001);
     ASSERT_NEAR(loaded.station.longitude, -71.0589, 0.001);
     ASSERT_EQ(loaded.modem.command_port, (uint16_t)9000);
@@ -120,7 +120,7 @@ TEST(config_save_load_roundtrip) {
     ASSERT_EQ(loaded.radio.baud, 57600);
     ASSERT_EQ(loaded.radio.hamlib_model, 3073);
     ASSERT_EQ(loaded.radio.hamlib_manufacturer, std::string("Kenwood"));
-    ASSERT_EQ(loaded.radio.kenwood_host, std::string("192.168.50.10"));
+    ASSERT_EQ(loaded.radio.kenwood_host, std::string("192.0.2.10"));
     ASSERT_EQ(loaded.radio.kenwood_port, (uint16_t)5002);
     ASSERT_FALSE(loaded.radio.auto_connect);
     ASSERT_TRUE(loaded.radio.ptt_server_enabled);
@@ -147,7 +147,7 @@ TEST(config_all_sections_roundtrip) {
     cfg.setDefaults();
     cfg.station.callsign = "KA1XYZ";
     cfg.station.grid_square = "FN42ig";
-    cfg.modem.host = "192.168.1.100";
+    cfg.modem.host = "192.0.2.100";
     cfg.modem.data_port = 7777;
     cfg.modem.family = "NARROW";
     cfg.modem.auto_connect = false;
@@ -203,7 +203,7 @@ TEST(config_all_sections_roundtrip) {
 
     ASSERT_EQ(loaded.station.callsign, std::string("KA1XYZ"));
     ASSERT_EQ(loaded.station.grid_square, std::string("FN42ig"));
-    ASSERT_EQ(loaded.modem.host, std::string("192.168.1.100"));
+    ASSERT_EQ(loaded.modem.host, std::string("192.0.2.100"));
     ASSERT_EQ(loaded.modem.data_port, (uint16_t)7777);
     ASSERT_EQ(loaded.modem.family, std::string("NARROW"));
     ASSERT_FALSE(loaded.modem.auto_connect);
@@ -281,14 +281,14 @@ TEST(config_partial_load) {
     {
         std::ofstream f(path);
         f << "[station]\n";
-        f << "callsign = \"N0CALL\"\n";
+        f << "callsign = \"K1DDD\"\n";
     }
 
     skylink::AppConfig loaded;
     ASSERT_TRUE(loaded.load(path));
 
     // Station should be loaded
-    ASSERT_EQ(loaded.station.callsign, std::string("N0CALL"));
+    ASSERT_EQ(loaded.station.callsign, std::string("K1DDD"));
     // Other sections should have defaults
     ASSERT_EQ(loaded.modem.host, std::string("127.0.0.1"));
     ASSERT_EQ(loaded.modem.command_port, (uint16_t)9101);
@@ -342,7 +342,7 @@ TEST(config_legacy_ale_section_ignored) {
     {
         std::ofstream f(path);
         f << "[station]\n";
-        f << "callsign = \"N0CALL\"\n\n";
+        f << "callsign = \"K1DDD\"\n\n";
         f << "[ale]\n";
         f << "scan_frequencies_hz = \"3590000, 7055000,7055000, 14105000\"\n";
         f << "auto_connect_on_scan_complete = true\n";
@@ -354,7 +354,7 @@ TEST(config_legacy_ale_section_ignored) {
     skylink::AppConfig loaded;
     ASSERT_TRUE(loaded.load(path));
 
-    ASSERT_EQ(loaded.station.callsign, std::string("N0CALL"));
+    ASSERT_EQ(loaded.station.callsign, std::string("K1DDD"));
     ASSERT_EQ(loaded.ui.font_size, 18);
     ASSERT_EQ(loaded.modem.host, std::string("127.0.0.1"));
 
@@ -438,13 +438,13 @@ TEST(config_trusted_callsigns_roundtrip) {
     std::string path = temp_path();
     skylink::AppConfig cfg;
     cfg.setDefaults();
-    cfg.files.trusted_callsigns = skylink::parseCallsignList(" w1aw, K6XYZ-2;;W1AW  n0call ");
+    cfg.files.trusted_callsigns = skylink::parseCallsignList(" k1bbb, K1CCC-2;;K1BBB  k1ddd ");
     ASSERT_EQ(cfg.files.trusted_callsigns.size(), size_t(3));
-    ASSERT_EQ(cfg.files.trusted_callsigns[0], std::string("W1AW"));
-    ASSERT_EQ(cfg.files.trusted_callsigns[1], std::string("K6XYZ-2"));
-    ASSERT_EQ(cfg.files.trusted_callsigns[2], std::string("N0CALL"));
+    ASSERT_EQ(cfg.files.trusted_callsigns[0], std::string("K1BBB"));
+    ASSERT_EQ(cfg.files.trusted_callsigns[1], std::string("K1CCC-2"));
+    ASSERT_EQ(cfg.files.trusted_callsigns[2], std::string("K1DDD"));
     ASSERT_EQ(skylink::joinCallsignList(cfg.files.trusted_callsigns),
-              std::string("W1AW, K6XYZ-2, N0CALL"));
+              std::string("K1BBB, K1CCC-2, K1DDD"));
     ASSERT_TRUE(cfg.save(path));
     skylink::AppConfig loaded;
     ASSERT_TRUE(loaded.load(path));
@@ -458,4 +458,165 @@ TEST(config_trusted_callsigns_roundtrip) {
     PASS();
 }
 
+// K1: the gateway relay allowlist is saved and loaded (it was only ever
+// cleared, so every station could relay email).
+TEST(config_allowed_relays_roundtrip) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    ASSERT_TRUE(cfg.email.allowed_relays.empty());
+    cfg.email.allowed_relays = skylink::parseCallsignList("k1aaa, K1BBB/P");
+    ASSERT_TRUE(cfg.save(path));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_EQ(loaded.email.allowed_relays.size(), size_t(2));
+    ASSERT_EQ(loaded.email.allowed_relays[0], std::string("K1AAA"));
+    ASSERT_EQ(loaded.email.allowed_relays[1], std::string("K1BBB/P"));
+    cfg.email.allowed_relays.clear();
+    ASSERT_TRUE(cfg.save(path));
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_TRUE(loaded.email.allowed_relays.empty());
+    std::filesystem::remove(path);
+    PASS();
+}
+
+// K21: allowed_uploaders is persisted.
+TEST(config_allowed_uploaders_roundtrip) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    cfg.bbs.allow_uploads = true;
+    cfg.bbs.welcome_message = "Hello from the test BBS";
+    cfg.bbs.allowed_uploaders = {"K1AAA", "K1BBB"};
+    cfg.bbs.max_upload_size = 70000;
+    ASSERT_TRUE(cfg.save(path));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_TRUE(loaded.bbs.allow_uploads);
+    ASSERT_EQ(loaded.bbs.welcome_message, std::string("Hello from the test BBS"));
+    ASSERT_TRUE(loaded.bbs.allowed_uploaders == cfg.bbs.allowed_uploaders);
+    ASSERT_EQ(loaded.bbs.max_upload_size, size_t(70000));
+    std::filesystem::remove(path);
+    PASS();
+}
+
+// K17: the away settings persist; away mode itself is a runtime toggle and
+// never comes back from the file.
+TEST(config_away_section_roundtrip) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    cfg.away.away_message = "Back at 1800Z";
+    cfg.away.allow_message_query = false;
+    cfg.away.allow_email_gateway = false;
+    cfg.away.allow_bbs_access = false;
+    cfg.away.auto_reply = false;
+    ASSERT_TRUE(cfg.save(path));
+    {
+        std::ifstream f(path);
+        std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const size_t at = all.find("[away]");
+        ASSERT_TRUE(at != std::string::npos);
+        const std::string section = all.substr(at, all.find("\n[", at + 1) - at);
+        ASSERT_TRUE(section.find("enabled") == std::string::npos);
+    }
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_EQ(loaded.away.away_message, std::string("Back at 1800Z"));
+    ASSERT_FALSE(loaded.away.allow_message_query);
+    ASSERT_FALSE(loaded.away.allow_email_gateway);
+    ASSERT_FALSE(loaded.away.allow_bbs_access);
+    ASSERT_FALSE(loaded.away.auto_reply);
+    std::filesystem::remove(path);
+    PASS();
+}
+
+// K23: voice.codec is kept (it was forced to AUTO on every load); a value
+// the modem does not accept falls back to AUTO.
+TEST(config_voice_codec_kept) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    cfg.voice.codec = "1300";
+    ASSERT_TRUE(cfg.save(path));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_EQ(loaded.voice.codec, std::string("1300"));
+    cfg.voice.codec = "700c";
+    ASSERT_TRUE(cfg.save(path));
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_EQ(loaded.voice.codec, std::string("700C"));
+    cfg.voice.codec = "9600";
+    ASSERT_TRUE(cfg.save(path));
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_EQ(loaded.voice.codec, std::string("AUTO"));
+    std::filesystem::remove(path);
+    PASS();
+}
+
+// K14 / G14: APRS filter, range and auto-beaconing persist.
+TEST(config_aprs_filter_and_beaconing_roundtrip) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    ASSERT_TRUE(cfg.aprs.auto_beacon);
+    ASSERT_TRUE(cfg.aprs.filter.empty());
+    cfg.aprs.auto_beacon = false;
+    cfg.aprs.filter = "r/42.0/-71.0/50 t/m";
+    cfg.aprs.filter_range_km = 250;
+    ASSERT_TRUE(cfg.save(path));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_FALSE(loaded.aprs.auto_beacon);
+    ASSERT_EQ(loaded.aprs.filter, std::string("r/42.0/-71.0/50 t/m"));
+    ASSERT_EQ(loaded.aprs.filter_range_km, 250);
+    std::filesystem::remove(path);
+    PASS();
+}
+
+// Saves go through a temporary file renamed into place: no leftovers, and
+// an unwritable target reports failure instead of claiming success.
+TEST(config_save_is_atomic_and_reports_failure) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    cfg.station.callsign = "K1AAA";
+    ASSERT_TRUE(cfg.save(path));
+    ASSERT_FALSE(std::filesystem::exists(path + ".tmp"));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_EQ(loaded.station.callsign, std::string("K1AAA"));
+    std::filesystem::remove(path);
+
+    // A directory where the file should be: the rename must fail.
+    const std::string dir_path = temp_path();
+    std::filesystem::create_directories(dir_path + "/occupied");
+    ASSERT_FALSE(cfg.save(dir_path));
+    ASSERT_FALSE(std::filesystem::exists(dir_path + ".tmp"));
+    std::filesystem::remove_all(dir_path);
+    PASS();
+}
+
 TEST_MAIN()
+
+// Account passwords were read but never written, so every save erased
+// them. Without the system keychain (tests never enable it) they are
+// written to the file, and the file is owner-only.
+TEST(config_passwords_persist_owner_only) {
+    std::string path = temp_path();
+    skylink::AppConfig cfg;
+    cfg.setDefaults();
+    cfg.email.smtp_password = "smtp-secret";
+    cfg.email.pop3_password = "pop3-secret";
+    cfg.email.winlink_telnet_password = "wl-secret";
+    ASSERT_TRUE(cfg.save(path));
+    skylink::AppConfig loaded;
+    ASSERT_TRUE(loaded.load(path));
+    ASSERT_EQ(loaded.email.smtp_password, std::string("smtp-secret"));
+    ASSERT_EQ(loaded.email.pop3_password, std::string("pop3-secret"));
+    ASSERT_EQ(loaded.email.winlink_telnet_password, std::string("wl-secret"));
+    const auto perms = std::filesystem::status(path).permissions();
+    ASSERT_TRUE((perms & (std::filesystem::perms::group_all | std::filesystem::perms::others_all)) ==
+                std::filesystem::perms::none);
+    std::filesystem::remove(path);
+}

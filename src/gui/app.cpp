@@ -6,7 +6,6 @@
 #include "skywave_link/winlink_telnet_client.hpp"
 #include "skywave_link/b2f.hpp"
 #include "skywave_link/lzh.hpp"
-#include "skywave_link/chat_window.hpp"
 #include "skywave_link/file_window.hpp"
 #include "skywave_link/message_window.hpp"
 #include "skywave_link/position_window.hpp"
@@ -15,11 +14,15 @@
 #include "skywave_link/mail_window.hpp"
 #include "skywave_link/bbs_window.hpp"
 #include "skywave_link/frequency_window.hpp"
-#include "skywave_link/beacon_panel.hpp"
-#include "skywave_link/ping_panel.hpp"
 #include "skywave_link/main_content.hpp"
 #include "skywave_link/station_map_window.hpp"
 #include "skywave_link/modern_style.hpp"
+#include "skywave_link/nmea_parser.hpp"
+#include "skywave_link/gui_util.hpp"
+#include "skywave_link/notification_sound.hpp"
+
+#include "skywave_link/psk_reporter.hpp"
+
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -46,6 +49,7 @@
     #include <unistd.h>
     #include <fcntl.h>
     #include <termios.h>
+    #include <cerrno>
 #endif
 
 #include <SDL.h>
@@ -60,14 +64,10 @@
     #include <openssl/x509v3.h>
 #endif
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wc23-extensions"
-#endif
-#include <hamlib/riglist.h>
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
+
+// SKYWAVE_LINK_VERSION is PROJECT_VERSION, defined by CMake on
+// skywave_link_core (PUBLIC, so this target gets it too).
+
 
 namespace skylink {
 
@@ -135,78 +135,12 @@ std::string openNativeFolderDialog() {
 
 namespace {
 
-std::string trimSpaces(const std::string& input);
-std::string normalizeCallsign(const std::string& input);
-
-VoiceMode configVoiceMode(const std::string& value) {
-    const std::string upper = trimSpaces(value);
-    std::string norm = upper;
-    for (char& ch : norm) {
-        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    }
-    if (norm == "CONNECTED") return VoiceMode::Connected;
-    if (norm == "BROADCAST") return VoiceMode::Broadcast;
-    return VoiceMode::Off;
-}
+using gui::normalizeCallsign;
+using gui::normalizeModemFamily;
+using gui::normalizeRadioBackend;
 
 bool voiceLocalAudioEnabled(const VoiceConfig& config) {
-    return configVoiceMode(config.mode) != VoiceMode::Off;
-}
-
-std::string normalizeRadioBackend(const std::string& value) {
-    std::string norm = trimSpaces(value);
-    for (char& ch : norm) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    }
-    if (norm == "hamlib") {
-        return "hamlib";
-    }
-    if (norm == "kenwood tcp" || norm == "kenwood_tcp") {
-        return "kenwood_tcp";
-    }
-    return "none";
-}
-
-// Skywave bandwidth families (WAVEFORM.md): WIDE 2.4 kHz (default),
-// MID 1 kHz, NARROW 500 Hz, plus opt-in ULTRA 2.7 kHz.
-std::string normalizeModemFamily(const std::string& value) {
-    std::string norm = trimSpaces(value);
-    for (char& ch : norm) {
-        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    }
-    if (norm == "MID" || norm == "NARROW" || norm == "ULTRA") {
-        return norm;
-    }
-    return "WIDE";
-}
-
-RadioConfig materializeRadioConfigForController(const RadioConfig& source) {
-    RadioConfig cfg = source;
-    const std::string backend = normalizeRadioBackend(source.backend);
-
-    cfg.backend = backend;
-    if (backend == "hamlib") {
-        cfg.enabled = true;
-        return cfg;
-    }
-
-    if (backend == "kenwood_tcp") {
-        cfg.enabled = true;
-        cfg.hamlib_model = RIG_MODEL_F6K;
-        const std::string host = trimSpaces(source.kenwood_host);
-        if (host.empty()) {
-            cfg.device.clear();
-        } else {
-            cfg.device = host + ":" + std::to_string(source.kenwood_port);
-        }
-        cfg.baud = 0;
-        return cfg;
-    }
-
-    cfg.enabled = false;
-    cfg.hamlib_model = 0;
-    cfg.device.clear();
-    return cfg;
+    return gui::parseVoiceMode(config.mode) != VoiceMode::Off;
 }
 
 const char* liveVoiceCodecDisplayLabel(const std::string& codec) {
@@ -242,7 +176,7 @@ const char* voiceStateLabel(VoiceState state) {
 
 SDL_Scancode configuredVoiceHotkeyScancode(const std::string& hotkey) {
     constexpr char kScancodePrefix[] = "SCANCODE:";
-    const std::string trimmed = trimSpaces(hotkey);
+    const std::string trimmed = gui::trimCopy(hotkey);
     if (trimmed.empty()) {
         return SDL_SCANCODE_UNKNOWN;
     }
@@ -310,39 +244,6 @@ bool voiceStartReady(VoiceMode mode, LinkState link_state) {
         default:
             return false;
     }
-}
-
-// Configs written against the ancestor app's modem (ports 8300-8302, in
-// either command/data order) are migrated onto the Skywave defaults
-// 9100/9101/9102 (INTERFACES.md). Anything else the operator set is left
-// alone.
-bool normalizeLegacyModemPorts(AppConfig* config) {
-    if (!config) {
-        return false;
-    }
-
-    const bool legacy_ports =
-        config->modem.voice_port == 8302 &&
-        ((config->modem.command_port == 8301 && config->modem.data_port == 8300) ||
-         (config->modem.command_port == 8300 && config->modem.data_port == 8301));
-    if (legacy_ports) {
-        config->modem.command_port = kDefaultCommandPort;
-        config->modem.data_port = kDefaultDataPort;
-        config->modem.voice_port = kDefaultVoicePort;
-        return true;
-    }
-
-    return false;
-}
-
-std::string aprsPasscodeForConfig(const AppConfig& config) {
-    if (!config.aprs.passcode.empty()) {
-        return config.aprs.passcode;
-    }
-    if (config.station.callsign.empty()) {
-        return "-1";
-    }
-    return std::to_string(APRSClient::calculatePasscode(config.station.callsign));
 }
 
 constexpr uint8_t kPositionRelayAckMarker = 0xF3;
@@ -431,25 +332,8 @@ bool isLikelyHashId(const std::string& text) {
            std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
 }
 
-std::string trimSpaces(const std::string& input) {
-    const size_t start = input.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return "";
-    }
-    const size_t end = input.find_last_not_of(" \t\r\n");
-    return input.substr(start, end - start + 1);
-}
-
-std::string normalizeCallsign(const std::string& input) {
-    std::string out = trimSpaces(input);
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
-        return static_cast<char>(std::toupper(c));
-    });
-    return out;
-}
-
 bool looksLikeEmailAddress(const std::string& input) {
-    const std::string addr = trimSpaces(input);
+    const std::string addr = gui::trimCopy(input);
     const size_t at = addr.find('@');
     if (at == std::string::npos || at == 0 || at + 1 >= addr.size()) {
         return false;
@@ -479,12 +363,12 @@ int localHourFromUnix(int64_t unix_seconds) {
 std::string gatewayBandHourKey(const std::string& callsign,
                                const std::string& band,
                                int hour_local) {
-    return normalizeCallsign(callsign) + "|B:" + trimSpaces(band) +
+    return normalizeCallsign(callsign) + "|B:" + gui::trimCopy(band) +
            "|H:" + std::to_string((hour_local + 24) % 24);
 }
 
 std::string extractAddressForRelay(const std::string& raw_to) {
-    std::string addr = trimSpaces(raw_to);
+    std::string addr = gui::trimCopy(raw_to);
     const size_t lt = addr.find('<');
     if (lt != std::string::npos) {
         const size_t gt = addr.find('>', lt + 1);
@@ -496,7 +380,7 @@ std::string extractAddressForRelay(const std::string& raw_to) {
     if (comma != std::string::npos) {
         addr = addr.substr(0, comma);
     }
-    return trimSpaces(addr);
+    return gui::trimCopy(addr);
 }
 
 bool isLikelyCallsignAddress(const std::string& token) {
@@ -530,7 +414,7 @@ std::string deriveRadioRelayTarget(const std::string& raw_to) {
     }
 
     const std::string local = normalizeCallsign(addr.substr(0, at));
-    const std::string domain = lowerAscii(trimSpaces(addr.substr(at + 1)));
+    const std::string domain = lowerAscii(gui::trimCopy(addr.substr(at + 1)));
     if (local.empty()) {
         return "";
     }
@@ -678,7 +562,7 @@ std::string utcDateTimeString() {
 }
 
 std::pair<std::string, std::string> splitEmailAddress(const std::string& addr) {
-    const std::string trimmed = trimSpaces(addr);
+    const std::string trimmed = gui::trimCopy(addr);
     const size_t at = trimmed.find('@');
     if (at == std::string::npos || at == 0 || at + 1 >= trimmed.size()) {
         return {"", ""};
@@ -689,7 +573,7 @@ std::pair<std::string, std::string> splitEmailAddress(const std::string& addr) {
 std::vector<uint8_t> encodeWinlinkEnvelopePayload(const MailMessage& mail) {
     B2FHeader header;
     header.message_id = mail.message_id;
-    header.type = B2FMessageType::Traffic;
+    header.type = B2FMessageType::Private;
     header.from_callsign = normalizeCallsign(mail.from);
     header.subject = mail.subject;
     header.date_time = utcDateTimeString();
@@ -697,7 +581,7 @@ std::vector<uint8_t> encodeWinlinkEnvelopePayload(const MailMessage& mail) {
     if (looksLikeEmailAddress(mail.to)) {
         auto [local, domain] = splitEmailAddress(mail.to);
         header.to_callsign = local.empty() ? "EMAIL" : local;
-        header.to_address = local.empty() || domain.empty() ? trimSpaces(mail.to) : (local + "@" + domain);
+        header.to_address = local.empty() || domain.empty() ? gui::trimCopy(mail.to) : (local + "@" + domain);
     } else {
         header.to_callsign = normalizeCallsign(mail.to);
     }
@@ -723,7 +607,7 @@ bool decodeWinlinkEnvelopePayload(const std::string& payload,
         from_callsign = normalizeCallsign(header.from_callsign);
     }
     if (!header.to_address.empty()) {
-        to_field = trimSpaces(header.to_address);
+        to_field = gui::trimCopy(header.to_address);
     } else if (!header.to_callsign.empty()) {
         to_field = normalizeCallsign(header.to_callsign);
     }
@@ -807,31 +691,26 @@ MailMessage makeUiMailMessage(const Message& msg, bool read) {
     return mail;
 }
 
-bool isEmailGatewayConfigured(const AppConfig& config) {
-    if (!config.email.gateway_enabled) {
-        return false;
-    }
-    const bool smtp_ready = !trimSpaces(config.email.smtp_host).empty() &&
-                            !trimSpaces(config.email.smtp_username).empty();
+// An SMTP or Winlink account to deliver internet mail through.
+bool emailAccountConfigured(const AppConfig& config) {
+    const bool smtp_ready = !gui::trimCopy(config.email.smtp_host).empty() &&
+                            !gui::trimCopy(config.email.smtp_username).empty();
     const bool winlink_telnet_ready =
         config.email.winlink_telnet_enabled &&
-        !trimSpaces(config.email.winlink_telnet_host).empty() &&
+        !gui::trimCopy(config.email.winlink_telnet_host).empty() &&
         !normalizeCallsign(config.email.winlink_telnet_callsign).empty() &&
-        !trimSpaces(config.email.winlink_telnet_password).empty();
+        !gui::trimCopy(config.email.winlink_telnet_password).empty();
     return smtp_ready || winlink_telnet_ready;
 }
 
+// Acting as an email gateway for other stations: enabled and an account.
+bool isEmailGatewayConfigured(const AppConfig& config) {
+    return config.email.gateway_enabled && emailAccountConfigured(config);
+}
+
+// Fails closed: an empty allowlist lets nobody relay through this account.
 bool senderAllowedForGateway(const AppConfig& config, const std::string& from_callsign) {
-    if (config.email.allowed_relays.empty()) {
-        return true;
-    }
-    const std::string from = normalizeCallsign(from_callsign);
-    for (const auto& allowed : config.email.allowed_relays) {
-        if (normalizeCallsign(allowed) == from) {
-            return true;
-        }
-    }
-    return false;
+    return app_detail::relaySenderAllowed(config.email.allowed_relays, from_callsign);
 }
 
 bool stripBeaconCapability(std::string& text, const std::string& marker) {
@@ -840,7 +719,7 @@ bool stripBeaconCapability(std::string& text, const std::string& marker) {
         return false;
     }
     text.erase(pos, marker.size());
-    text = trimSpaces(text);
+    text = gui::trimCopy(text);
     return true;
 }
 
@@ -860,7 +739,7 @@ bool isLikelyCallsignToken(const std::string& token) {
 }
 
 std::pair<std::string, std::string> extractCallsignPrefix(const std::string& text) {
-    std::string trimmed = trimSpaces(text);
+    std::string trimmed = gui::trimCopy(text);
     if (trimmed.empty()) {
         return {"", ""};
     }
@@ -871,24 +750,18 @@ std::pair<std::string, std::string> extractCallsignPrefix(const std::string& tex
         return {"", trimmed};
     }
 
-    std::string rest = (split == std::string::npos) ? "" : trimSpaces(trimmed.substr(split + 1));
+    std::string rest = (split == std::string::npos) ? "" : gui::trimCopy(trimmed.substr(split + 1));
     return {normalizeCallsign(token), rest};
 }
 
-std::string toUpperAscii(std::string text) {
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-        return static_cast<char>(std::toupper(c));
-    });
-    return text;
-}
 
 std::string extractWeatherAlertField(const std::string& report, const std::string& key) {
     if (report.empty() || key.empty()) {
         return "";
     }
 
-    const std::string upper_report = toUpperAscii(report);
-    const std::string upper_key = toUpperAscii(key);
+    const std::string upper_report = gui::upperCopy(report);
+    const std::string upper_key = gui::upperCopy(key);
     const size_t key_pos = upper_report.find(upper_key);
     if (key_pos == std::string::npos) {
         return "";
@@ -922,16 +795,16 @@ std::string extractWeatherAlertField(const std::string& report, const std::strin
         ++end;
     }
 
-    return trimSpaces(report.substr(start, end - start));
+    return gui::trimCopy(report.substr(start, end - start));
 }
 
 std::string inferWeatherAlertSeverity(const std::string& report) {
     std::string severity = extractWeatherAlertField(report, "severity");
     if (!severity.empty()) {
-        return toUpperAscii(severity);
+        return gui::upperCopy(severity);
     }
 
-    const std::string upper_report = toUpperAscii(report);
+    const std::string upper_report = gui::upperCopy(report);
     if (upper_report.find("EXTREME") != std::string::npos) return "EXTREME";
     if (upper_report.find("SEVERE") != std::string::npos) return "SEVERE";
     if (upper_report.find("MODERATE") != std::string::npos) return "MODERATE";
@@ -1054,6 +927,7 @@ App::~App() {
 bool App::initialize() {
     // Load configuration, falling back to the legacy Skywave path if needed.
     std::string loaded_config_path = AppConfig::getDefaultConfigPath();
+    config_path_ = loaded_config_path;
     if (!config_.load(loaded_config_path)) {
         const std::string legacy_config_path = AppConfig::getLegacyConfigPath();
         if (legacy_config_path != loaded_config_path &&
@@ -1063,8 +937,7 @@ bool App::initialize() {
             }
         }
     }
-    normalizeLegacyModemPorts(&config_);
-    config_.voice.codec = "AUTO";
+    config_.voice.codec = gui::normalizeVoiceCodec(config_.voice.codec);
     config_.radio.backend = normalizeRadioBackend(config_.radio.backend);
 
     // Initialize SDL
@@ -1088,8 +961,19 @@ bool App::initialize() {
     aprs_ = std::make_unique<APRSClient>();
     file_transfer_mgr_ = std::make_unique<FileTransferManager>();
     mesh_relay_ = std::make_unique<MeshRelay>();
+
+    // Windows and the chat log exist before anything can report into them
+    // (store open, modem auto-connect, APRS, GPS, gateway start-up).
+    initializeSharedState();
+    initializeWindows();
+
     aprs_->onPositionReceived([this](const APRSPosition& pos) {
         onAprsPositionReceived(pos);
+    });
+    aprs_->onMessageReceived([this](const std::string& from, const std::string& message) {
+        appendSystemChat("[APRS] Message from " + app_detail::sanitizeRemoteText(from, 12) + ": " +
+                         app_detail::sanitizeRemoteText(message, 200));
+        playNotificationSound();
     });
 
     file_transfer_mgr_->setDownloadPath(config_.files.download_path);
@@ -1130,19 +1014,25 @@ bool App::initialize() {
             unread_file_notifications_++;
         }
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        if (success) {
-            msg.text = "File transfer complete: " + path;
+        if (success && found_progress && completed_progress.bbs_upload) {
+            const std::string peer = normalizeCallsign(completed_progress.remote_callsign);
+            if (incoming_success) {
+                // A remote station's upload into our BBS folder (K21).
+                appendSystemChat("[BBS] " + (peer.empty() ? std::string("A station") : peer) +
+                                 " uploaded " + completed_name + " to this BBS");
+                refreshBBSFiles();
+            } else {
+                appendSystemChat("[BBS] Upload of " + completed_name + " to " +
+                                 (peer.empty() ? std::string("the remote") : peer + "'s") +
+                                 " BBS complete");
+            }
+        } else if (success) {
+            appendSystemChat("File transfer complete: " + path);
         } else {
             const TransferProgress t = file_transfer_mgr_->getTransfer(transfer_id);
-            msg.text = "File transfer failed: " + path +
-                       (t.error_message.empty() ? std::string() : " (" + t.error_message + ")");
+            appendSystemChat("File transfer failed: " + path +
+                             (t.error_message.empty() ? std::string() : " (" + t.error_message + ")"));
         }
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
         if (incoming_success) {
             ChatMessage notice;
             notice.from = found_progress && !completed_progress.remote_callsign.empty()
@@ -1152,8 +1042,9 @@ bool App::initialize() {
             notice.text = "[FILE] Received " +
                           (completed_name.empty() ? std::string(path) : completed_name);
             notice.is_outgoing = false;
-            notice.timestamp = msg.timestamp;
+            notice.timestamp = unixNowSeconds();
             chat_history_.push_back(notice);
+            playNotificationSound();
         }
         chat_scroll_to_bottom_ = true;
         syncTransfersFromManager();
@@ -1177,30 +1068,32 @@ bool App::initialize() {
         }
         const char* verdict = accept ? " [accepted]" : " [awaiting your decision]";
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Incoming file offer from " + (normalized_from.empty() ? std::string("UNKNOWN") : normalized_from) +
-                   ": " + filename + " (" +
-                   std::to_string(size) + " bytes compressed)" + verdict;
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
+        appendSystemChat("Incoming file offer from " +
+                         (normalized_from.empty() ? std::string("UNKNOWN") : normalized_from) +
+                         ": " + filename + " (" + std::to_string(size) + " bytes compressed)" + verdict);
         ChatMessage visible;
         visible.from = normalized_from.empty() ? std::string("UNKNOWN") : normalized_from;
         visible.to = normalizeCallsign(config_.station.callsign);
         visible.text = "[FILE OFFER] " + filename + " (" + std::to_string(size) +
                        " bytes compressed)" + verdict;
         visible.is_outgoing = false;
-        visible.timestamp = msg.timestamp;
+        visible.timestamp = unixNowSeconds();
         chat_history_.push_back(visible);
         chat_scroll_to_bottom_ = true;
+        playNotificationSound();
         return accept ? FileOfferDecision::Accept : FileOfferDecision::Defer;
     });
 
     // Open message store relative to the active config directory when configured path is relative.
-    store_->open(resolveStorePath(loaded_config_path, config_.store.db_path));
+    const std::string store_path = resolveStorePath(loaded_config_path, config_.store.db_path);
+    if (!store_->open(store_path)) {
+        appendSystemChat("Message store could not be opened at " + store_path +
+                         ": mail, beacons and the email relay queue will NOT be saved this session");
+    }
+    // New undelivered mail gets an expiry (store.message_expiry_days; K22).
+    store_->setDefaultExpiryDays(config_.store.message_expiry_days);
     loadMailFromStore();
+    loadWeatherCache();
     // Internet-relay mail that was still waiting at the last exit.
     for (auto& msg : store_->loadInternetRelayQueue()) {
         msg.status = MessageStatus::Pending;
@@ -1233,7 +1126,6 @@ bool App::initialize() {
         onModemEvent(name, args);
     });
     modem_->onVoiceStatus([this](const VoiceStatus& status) {
-        voice_status_generation_++;
         if (status.mode != VoiceMode::Off && status.state != VoiceState::Idle) {
             voice_start_pending_ = false;
             voice_start_inflight_ = false;
@@ -1246,22 +1138,13 @@ bool App::initialize() {
     // Initialize UI state from config
     std::strncpy(callsign_input_, config_.station.callsign.c_str(), sizeof(callsign_input_) - 1);
     std::strncpy(modem_host_input_, config_.modem.host.c_str(), sizeof(modem_host_input_) - 1);
-    std::strncpy(voice_capture_device_input_, config_.voice.capture_device.c_str(),
-                 sizeof(voice_capture_device_input_) - 1);
-    std::strncpy(voice_playback_device_input_, config_.voice.playback_device.c_str(),
-                 sizeof(voice_playback_device_input_) - 1);
     modem_port_input_ = config_.modem.command_port;
-    voice_port_input_ = config_.modem.voice_port;
-    current_band_ = trimSpaces(config_.radio.default_band);
+    current_band_ = gui::trimCopy(config_.radio.default_band);
     if (current_band_.empty()) {
         current_band_ = "40m";
     }
-    if (freq_mgr_) {
-        const uint64_t calling_freq_hz = freq_mgr_->getCallingFrequency(current_band_);
-        if (calling_freq_hz > 0) {
-            current_frequency_hz_ = static_cast<uint32_t>(calling_freq_hz);
-        }
-    }
+    // The dial frequency is unknown until a rig reports it.
+    current_frequency_hz_ = 0;
     my_lat_ = config_.station.latitude;
     my_lon_ = config_.station.longitude;
     std::strncpy(position_comment_, config_.aprs.comment.c_str(), sizeof(position_comment_) - 1);
@@ -1276,23 +1159,12 @@ bool App::initialize() {
     }
 
     // Connect to APRS-IS if configured
-    if (config_.aprs.enabled) {
-        const std::string aprs_passcode = aprsPasscodeForConfig(config_);
-        // Connect + login run in the background (pollAPRSConnect()).
-        aprs_->beginConnect(config_.aprs.server, config_.aprs.port,
-                            config_.station.callsign, aprs_passcode);
-        aprs_->setMyPosition(config_.station.latitude, config_.station.longitude,
-                             config_.station.altitude_m);
-        aprs_->setMyComment(config_.aprs.comment);
-        aprs_->setMySymbol(config_.aprs.symbol_table, config_.aprs.symbol);
-        aprs_->setBeaconInterval(config_.aprs.beacon_interval_sec);
-        aprs_->enableBeaconing(true);
-    }
+    applyAPRSConfig();
 
     // Start GPS serial if configured so position reporting can use live coordinates.
     if (config_.aprs.gps_enabled && !config_.aprs.gps_port.empty()) {
         if (!openGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud)) {
-            std::cerr << "[GPS] Failed to open configured GPS port: " << config_.aprs.gps_port << "\n";
+            appendSystemChat("GPS: could not open the configured port " + config_.aprs.gps_port);
         }
     }
 
@@ -1303,6 +1175,10 @@ bool App::initialize() {
     last_poll_ = std::chrono::steady_clock::now();
     last_status_update_ = last_poll_;
     app_start_time_ = last_poll_;
+    last_outbox_retry_ = last_poll_;
+    last_mesh_prune_ = last_poll_;
+    // First maintenance pass shortly after start-up, then hourly.
+    next_store_maintenance_ = last_poll_ + std::chrono::seconds(60);
 
     const char* auto_exit_env = std::getenv("SKYWAVE_LINK_AUTO_EXIT_MS");
     if (auto_exit_env) {
@@ -1315,10 +1191,6 @@ bool App::initialize() {
             // Ignore invalid values.
         }
     }
-
-    // Initialize shared state and modular windows
-    initializeSharedState();
-    initializeWindows();
 
     loadTestScript();
     return true;
@@ -1424,7 +1296,7 @@ bool App::voiceAudioWanted() {
     // voice that may arrive at any time while listening.
     return modem_->getStatus().link_state == LinkState::Connected ||
            v.state != VoiceState::Idle || voice_start_pending_ ||
-           configVoiceMode(config_.voice.mode) == VoiceMode::Broadcast;
+           gui::parseVoiceMode(config_.voice.mode) == VoiceMode::Broadcast;
 }
 
 void App::updateVoiceAudioDevices() {
@@ -1442,7 +1314,7 @@ void App::updateVoiceAudioDevices() {
             if (job->capture != 0) SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(job->capture));
             if (job->playback != 0) SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(job->playback));
             if (!job->error.empty()) {
-                shared_state_.addSystemMessage("Voice audio unavailable (" + job->error +
+                appendSystemChat("Voice audio unavailable (" + job->error +
                                                "); retrying in 30 s");
                 voice_open_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
             }
@@ -1482,13 +1354,20 @@ void App::applyVoiceSettingsToModem(bool restart_if_open) {
     }
 
     const VoiceStatus current = modem_->getVoiceStatus();
-    const VoiceMode desired_mode = configVoiceMode(config_.voice.mode);
+    const VoiceMode desired_mode = gui::parseVoiceMode(config_.voice.mode);
     const bool was_open = current.state != VoiceState::Idle && current.mode != VoiceMode::Off;
     const bool mode_changed = current.mode != desired_mode;
     bool changed = false;
 
-    config_.voice.codec = "AUTO";
-    if (modem_->setVoiceCodec("AUTO")) {
+    config_.voice.codec = gui::normalizeVoiceCodec(config_.voice.codec);
+    // The configured Codec2 rate (VOICECODEC; AUTO lets the modem choose).
+    {
+        const std::string codec = config_.voice.codec;
+        modem_->sendCommandAsync("VOICECODEC " + codec, [this, codec](bool ok, const std::string& response) {
+            if (!ok) {
+                logCommandFailure("Could not set the voice codec to " + codec, "VOICECODEC", response);
+            }
+        });
         changed = true;
     }
     if (mode_changed && modem_->setVoiceMode(desired_mode)) {
@@ -1522,14 +1401,14 @@ void App::logCommandFailure(const std::string& what, const std::string& cmd,
     if (shutdown_done_ || (response.empty() && (!modem_ || !modem_->isConnected()))) {
         return;
     }
-    shared_state_.addSystemMessage(what + ": " + describeCommandError(cmd, response));
+    appendSystemChat(what + ": " + describeCommandError(cmd, response));
 }
 
 void App::setModemFamily(const std::string& family) {
     const std::string target = normalizeModemFamily(family);
     config_.modem.family = target;
     if (!modem_ || !modem_->isConnected()) {
-        shared_state_.addSystemMessage("Connect to the modem to change its bandwidth family");
+        appendSystemChat("Connect to the modem to change its bandwidth family");
         return;
     }
     // FAMILY is IDLE/LISTENING-only; ULTRA must be permitted (ULTRA ON)
@@ -1537,7 +1416,7 @@ void App::setModemFamily(const std::string& family) {
     // A refusal reverts the setting to what the modem actually runs.
     modem_->setFamily(target, [this, target](bool ok, const std::string& response) {
         if (ok) {
-            shared_state_.addSystemMessage("Modem bandwidth family set to " + target);
+            appendSystemChat("Modem bandwidth family set to " + target);
         } else {
             logCommandFailure("Could not switch the modem to " + target, "FAMILY " + target,
                               response);
@@ -1546,6 +1425,38 @@ void App::setModemFamily(const std::string& family) {
         syncFamilyFromModem();
         modem_->sendCommand("STATUS");
     });
+}
+
+// The modem keys the rig through this app's PTT server (INTERFACES.md
+// "PTT": PTTMETHOD TCP, PTTPORT host:port; KEY/UNKEY lines). Pushed on
+// every modem connect and whenever the radio settings are applied, so
+// the modem never keys a port nothing listens on.
+void App::pushPttSettingsToModem() {
+    if (!modem_ || !modem_->isConnected() || !radio_) {
+        return;
+    }
+    const RadioController::Status rs = radio_->getStatus();
+    if (!rs.ptt_server_running || rs.ptt_port == 0) {
+        if (config_.radio.ptt_server_enabled) {
+            appendSystemChat("PTT server is not running" +
+                             (rs.last_error.empty() ? std::string() : " (" + rs.last_error + ")") +
+                             ": the modem cannot key the radio through this app");
+        }
+        return;
+    }
+    std::string host = gui::trimCopy(rs.ptt_bind);
+    if (host.empty() || host == "0.0.0.0" || host == "::") {
+        host = "127.0.0.1";
+    }
+    const std::string endpoint = host + ":" + std::to_string(rs.ptt_port);
+    auto done = [this, endpoint](bool ok, const std::string& response) {
+        if (ok) {
+            appendSystemChat("Modem keys the radio through this app's PTT server at " + endpoint);
+        } else {
+            logCommandFailure("Could not point the modem's PTT at " + endpoint, "PTTMETHOD/PTTPORT", response);
+        }
+    };
+    (void)modem_->usePttServer(host, rs.ptt_port, done);
 }
 
 void App::syncFamilyFromModem() {
@@ -1558,6 +1469,28 @@ void App::syncFamilyFromModem() {
         }
         config_.modem.family = normalizeModemFamily(response.substr(7));
     });
+}
+
+// Counts refused uplink records and says so, rate-limited: a full backlog
+// means the modem is not draining the voice socket, a closed one that the
+// voice media connection is gone (it is reopened from poll()).
+void App::noteVoiceSendResult(bool queued) {
+    if (queued) {
+        return;
+    }
+    ++voice_tx_dropped_;
+    const auto now = std::chrono::steady_clock::now();
+    if (voice_tx_drop_reported_at_.time_since_epoch().count() != 0 &&
+        now - voice_tx_drop_reported_at_ < std::chrono::seconds(10)) {
+        return;
+    }
+    const uint64_t fresh = voice_tx_dropped_ - voice_tx_dropped_reported_;
+    voice_tx_dropped_reported_ = voice_tx_dropped_;
+    voice_tx_drop_reported_at_ = now;
+    appendSystemChat("Voice: " + std::to_string(fresh) + " audio frame(s) not sent (" +
+                     std::string(modem_ && modem_->hasVoiceMedia() ? "modem voice backlog full"
+                                                                   : "voice media socket closed") +
+                     "); " + std::to_string(voice_tx_dropped_) + " dropped this session");
 }
 
 void App::pumpVoiceAudio() {
@@ -1592,7 +1525,7 @@ void App::pumpVoiceAudio() {
                 scaled = std::clamp(scaled, -32768.0f, 32767.0f);
                 pcm[i] = static_cast<int16_t>(scaled);
             }
-            (void)modem_->sendVoicePcm(pcm.data(), pcm.size());
+            noteVoiceSendResult(modem_->sendVoicePcm(pcm.data(), pcm.size()));
             queued_local_pcm = true;
         }
     } else if (voice_audio_ready_ && voice_capture_device_id_ != 0) {
@@ -1603,7 +1536,7 @@ void App::pumpVoiceAudio() {
         !queued_local_pcm &&
         voice.tx_queued < 320) {
         static const int16_t silence_frame[320] = { 0 };
-        (void)modem_->sendVoicePcm(silence_frame, 320);
+        noteVoiceSendResult(modem_->sendVoicePcm(silence_frame, 320));
     }
 
     if (voice_audio_ready_ && voice_playback_device_id_ != 0) {
@@ -1715,23 +1648,16 @@ void App::initializeSharedState() {
     shared_state_.freq_mgr = freq_mgr_.get();
     shared_state_.aprs = aprs_.get();
     shared_state_.file_transfer_mgr = file_transfer_mgr_.get();
+    shared_state_.mesh_relay = mesh_relay_.get();
 
     shared_state_.current_tab = &current_tab_;
     shared_state_.show_settings = &show_settings_;
-    shared_state_.running = &running_;
 
     shared_state_.chat_history = &chat_history_;
     shared_state_.chat_input = chat_input_;
     shared_state_.chat_input_size = sizeof(chat_input_);
     shared_state_.current_chat_partner = &current_chat_partner_;
     shared_state_.chat_scroll_to_bottom = &chat_scroll_to_bottom_;
-
-    shared_state_.remote_is_typing = &remote_is_typing_;
-    shared_state_.last_typing_indicator = &last_typing_indicator_;
-    shared_state_.last_typing_sent = &last_typing_sent_;
-    shared_state_.last_input_was_empty = &last_input_was_empty_;
-
-    shared_state_.outgoing_fragment_counter = &outgoing_fragment_counter_;
 
     shared_state_.transfers = &transfers_;
     shared_state_.unread_file_notifications = &unread_file_notifications_;
@@ -1758,7 +1684,7 @@ void App::initializeSharedState() {
     shared_state_.cq_current_repeat = &cq_current_repeat_;
     shared_state_.broadcast_message = broadcast_message_;
     shared_state_.broadcast_message_size = sizeof(broadcast_message_);
-    shared_state_.heard_stations = &heard_stations_;
+    shared_state_.heard_calls = &heard_calls_;
 
     shared_state_.channel_sniffer_active = &channel_sniffer_active_;
     shared_state_.sniffer_current_slot = &sniffer_current_slot_;
@@ -1768,14 +1694,11 @@ void App::initializeSharedState() {
     shared_state_.gps_port = &gps_port_;
     shared_state_.gps_baud = &gps_baud_;
 
-    shared_state_.email_outbox = &email_outbox_;
-    shared_state_.radio_outbox = &radio_outbox_;
     shared_state_.email_gateway_active = &email_gateway_active_;
     shared_state_.relay_diagnostics = &relay_diagnostics_;
 
     shared_state_.bbs_files = &bbs_files_;
     shared_state_.pending_bbs_downloads = &pending_bbs_downloads_ui_;
-    shared_state_.selected_bbs_file = &selected_bbs_file_;
     shared_state_.bbs_upload_path = bbs_upload_path_;
     shared_state_.bbs_upload_path_size = sizeof(bbs_upload_path_);
     shared_state_.bbs_file_desc = bbs_file_desc_;
@@ -1794,16 +1717,12 @@ void App::initializeSharedState() {
     shared_state_.station_locations = &station_locations_;
 
     shared_state_.qso_active = &qso_active_;
-    shared_state_.remote_snr_db = &remote_snr_db_;
-    shared_state_.local_snr_db = &local_snr_db_;
-    shared_state_.snr_exchanged = &snr_exchanged_;
     shared_state_.qso_start_time = &qso_start_time_;
 
     shared_state_.away_mode_active = &away_mode_active_;
 
     shared_state_.ping_results = &ping_results_;
     shared_state_.ping_in_progress = &ping_in_progress_;
-    shared_state_.ping_target = &ping_target_;
 
     shared_state_.mail_inbox = &mail_inbox_;
     shared_state_.mail_outbox = &mail_outbox_;
@@ -1825,17 +1744,13 @@ void App::initializeSharedState() {
     shared_state_.weather_zone_input_size = sizeof(weather_zone_input_);
     shared_state_.weather_request_pending = &weather_request_pending_;
     shared_state_.weather_request_time = &weather_request_time_;
-    shared_state_.weather_fetch_mutex = &weather_fetch_mutex_;
-    shared_state_.pending_weather_fetch = &pending_weather_fetch_;
 
-    shared_state_.psk_reporter_queue = &psk_reporter_queue_;
-    shared_state_.psk_reporter_mutex = &psk_reporter_mutex_;
+    shared_state_.psk_status = &psk_status_;
     shared_state_.current_frequency_hz = &current_frequency_hz_;
 }
 
 void App::initializeWindows() {
     // Create all modular windows
-    chat_window_ = std::make_unique<ChatWindow>(shared_state_);
     file_window_ = std::make_unique<FileWindow>(shared_state_);
     message_window_ = std::make_unique<MessageWindow>(shared_state_);
     position_window_ = std::make_unique<PositionWindow>(shared_state_);
@@ -1844,22 +1759,18 @@ void App::initializeWindows() {
     mail_window_ = std::make_unique<MailWindow>(shared_state_);
     bbs_window_ = std::make_unique<BBSWindow>(shared_state_);
     frequency_window_ = std::make_unique<FrequencyWindow>(shared_state_);
-    beacon_panel_ = std::make_unique<BeaconPanel>(shared_state_);
-    ping_panel_ = std::make_unique<PingPanel>(shared_state_);
     main_content_ = std::make_unique<MainContentRenderer>(shared_state_);
     station_map_window_ = std::make_unique<StationMapWindow>(shared_state_);
 
-    // Wire up callbacks for ChatWindow
-    chat_window_->onSendMessage = [this](const std::string& text) { sendChatMessage(text); };
-    chat_window_->onSendTypingIndicator = [this]() { sendTypingIndicator(); };
-    chat_window_->onStartCQ = [this]() { startCQ(); };
-    chat_window_->onStopCQ = [this]() { stopCQ(); };
-    chat_window_->onSendBroadcast = [this](const std::string& msg) { sendBroadcast(msg); };
-    chat_window_->onConnectToStation = [this](const std::string& cs) { connectToStation(cs); };
-    chat_window_->onSendPing = [this](const std::string& cs) { sendPing(cs); };
-
     // Wire up callbacks for FileWindow
     file_window_->onSendFile = [this](const std::string& path) { sendFile(path); };
+    file_window_->onCancelTransfer = [this](const std::string& transfer_id) {
+        if (!file_transfer_mgr_ || !modem_) {
+            return;
+        }
+        file_transfer_mgr_->cancelTransfer(*modem_, transfer_id);
+        syncTransfersFromManager();
+    };
 #ifdef __APPLE__
     file_window_->onOpenFileDialog = [this](PathPickedCallback done) {
         startPathPicker(false, std::move(done));
@@ -1868,27 +1779,18 @@ void App::initializeWindows() {
 
     // Wire up callbacks for MessageWindow
     message_window_->onRefreshMessages = [this]() { refreshMessages(); };
-    message_window_->onSendEmail = [this](const std::string& to, const std::string& subj,
-                                          const std::string& body, const std::string& from) {
-        Message email;
-        email.type = MessageType::Email;
-        email.status = MessageStatus::Pending;
-        email.from_callsign = from;
-        email.to_callsign = to;
-        email.subject = subj;
-        email.body = body;
-        email.created_at = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        if (store_) {
-            email.id = store_->createMessage(email);
-            relayRadioToEmail(email);
-        }
+    // True only when the email was validated and queued.
+    message_window_->onQueueEmail = [this](const std::string& to, const std::string& subj,
+                                           const std::string& body, const std::string& from,
+                                           std::string& error) {
+        return queueOutgoingEmail(to, subj, body, from, &error);
     };
     message_window_->onDeleteMessage = [this](int64_t message_store_id) {
         if (message_store_id <= 0) {
             return;
         }
         if (!deleteStoredMessage(message_store_id, "")) {
+            appendSystemChat("Could not delete message " + std::to_string(message_store_id));
             return;
         }
 
@@ -1897,20 +1799,21 @@ void App::initializeWindows() {
         if (selected_message_ >= static_cast<int>(inbox_messages_.size())) {
             selected_message_ = static_cast<int>(inbox_messages_.size()) - 1;
         }
-
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Deleted message " + std::to_string(message_store_id);
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Deleted message " + std::to_string(message_store_id));
     };
 
     // Wire up callbacks for PositionWindow
     position_window_->onUpdatePosition = [this](double lat, double lon) { updatePosition(lat, lon); };
     position_window_->onSendBroadcastPayload = [this](const std::vector<uint8_t>& data) {
         return sendBroadcastPayload(data);
+    };
+    position_window_->onAPRSConnect = [this]() {
+        config_.aprs.enabled = true;
+        applyAPRSConfig();
+    };
+    position_window_->onAPRSDisconnect = [this]() {
+        config_.aprs.enabled = false;
+        applyAPRSConfig();
     };
 
     // Wire up callbacks for SettingsWindow
@@ -1919,22 +1822,34 @@ void App::initializeWindows() {
     settings_window_->onApplyModemConfig = [this]() { applyModemSettingsToModem(); };
     settings_window_->onSetModemFamily = [this](const std::string& family) { setModemFamily(family); };
     settings_window_->onApplyCallsign = [this](const std::string& callsign) {
+        // Mail is filed by callsign: save what is in memory, then reload
+        // the mailboxes under the new call.
+        saveMailToStore();
         config_.station.callsign = callsign;
+        loadMailFromStore();
+        refreshMessages();
         const std::string call = normalizeCallsign(callsign);
-        if (!modem_ || !modem_->isConnected() || call.empty()) {
+        if (call.empty()) {
+            appendSystemChat("Callsign cleared: mail and calls need a callsign");
+            return;
+        }
+        if (!modem_ || !modem_->isConnected()) {
+            appendSystemChat("Callsign set to " + call + " (sent to the modem when it connects)");
             return;
         }
         modem_->setCallsign(call, [this, call](bool ok, const std::string& response) {
             if (ok) {
-                shared_state_.addSystemMessage("Modem callsign set to " + call);
+                appendSystemChat("Modem callsign set to " + call);
             } else {
                 logCommandFailure("Could not set callsign " + call, "MYCALL", response);
             }
         });
     };
-    settings_window_->onSaveConfig = [this]() { config_.save(AppConfig::getDefaultConfigPath()); };
     settings_window_->onOpenGPSPort = [this](const std::string& port, int baud) {
-        return openGPSPort(port, baud);
+        const bool ok = openGPSPort(port, baud);
+        appendSystemChat(ok ? "GPS port " + port + " opened (" + std::to_string(baud) + " baud)"
+                            : "GPS: could not open " + port);
+        return ok;
     };
     settings_window_->onCloseGPSPort = [this]() { closeGPSPort(); };
     settings_window_->onStartEmailGateway = [this]() { startEmailGateway(); };
@@ -1982,6 +1897,21 @@ void App::initializeWindows() {
         closeVoiceAudioDevices();
         (void)openVoiceAudioDevices();
     };
+    settings_window_->onSendBeacon = [this]() { sendBeacon(); };
+    settings_window_->onEnableAwayMode = [this]() { enableAwayMode(); };
+    settings_window_->onDisableAwayMode = [this]() { disableAwayMode(); };
+    settings_window_->onUploadPSKReporterSpots = [this]() { uploadPSKReporterSpots(); };
+    settings_window_->onSetupStyle = [this]() { setupStyle(); };
+    settings_window_->onApplyAPRSConfig = [this]() { applyAPRSConfig(); };
+    settings_window_->onSaveSettings = [this](std::string& error) {
+        const std::string path = config_path_.empty() ? AppConfig::getDefaultConfigPath() : config_path_;
+        if (saveConfig(false)) {
+            return true;
+        }
+        error = "could not write " + path;
+        return false;
+    };
+    settings_window_->aprs_filter = &config_.aprs.filter;
 #ifdef __APPLE__
     settings_window_->onBrowseDownloadPath = [this](PathPickedCallback done) {
         startPathPicker(true, std::move(done));
@@ -1995,6 +1925,10 @@ void App::initializeWindows() {
     weather_window_->onRequestTAF = [this](const std::string& code) { requestTAF(code); };
     weather_window_->onRequestMarine = [this](const std::string& zone) { requestMarineWeather(zone); };
     weather_window_->onCheckStationLink = [this](bool refresh) { return isStationLinkConnected(refresh); };
+    weather_window_->onCancelWeatherRequest = [this]() { cancelWeatherRequest(); };
+    // The App owns the one request timeout; the window shows its countdown.
+    weather_window_->timeout_seconds = WEATHER_TIMEOUT_MS / 1000;
+    weather_window_->onRequestAlerts = [this](const std::string& loc) { requestWeatherAlerts(loc); };
 
     // Wire up callbacks for MailWindow
     mail_window_->onSendMail = [this](const std::string& to, const std::string& subj, const std::string& body) {
@@ -2032,19 +1966,18 @@ void App::initializeWindows() {
         }
 
         if (deleted) {
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = std::string("Deleted ") + (outgoing ? "sent" : "received") + " mail";
-            msg.is_outgoing = false;
-            msg.timestamp = unixNowSeconds();
-            chat_history_.push_back(msg);
-            chat_scroll_to_bottom_ = true;
+            appendSystemChat(std::string("Deleted ") + (outgoing ? "sent" : "received") + " mail");
+        } else if (store_id > 0 || !message_id.empty()) {
+            appendSystemChat("Mail removed from the list, but the stored copy could not be deleted");
         }
     };
 
     // Wire up callbacks for BBSWindow
     bbs_window_->onRefreshFiles = [this]() { refreshBBSFiles(); };
     bbs_window_->onUpload = [this](const std::string& path, const std::string& desc) { uploadToBBS(path, desc); };
+    bbs_window_->onUploadToRemote = [this](const std::string& path) {
+        return sendFile(path, FileOfferKind::BbsUpload);
+    };
     bbs_window_->onDownload = [this](const BBSFile& file) { downloadFromBBS(file); };
     bbs_window_->onDelete = [this](const std::string& name) { deleteBBSFile(name); };
 #ifdef __APPLE__
@@ -2063,11 +1996,6 @@ void App::initializeWindows() {
         respondToQsySuggestion(accept);
     };
 
-    // Wire up callbacks for BeaconPanel and PingPanel
-    beacon_panel_->onSendBeacon = [this]() { sendBeacon(); };
-    beacon_panel_->onConnectToStation = [this](const std::string& cs) { connectToStation(cs); };
-    ping_panel_->onSendPing = [this](const std::string& cs) { sendPing(cs); };
-
     // Wire up callbacks for MainContentRenderer
     main_content_->onConnectModem = [this]() { connectToModem(); };
     main_content_->onDisconnectModem = [this]() { disconnectFromModem(); };
@@ -2081,17 +2009,38 @@ void App::initializeWindows() {
         voice_ui_ptt_active_ = enabled;
         (void)setVoicePttState(voice_ui_ptt_active_ || voice_hotkey_ptt_active_);
     };
-    main_content_->onSendChatMessage = [this](const std::string& text) { sendChatMessage(text); };
-    main_content_->onSendTypingIndicator = [this]() { sendTypingIndicator(); };
+    // Returns false (and says why in the log) when the line was not sent,
+    // so the input can be kept.
+    main_content_->onSendChatMessage = [this](const std::string& text) { return sendChatMessage(text); };
     main_content_->onSendBroadcast = [this](const std::string& msg) { sendBroadcast(msg); };
     main_content_->onSendBroadcastPayload = [this](const std::vector<uint8_t>& data) {
         return sendBroadcastPayload(data);
     };
-    main_content_->onSetFrequency = [this](uint64_t freq) {
-        if (modem_ && modem_->isConnected()) {
-            tuneOperatingFrequency(freq);
+    // G8: the window's tuning callback; the window keeps its band choice
+    // only when this returns true.
+    main_content_->onTuneFrequency = [this](uint64_t freq) {
+        std::string why;
+        if (tuneOperatingFrequency(freq, false, &why)) {
+            appendSystemChat("Radio tuned to " + std::to_string(freq / 1000.0).substr(0, 8) + " kHz");
+            return true;
         }
+        appendSystemChat("Radio NOT tuned to " + std::to_string(freq / 1000.0).substr(0, 8) + " kHz: " + why);
+        return false;
     };
+}
+
+bool App::saveConfig(bool announce) {
+    const std::string path = config_path_.empty() ? AppConfig::getDefaultConfigPath() : config_path_;
+    const bool ok = config_.save(path);
+    if (!ok) {
+        std::cerr << "[Config] Could not save settings to " << path << "\n";
+    }
+    if (announce) {
+        appendSystemChat(ok ? "Settings saved to " + path
+                            : "Settings could NOT be saved to " + path +
+                                  " (check that the folder exists and is writable)");
+    }
+    return ok;
 }
 
 void App::run() {
@@ -2155,8 +2104,8 @@ void App::shutdown() {
 
     saveMailToStore();
 
-    // Save config
-    config_.save(AppConfig::getDefaultConfigPath());
+    // Save config (the window is already hidden: a failure goes to stderr).
+    (void)saveConfig(false);
 
     // Gracefully tear down active radio link before dropping TCP sockets.
     gracefulDisconnectModem();
@@ -2238,6 +2187,9 @@ void App::processEvents() {
     while (SDL_PollEvent(&event)) {
         ImGui_ImplSDL2_ProcessEvent(&event);
 
+        if (event.type == SDL_KEYDOWN && handleShortcutKey(event.key)) {
+            continue;
+        }
         if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
             if (handleVoiceHotkeyEvent(event.key, event.type == SDL_KEYDOWN)) {
                 continue;
@@ -2276,7 +2228,7 @@ bool App::setVoicePttState(bool enabled) {
     }
 
     const VoiceStatus voice = modem_->getVoiceStatus();
-    const VoiceMode desired_mode = configVoiceMode(config_.voice.mode);
+    const VoiceMode desired_mode = gui::parseVoiceMode(config_.voice.mode);
     const LinkState link_state = modem_->getStatus().link_state;
 
     if (!enabled) {
@@ -2336,6 +2288,30 @@ bool App::setVoicePttState(bool enabled) {
     voice_ptt_after_start_ = true;
     voice_local_ptt_ = true;
     return true;
+}
+
+// Menu shortcuts: Cmd+, / Cmd+Q on macOS, Ctrl+, / Ctrl+Q elsewhere.
+bool App::handleShortcutKey(const SDL_KeyboardEvent& key) {
+    if (key.repeat != 0 || voice_hotkey_capture_active_) {
+        return false;
+    }
+#ifdef __APPLE__
+    const bool primary = (key.keysym.mod & KMOD_GUI) != 0;
+#else
+    const bool primary = (key.keysym.mod & KMOD_CTRL) != 0;
+#endif
+    if (!primary || (key.keysym.mod & (KMOD_SHIFT | KMOD_ALT)) != 0) {
+        return false;
+    }
+    if (key.keysym.sym == SDLK_COMMA) {
+        show_settings_ = true;
+        return true;
+    }
+    if (key.keysym.sym == SDLK_q) {
+        running_ = false;
+        return true;
+    }
+    return false;
 }
 
 bool App::handleVoiceHotkeyEvent(const SDL_KeyboardEvent& key, bool pressed) {
@@ -2399,6 +2375,11 @@ void App::update() {
         if (modem_) modem_->poll();
         if (aprs_) aprs_->poll();
         last_poll_ = now;
+        // The displayed dial frequency is the rig's, or unknown (0).
+        const auto dial = knownDialFrequencyHz();
+        current_frequency_hz_ = dial && *dial <= std::numeric_limits<uint32_t>::max()
+                                    ? static_cast<uint32_t>(*dial)
+                                    : 0;
     }
 
     // Keep link-state fresh for UI/actions that depend on station connection.
@@ -2454,7 +2435,7 @@ void App::update() {
         }
 
         const VoiceStatus voice = modem_->getVoiceStatus();
-        const VoiceMode desired_mode = configVoiceMode(config_.voice.mode);
+        const VoiceMode desired_mode = gui::parseVoiceMode(config_.voice.mode);
         const LinkState link_state = modem_->getStatus().link_state;
         const bool voice_open =
             desired_mode != VoiceMode::Off &&
@@ -2555,6 +2536,15 @@ void App::update() {
         file_transfer_mgr_->setDownloadPath(config_.files.download_path);
         file_transfer_mgr_->setAutoAccept(config_.files.auto_accept);
         file_transfer_mgr_->setTrustedCallsigns(config_.files.trusted_callsigns);
+        file_transfer_mgr_->setMaxFileSize(config_.files.max_file_size);
+        // Remote uploads into the BBS folder (K21): allow_uploads AND the
+        // sender in allowed_uploaders, within max_upload_size.
+        BbsUploadPolicy policy;
+        policy.allow_uploads = config_.bbs.allow_uploads && config_.bbs.enabled;
+        policy.directory = config_.bbs.bbs_path;
+        policy.allowed_uploaders = config_.bbs.allowed_uploaders;
+        policy.max_upload_size = config_.bbs.max_upload_size;
+        file_transfer_mgr_->setBbsUploadPolicy(policy);
         file_transfer_mgr_->update(*modem_);
     }
 
@@ -2571,11 +2561,6 @@ void App::update() {
     // Update ping timeout
     updatePing();
 
-    // Keep SNR telemetry fresh for adaptive link decisions (currently disabled).
-    if (SNR_KEEPALIVE_ENABLED) {
-        updateSNRKeepAlive();
-    }
-
     // Update channel sniffer if active
     updateChannelSniffer();
 
@@ -2585,6 +2570,13 @@ void App::update() {
     // Update email gateway if active
     pollEmailGatewayJob();
     updateEmailGateway();
+    // Outbound internet mail has its own retry timer: an SMTP-only gateway
+    // never fetches, so the fetch schedule alone would never send it.
+    if (email_gateway_active_ && !email_outbox_.empty() &&
+        now - last_outbox_retry_ >= std::chrono::seconds(EMAIL_OUTBOX_RETRY_SEC)) {
+        last_outbox_retry_ = now;
+        sendQueuedEmails();
+    }
 
     // Update PSK Reporter uploads
     updatePSKReporter();
@@ -2592,22 +2584,36 @@ void App::update() {
     // Process completed async weather fetches
     processWeatherFetchResult();
 
-    // Check weather request timeout
-    if (weather_request_pending_) {
-        auto weather_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - weather_request_time_);
-        if (weather_elapsed.count() > WEATHER_TIMEOUT_MS) {
-            weather_request_pending_ = false;
+    // The one weather request timeout: the weather window watches
+    // weather_request_pending and offers Retry when it ends without a report.
+    if (weather_request_pending_ &&
+        now - weather_request_time_ > std::chrono::milliseconds(WEATHER_TIMEOUT_MS)) {
+        weather_request_pending_ = false;
+        appendSystemChat("Weather request timed out after " + std::to_string(WEATHER_TIMEOUT_MS / 1000) +
+                         " s (the linked station may have no internet access)");
+    }
 
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = "Weather request timed out";
-            msg.is_outgoing = false;
-            msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            chat_history_.push_back(msg);
-            chat_scroll_to_bottom_ = true;
-        }
+    // Window-side per-frame work (WindowBase::update).
+    if (weather_window_) weather_window_->update();
+    if (file_window_) file_window_->update();
+    if (message_window_) message_window_->update();
+    if (position_window_) position_window_->update();
+    if (settings_window_) settings_window_->update();
+    if (mail_window_) mail_window_->update();
+    if (bbs_window_) bbs_window_->update();
+    if (frequency_window_) frequency_window_->update();
+    if (station_map_window_) station_map_window_->update();
+
+    // Learned mesh routes expire.
+    if (mesh_relay_ && now - last_mesh_prune_ >= std::chrono::seconds(60)) {
+        last_mesh_prune_ = now;
+        mesh_relay_->pruneStaleRoutes(MESH_ROUTE_MAX_AGE_SEC);
+    }
+
+    // Periodic message-store maintenance (store.auto_cleanup).
+    if (now >= next_store_maintenance_) {
+        next_store_maintenance_ = now + std::chrono::hours(1);
+        runStoreMaintenance();
     }
 
     pruneFragmentBuffers();
@@ -2625,6 +2631,33 @@ void App::update() {
         if (alive_ms.count() >= auto_exit_after_ms_) {
             running_ = false;
         }
+    }
+}
+
+// Hourly when store.auto_cleanup is on: undelivered outgoing mail older
+// than store.message_expiry_days is marked expired (and said so), old
+// beacon/ping/weather history is trimmed, and the database is compacted
+// once a week.
+void App::runStoreMaintenance() {
+    if (!store_ || !store_->isOpen()) {
+        return;
+    }
+    const int64_t now = unixNowSeconds();
+    const int expiry_days = std::clamp(config_.store.message_expiry_days, 1, 3650);
+
+    MaintenancePolicy policy;
+    policy.message_expiry_days = expiry_days;
+    policy.max_pending_messages = config_.store.max_pending_messages;
+    policy.auto_cleanup = config_.store.auto_cleanup;
+    const auto report = store_->runMaintenance(policy, now);
+    const int expired = report.expired + report.trimmed;
+    if (expired > 0 || report.deleted_messages > 0) {
+        // The store changed under the mailboxes: show what it holds.
+        loadMailFromStore();
+    }
+    if (expired > 0) {
+        appendSystemChat(std::to_string(expired) + " undelivered mail(s) expired (older than " +
+                         std::to_string(expiry_days) + " days, or over the pending limit)");
     }
 }
 
@@ -2857,11 +2890,21 @@ void App::renderMenuBar() {
 
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Settings", "Ctrl+,")) {
+#ifdef __APPLE__
+            constexpr const char* kSettingsShortcut = "Cmd+,";
+            constexpr const char* kQuitShortcut = "Cmd+Q";
+#else
+            constexpr const char* kSettingsShortcut = "Ctrl+,";
+            constexpr const char* kQuitShortcut = "Ctrl+Q";
+#endif
+            if (ImGui::MenuItem("Settings", kSettingsShortcut)) {
                 show_settings_ = true;
             }
+            if (ImGui::MenuItem("Save Settings")) {
+                (void)saveConfig(true);
+            }
             ImGui::Separator();
-            if (ImGui::MenuItem("Quit", "Ctrl+Q")) {
+            if (ImGui::MenuItem("Quit", kQuitShortcut)) {
                 running_ = false;
             }
             ImGui::EndMenu();
@@ -2916,7 +2959,7 @@ void App::renderMenuBar() {
             ImGui::Text("Skywave Link");
             ImGui::Separator();
             ImGui::Text("HF Digital Communications Application");
-            ImGui::Text("Version 1.0.0");
+            ImGui::Text("Version %s", SKYWAVE_LINK_VERSION);
             ImGui::Spacing();
             ImGui::Text("A peer-to-peer digital messaging system for");
             ImGui::Text("amateur radio operators using the Skywave modem.");
@@ -3047,97 +3090,6 @@ void App::renderStatusBar() {
     ImGui::EndChild();  // End StatusBar
 }
 
-std::vector<std::pair<std::string, float>> App::computeBandRecommendations() const {
-    std::vector<std::pair<std::string, float>> ranked;
-    if (!store_ || !store_->isOpen()) {
-        return ranked;
-    }
-
-    struct Accum {
-        double weighted_snr = 0.0;
-        double total_weight = 0.0;
-        double weighted_prop = 0.0;
-        double prop_weight = 0.0;
-    };
-    std::map<std::string, Accum> by_band;
-
-    const int64_t now = unixNowSeconds();
-    std::time_t now_t = static_cast<std::time_t>(now);
-    std::tm now_tm = *std::localtime(&now_t);
-    const int now_hour = now_tm.tm_hour;
-
-    auto beacons = store_->loadRecentBeacons(400);
-    for (const auto& b : beacons) {
-        if (b.band.empty()) {
-            continue;
-        }
-        const int64_t age_sec = std::max<int64_t>(0, now - b.timestamp);
-        const double age_hours = static_cast<double>(age_sec) / 3600.0;
-        std::time_t ts = static_cast<std::time_t>(b.timestamp);
-        std::tm tm = *std::localtime(&ts);
-        int hour_diff = std::abs(now_hour - tm.tm_hour);
-        hour_diff = std::min(hour_diff, 24 - hour_diff);
-
-        const double time_weight = 1.0 / (1.0 + static_cast<double>(hour_diff));
-        const double decay_weight = std::exp(-age_hours / 24.0);
-        const double weight = time_weight * decay_weight;
-
-        auto& acc = by_band[b.band];
-        acc.weighted_snr += static_cast<double>(b.snr_db) * weight;
-        acc.total_weight += weight;
-        if (freq_mgr_ &&
-            !config_.station.grid_square.empty() &&
-            !b.grid_square.empty()) {
-            auto est = FrequencyManager::estimatePropagationWindow(
-                config_.station.grid_square,
-                b.grid_square,
-                now_hour);
-            if (est.valid) {
-                acc.weighted_prop += freq_mgr_->scoreBandForPropagation(b.band, est) * weight;
-                acc.prop_weight += weight;
-            }
-        }
-    }
-
-    auto pings = store_->loadRecentPings(400);
-    for (const auto& p : pings) {
-        if (p.band.empty()) {
-            continue;
-        }
-        const int64_t age_sec = std::max<int64_t>(0, now - p.timestamp);
-        const double age_hours = static_cast<double>(age_sec) / 3600.0;
-        std::time_t ts = static_cast<std::time_t>(p.timestamp);
-        std::tm tm = *std::localtime(&ts);
-        int hour_diff = std::abs(now_hour - tm.tm_hour);
-        hour_diff = std::min(hour_diff, 24 - hour_diff);
-
-        const double time_weight = 1.0 / (1.0 + static_cast<double>(hour_diff));
-        const double decay_weight = std::exp(-age_hours / 12.0);
-        const double weight = 0.5 * time_weight * decay_weight;
-        const double snr = p.online ? p.snr_db : -20.0;
-
-        auto& acc = by_band[p.band];
-        acc.weighted_snr += snr * weight;
-        acc.total_weight += weight;
-    }
-
-    for (const auto& entry : by_band) {
-        const auto& band = entry.first;
-        const auto& acc = entry.second;
-        if (acc.total_weight <= 0.0) {
-            continue;
-        }
-        const double avg_snr = acc.weighted_snr / acc.total_weight;
-        const double avg_prop = (acc.prop_weight > 0.0) ? (acc.weighted_prop / acc.prop_weight) : 0.0;
-        ranked.emplace_back(band, static_cast<float>(avg_snr + (avg_prop * 0.85)));
-    }
-
-    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
-    return ranked;
-}
-
 void App::refreshBBSFiles() {
     std::vector<BBSFile> local_files;
     std::filesystem::path bbs_dir(config_.bbs.bbs_path);
@@ -3185,7 +3137,7 @@ void App::refreshBBSFiles() {
             if (desc_file.is_open()) {
                 std::ostringstream ss;
                 ss << desc_file.rdbuf();
-                file.description = trimSpaces(ss.str());
+                file.description = gui::trimCopy(ss.str());
             }
 
             local_files.push_back(std::move(file));
@@ -3260,7 +3212,7 @@ void App::uploadToBBS(const std::string& filepath, const std::string& descriptio
 
     BBSFile announced;
     announced.filename = src.filename().string();
-    announced.description = trimSpaces(description);
+    announced.description = gui::trimCopy(description);
     if (announced.description.size() > kBbsMaxDescriptionLen) {
         announced.description.resize(kBbsMaxDescriptionLen);
     }
@@ -3304,7 +3256,7 @@ void App::downloadFromBBS(const std::string& filename) {
         return;
     }
 
-    std::string download_dir = trimSpaces(config_.files.download_path);
+    std::string download_dir = gui::trimCopy(config_.files.download_path);
     if (download_dir.empty()) {
         download_dir = "downloads";
     }
@@ -3367,7 +3319,7 @@ void App::announceBBSFile(const BBSFile& file) {
     if (safe_name.size() > kBbsMaxFilenameLen) {
         safe_name.resize(kBbsMaxFilenameLen);
     }
-    std::string description = trimSpaces(file.description);
+    std::string description = gui::trimCopy(file.description);
     if (description.size() > kBbsMaxDescriptionLen) {
         description.resize(kBbsMaxDescriptionLen);
     }
@@ -3388,7 +3340,12 @@ void App::announceBBSFile(const BBSFile& file) {
     packet.push_back(static_cast<uint8_t>(owner.size()));
     packet.insert(packet.end(), owner.begin(), owner.end());
 
-    (void)sendBroadcastPayload(packet);
+    if (sendBroadcastPayload(packet)) {
+        appendSystemChat("[BBS] Announced " + safe_name);
+    } else {
+        appendSystemChat("[BBS] " + safe_name + " is in the BBS folder but could not be announced "
+                         "(modem not connected)");
+    }
 }
 
 void App::announceBBSFileRemoval(const std::string& filename) {
@@ -3414,7 +3371,9 @@ void App::announceBBSFileRemoval(const std::string& filename) {
     packet.insert(packet.end(), safe_name.begin(), safe_name.end());
     packet.push_back(static_cast<uint8_t>(owner.size()));
     packet.insert(packet.end(), owner.begin(), owner.end());
-    (void)sendBroadcastPayload(packet);
+    if (!sendBroadcastPayload(packet)) {
+        appendSystemChat("[BBS] Removal of " + safe_name + " could not be announced (modem not connected)");
+    }
 }
 
 void App::processBBSAnnouncement(const std::string& from, const std::vector<uint8_t>& data) {
@@ -3452,7 +3411,7 @@ void App::processBBSAnnouncement(const std::string& from, const std::vector<uint
 
     BBSFile file;
     file.filename = filename;
-    file.description = trimSpaces(description);
+    file.description = gui::trimCopy(description);
     file.size_bytes = size_bytes;
     file.upload_time = unixNowSeconds();
     file.uploader = owner;
@@ -3460,13 +3419,7 @@ void App::processBBSAnnouncement(const std::string& from, const std::vector<uint
 
     upsertRemoteBBSFile(owner, file);
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "[BBS] " + file.uploader + " shared " + file.filename;
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat("[BBS] " + file.uploader + " shared " + file.filename);
 }
 
 void App::processBBSRemoval(const std::string& from, const std::vector<uint8_t>& data) {
@@ -3540,36 +3493,18 @@ void App::processBBSFileRequest(const std::string& from, const std::vector<uint8
         return;  // Sidecars are not BBS files.
     }
     if (!std::filesystem::is_regular_file(src, src_ec)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "[BBS] Request from " + requester + " ignored: file not found (" + filename + ")";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("[BBS] Request from " + requester + " ignored: file not found (" + filename + ")");
         return;
     }
 
     const std::string transfer_id =
         file_transfer_mgr_->sendFile(*modem_, requester, src.string());
     if (transfer_id.empty()) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "[BBS] Failed to send requested file " + filename + " to " + normalizeCallsign(from);
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("[BBS] Failed to send requested file " + filename + " to " + normalizeCallsign(from));
         return;
     }
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "[BBS] Sending " + filename + " to " + normalizeCallsign(from);
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat("[BBS] Sending " + filename + " to " + normalizeCallsign(from));
 }
 
 void App::requestRemoteBBSDownload(const std::string& from, const std::string& filename) {
@@ -3596,23 +3531,11 @@ void App::requestRemoteBBSDownload(const std::string& from, const std::string& f
         }
     }
     if (owner.empty() || owner == "UNKNOWN") {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "[BBS] Unable to determine source station for " + safe_name;
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("[BBS] Unable to determine source station for " + safe_name);
         return;
     }
     if (!modem_->isConnected()) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "[BBS] Cannot fetch " + safe_name + ": modem is disconnected";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("[BBS] Cannot fetch " + safe_name + ": modem is disconnected");
         return;
     }
 
@@ -3621,7 +3544,7 @@ void App::requestRemoteBBSDownload(const std::string& from, const std::string& f
         connected_peer = normalizeCallsign(current_chat_partner_);
     }
 
-    std::string download_dir = trimSpaces(config_.files.download_path);
+    std::string download_dir = gui::trimCopy(config_.files.download_path);
     if (download_dir.empty()) {
         download_dir = "downloads";
     }
@@ -3656,13 +3579,7 @@ void App::requestRemoteBBSDownload(const std::string& from, const std::string& f
         return;
     }
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "[BBS] Connecting to " + owner + " to fetch " + safe_name;
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat("[BBS] Connecting to " + owner + " to fetch " + safe_name);
 
     connectToStation(owner);
 }
@@ -3694,25 +3611,13 @@ bool App::sendRemoteBbsFileRequest(const std::string& owner,
 
     if (!modem_->sendData(packet)) {
         if (emit_chat) {
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = "[BBS] Failed to request " + safe_name + " from " + owner;
-            msg.is_outgoing = false;
-            msg.timestamp = unixNowSeconds();
-            chat_history_.push_back(msg);
-            chat_scroll_to_bottom_ = true;
+            appendSystemChat("[BBS] Failed to request " + safe_name + " from " + owner);
         }
         return false;
     }
 
     if (emit_chat) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "[BBS] Requested " + safe_name + " from " + owner;
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("[BBS] Requested " + safe_name + " from " + owner);
     }
     return true;
 }
@@ -3775,13 +3680,8 @@ void App::prunePendingRemoteBbsDownloads() {
     }
     syncPendingBbsDownloadsForUi();
     for (const auto& stale : expired) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "[BBS] Download request timed out for " + stale.filename +
-                   " from " + stale.owner_callsign;
-        msg.is_outgoing = false;
-        msg.timestamp = now;
-        chat_history_.push_back(msg);
+        appendSystemChat("[BBS] Download request timed out for " + stale.filename +
+                   " from " + stale.owner_callsign);
     }
     if (!expired.empty()) {
         chat_scroll_to_bottom_ = true;
@@ -3849,14 +3749,8 @@ void App::removeRemoteBBSFile(const std::string& from, const std::string& filena
     const auto erased = remote_bbs_files_.erase(key);
     if (erased > 0) {
         refreshBBSFiles();
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "[BBS] " + normalizeCallsign(from) + " removed " +
-                   std::filesystem::path(filename).filename().string();
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("[BBS] " + normalizeCallsign(from) + " removed " +
+                   std::filesystem::path(filename).filename().string());
     }
 }
 
@@ -3938,13 +3832,65 @@ void App::renderPendingFileOffers() {
     ImGui::End();
 }
 
+// Incoming chat/mail sound (ui.sound_notifications): the platform's system
+// alert sound via NotificationSound (never blocks; one sound per burst).
+void App::playNotificationSound() {
+    (void)notification_sound_.notify(config_.ui.sound_notifications);
+}
+
+// APRS-IS per the settings: connect (or reconnect with new server/login),
+// apply beacon interval and position, or disconnect when disabled.
+void App::applyAPRSConfig() {
+    if (!aprs_) {
+        return;
+    }
+    if (!config_.aprs.enabled) {
+        if (aprs_->isConnecting()) {
+            aprs_->cancelConnect();
+        }
+        if (aprs_->isConnected()) {
+            aprs_->disconnect();
+            appendSystemChat("APRS-IS disconnected");
+        }
+        return;
+    }
+    if (normalizeCallsign(config_.station.callsign).empty()) {
+        appendSystemChat("APRS-IS not connected: set your callsign first (Settings > Station)");
+        return;
+    }
+    aprs_->setMyPosition(config_.station.latitude, config_.station.longitude, config_.station.altitude_m);
+    aprs_->setMyComment(config_.aprs.comment);
+    aprs_->setMySymbol(config_.aprs.symbol_table, config_.aprs.symbol);
+    aprs_->setBeaconInterval(config_.aprs.beacon_interval_sec);
+    aprs_->enableBeaconing(config_.aprs.auto_beacon);
+    aprs_->setFilterRangeKm(config_.aprs.filter_range_km);
+    aprs_->setFilter(config_.aprs.filter);  // empty: range around us + our call
+    // A changed server or login only takes effect on a new session.
+    if (aprs_->isConnecting()) {
+        aprs_->cancelConnect();
+    }
+    if (aprs_->isConnected()) {
+        aprs_->disconnect();
+    }
+    if (aprs_->beginConnect(config_.aprs.server, config_.aprs.port, config_.station.callsign,
+                            APRSClient::effectivePasscode(config_.aprs.passcode, config_.station.callsign))) {
+        appendSystemChat("Connecting to APRS-IS " + config_.aprs.server + ":" +
+                         std::to_string(config_.aprs.port) + "...");
+    } else {
+        appendSystemChat("APRS-IS connect could not start: " +
+                         (aprs_->lastConnectError().empty() ? std::string("unknown error")
+                                                            : aprs_->lastConnectError()));
+    }
+}
+
+// The one way App reports to the operator: a SYSTEM line in the chat log.
 void App::appendSystemChat(const std::string& text) {
     ChatMessage msg;
     msg.from = "SYSTEM";
     msg.text = text;
     msg.is_outgoing = false;
     msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
+    chat_history_.push_back(std::move(msg));
     chat_scroll_to_bottom_ = true;
 }
 
@@ -3969,20 +3915,33 @@ void App::flushMeshRelayQueue() {
         return;
     }
 
-    RelayQueueEntry entry;
-    if (!mesh_relay_->getNextRelay(entry)) {
+    // A forward the modem refused earlier goes first, after its backoff.
+    MeshRetry item;
+    const auto now = std::chrono::steady_clock::now();
+    if (!mesh_retry_.empty()) {
+        if (now < mesh_retry_.front().next_try) {
+            return;
+        }
+        item = std::move(mesh_retry_.front());
+        mesh_retry_.pop_front();
+    } else if (!mesh_relay_->getNextRelay(item.entry)) {
         return;
     }
 
-    if (!sendBroadcastPayload(entry.packet)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Mesh relay forward failed for " + entry.header.destination;
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+    if (sendBroadcastPayload(item.entry.packet)) {
+        return;
     }
+    item.attempts++;
+    if (item.attempts >= MESH_MAX_SEND_ATTEMPTS) {
+        appendSystemChat("Mesh relay forward toward " + item.entry.header.destination + " dropped after " +
+                         std::to_string(item.attempts) + " failed send attempts");
+        return;
+    }
+    item.next_try = now + std::chrono::seconds(10 * item.attempts);
+    appendSystemChat("Mesh relay forward toward " + item.entry.header.destination +
+                     " not sent; retrying (" + std::to_string(item.attempts) + "/" +
+                     std::to_string(MESH_MAX_SEND_ATTEMPTS) + ")");
+    mesh_retry_.push_front(std::move(item));
 }
 
 bool App::forwardPacketViaMesh(const std::vector<uint8_t>& payload,
@@ -4000,14 +3959,8 @@ bool App::forwardPacketViaMesh(const std::vector<uint8_t>& payload,
     auto relay_packet = mesh_relay_->createRelayPacket(destination, payload, message_id);
     const bool ok = sendBroadcastPayload(relay_packet);
     if (ok && !message_id.empty()) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Relayed MID " + message_id + " toward " + destination +
-                   " (TTL " + std::to_string(mesh_relay_->getDefaultTTL()) + ")";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Relayed MID " + message_id + " toward " + destination +
+                   " (TTL " + std::to_string(mesh_relay_->getDefaultTTL()) + ")");
     }
     return ok;
 }
@@ -4022,26 +3975,26 @@ void App::onModemStateChange(const std::string& state) {
     last_logged_fsm_state_ = state;
     if (state == "CALLING") {
         const std::string target = normalizeCallsign(pending_connect_target_);
-        shared_state_.addSystemMessage(target.empty() ? std::string("Calling...")
+        appendSystemChat(target.empty() ? std::string("Calling...")
                                                       : "Calling " + target + "...");
     } else if (state == "CONNECTING") {
-        shared_state_.addSystemMessage(pending_connect_target_.empty()
+        appendSystemChat(pending_connect_target_.empty()
                                            ? std::string("Incoming call, setting up the link...")
                                            : std::string("Answered, setting up the link..."));
     } else if (state == "DISCONNECTING") {
-        shared_state_.addSystemMessage("Disconnecting...");
+        appendSystemChat("Disconnecting...");
     }
 }
 
 void App::onModemEvent(const std::string& name, const std::string& args) {
     if (name == "TX_WATCHDOG") {
-        shared_state_.addSystemMessage("Modem fault: the TX watchdog released PTT after " +
+        appendSystemChat("Modem fault: the TX watchdog released PTT after " +
                                        args + " s of continuous keying");
     } else if (name == "CFO_WARN") {
-        shared_state_.addSystemMessage("Transmit frequency alignment is at " + args +
+        appendSystemChat("Transmit frequency alignment is at " + args +
                                        " Hz; retune the dial");
     } else if (name == "STREAM_REPLAY") {
-        shared_state_.addSystemMessage("The peer restarted; " + args +
+        appendSystemChat("The peer restarted; " + args +
                                        " bytes were re-sent and may repeat");
     }
 }
@@ -4067,13 +4020,12 @@ void App::onDataReceived(const std::vector<uint8_t>& data) {
 // chains and reach this app through onBroadcastMessage(). `frame.payload` is
 // the link-frame body with the envelope stripped (see skywave_protocol.hpp).
 void App::onMonitorFrame(const MonitorFrame& frame) {
-    const std::string frame_type = toUpperAscii(frame.frame_type);
+    const std::string frame_type = gui::upperCopy(frame.frame_type);
     const std::string sender = normalizeCallsign(frame.src_callsign);
 
     if (frame_type == "CQ") {
         const std::string cq_from = sender.empty() ? std::string("UNKNOWN") : sender;
-        addHeardStation(cq_from);
-        processCQResponse(cq_from);
+        processCQResponse(cq_from, frame.family);
         return;
     }
 
@@ -4081,12 +4033,10 @@ void App::onMonitorFrame(const MonitorFrame& frame) {
         return;
     }
 
-    // BEACON body: callsign, noise floor (biased +20 dB), family, sw version.
-    float snr = 0.0f;
-    if (auto beacon = parseSkywaveBeacon(frame.payload)) {
-        snr = beacon->snr_floor_db;
-    }
-    processReceivedBeacon(sender.empty() ? "UNKNOWN" : sender, "", "", snr, false);
+    // BEACON body: callsign and the sender's own SNR-floor byte (0xFF =
+    // unknown), which says nothing about how this station hears it. MON
+    // lines carry no receive SNR, so a heard beacon has none (A8).
+    processReceivedBeacon(sender.empty() ? "UNKNOWN" : sender, "", "", std::nullopt, false, frame.family);
 }
 
 void App::onBroadcastMessage(const std::string& raw_sender,
@@ -4095,25 +4045,6 @@ void App::onBroadcastMessage(const std::string& raw_sender,
     if (payload.empty()) {
         return;
     }
-
-    // Application envelope used by this app's own broadcasts.
-    if (payload.size() >= 4 &&
-        payload[0] == 0xBD &&
-        payload[1] == 0x31 &&
-        payload[2] == 0x01) {
-        const size_t app_len = static_cast<size_t>(payload[3]);
-        if ((4u + app_len) <= payload.size()) {
-            // Same whitelist as an unwrapped broadcast: the envelope must
-            // not smuggle session-only types past it.
-            if (app_len > 0 && isDisconnectedBroadcastPayload(payload[4])) {
-                std::vector<uint8_t> inner(payload.begin() + 4,
-                                           payload.begin() + 4 + app_len);
-                processIncomingMessage(inner, sender, RxOrigin::Broadcast);
-            }
-            return;
-        }
-    }
-
     if (isDisconnectedBroadcastPayload(payload[0])) {
         processIncomingMessage(payload, sender, RxOrigin::Broadcast);
     }
@@ -4162,13 +4093,9 @@ void App::onConnected(const std::string& callsign) {
 
     if (!auto_gateway_target_.empty() &&
         normalizeCallsign(current_chat_partner_) == normalizeCallsign(auto_gateway_target_)) {
-        ChatMessage gw_msg;
-        gw_msg.from = "SYSTEM";
-        gw_msg.text = "Gateway link established with " + current_chat_partner_;
-        gw_msg.is_outgoing = false;
-        gw_msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(gw_msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Gateway link established with " + current_chat_partner_);
+        gateway_call_attempts_ = 0;
+        gateway_gave_up_logged_ = false;
     }
 
     // Start QSO tracking
@@ -4179,40 +4106,30 @@ void App::onConnected(const std::string& callsign) {
         stopCQ();
     }
 
-    // Queue PSK Reporter spot for connection
-    if (config_.psk_reporter.enabled) {
-        // Get SNR from modem status if available
-        float snr = 0.0f;
-        if (modem_) {
-            snr = modem_->getStatus().snr_db;
-        }
-        if (snr >= config_.psk_reporter.min_snr) {
-            queuePSKReporterSpot(current_chat_partner_, "", snr);
-        }
-    }
+    // PSK Reporter: the peer was heard. No SNR yet: the link has not
+    // measured this station at the moment it connects.
+    queuePSKReporterSpot(current_chat_partner_, "", std::nullopt);
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Connected to " + current_chat_partner_;
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
-
-    // SNR keep-alive is scheduled in startQSO() with staggered timing.
+    appendSystemChat("Connected to " + current_chat_partner_);
 
     if (config_.voice.auto_start &&
-        configVoiceMode(config_.voice.mode) == VoiceMode::Connected &&
+        gui::parseVoiceMode(config_.voice.mode) == VoiceMode::Connected &&
         modem_ && modem_->isConnected()) {
         applyVoiceSettingsToModem(false);
         voice_start_pending_ = true;
         voice_start_inflight_ = false;
     }
 
-    // If away mode, send auto-reply
+    // If away mode, send auto-reply (with the commands this station offers),
+    // signed with the operator's name when one is set (K20).
     if (away_mode_active_ && config_.away.auto_reply) {
-        sendChatMessage("[AUTO] " + config_.away.away_message);
+        const std::string name = gui::trimCopy(config_.station.name);
+        (void)sendChatMessage("[AUTO] " + (name.empty() ? std::string() : name + ": ") +
+                              config_.away.away_message + awayCommandHelp());
+    }
+    // BBS welcome (K21) to a station that called this BBS.
+    if (config_.bbs.enabled && !qsy_initiator_ && !gui::trimCopy(config_.bbs.welcome_message).empty()) {
+        (void)sendChatMessage("[BBS] " + gui::trimCopy(config_.bbs.welcome_message));
     }
 
     const bool gateway_session =
@@ -4233,6 +4150,7 @@ void App::onConnected(const std::string& callsign) {
 
 void App::onDisconnected(const std::string& reason) {
     last_logged_fsm_state_.clear();
+    gateway_waiting_logged_ = false;
     dropPendingFileOffers();
     if (file_transfer_mgr_) {
         file_transfer_mgr_->linkLost("Link lost");
@@ -4242,9 +4160,9 @@ void App::onDisconnected(const std::string& reason) {
         // The call never connected (NO_ANSWER, REFUSED, ...): say so.
         const std::string target = normalizeCallsign(pending_connect_target_);
         if (!target.empty()) {
-            shared_state_.addSystemMessage("Call to " + target + " failed: " + why);
+            appendSystemChat("Call to " + target + " failed: " + why);
         } else if (!reason.empty() && reason != "NORMAL") {
-            shared_state_.addSystemMessage(why);
+            appendSystemChat(why);
         }
     }
     voice_local_ptt_ = false;
@@ -4269,20 +4187,11 @@ void App::onDisconnected(const std::string& reason) {
 
     if (!current_chat_partner_.empty()) {
         // End QSO and show duration
-        std::string duration = formatQSODuration();
+        std::string duration = shared_state_.formatQSODuration();
         endQSO();
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Disconnected from " + current_chat_partner_ + " (QSO: " + duration + ")";
-        if (!reason.empty() && reason != "NORMAL") {
-            msg.text += " - " + why;
-        }
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Disconnected from " + current_chat_partner_ + " (QSO: " + duration + ")" +
+                         ((!reason.empty() && reason != "NORMAL") ? " - " + why : std::string()));
     }
     current_chat_partner_.clear();
 
@@ -4320,27 +4229,15 @@ void App::onDisconnected(const std::string& reason) {
             qsy_workflow_state_ = QsyWorkflowState::ReconnectPending;
             pending_connect_target_ = qsy_workflow_peer_;
 
-            ChatMessage retry_msg;
-            retry_msg.from = "SYSTEM";
-            retry_msg.text = "QSY link failed. Reconnect attempt " +
+            appendSystemChat("QSY link failed. Reconnect attempt " +
                              std::to_string(qsy_reconnect_attempts_) + "/" +
                              std::to_string(max_attempts) + " to " + qsy_workflow_peer_ +
-                             " will start on calling frequency.";
-            retry_msg.is_outgoing = false;
-            retry_msg.timestamp = unixNowSeconds();
-            chat_history_.push_back(retry_msg);
-            chat_scroll_to_bottom_ = true;
+                             " will start on calling frequency.");
             return;
         }
 
-        ChatMessage fail_msg;
-        fail_msg.from = "SYSTEM";
-        fail_msg.text = "QSY recovery exhausted after " + std::to_string(max_attempts) +
-                        " attempts. Station link will remain disconnected.";
-        fail_msg.is_outgoing = false;
-        fail_msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(fail_msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("QSY recovery exhausted after " + std::to_string(max_attempts) +
+                        " attempts. Station link will remain disconnected.");
     }
 
     resetQsyWorkflow(true);
@@ -4362,7 +4259,7 @@ void App::startModemConnect(bool announce) {
                              config_.modem.data_port,
                              config_.modem.voice_port) &&
         announce) {
-        shared_state_.addSystemMessage("Connecting to modem at " + config_.modem.host + ":" +
+        appendSystemChat("Connecting to modem at " + config_.modem.host + ":" +
                                        std::to_string(config_.modem.command_port) + "...");
     }
 }
@@ -4434,12 +4331,13 @@ void App::pollAPRSConnect() {
     if (!aprs_ || !aprs_->isConnecting()) return;
     switch (aprs_->pollConnect()) {
     case APRSConnectProgress::Connected:
+        appendSystemChat("APRS-IS connected (" + config_.aprs.server + ")");
         if (aprs_->takeQueuedPositionSent()) {
-            shared_state_.addSystemMessage("APRS-IS position beacon sent");
+            appendSystemChat("APRS-IS position beacon sent");
         }
         break;
     case APRSConnectProgress::Failed:
-        shared_state_.addSystemMessage("APRS-IS connect failed: " +
+        appendSystemChat("APRS-IS connect failed: " +
                                        (aprs_->lastConnectError().empty()
                                             ? std::string("no connection")
                                             : aprs_->lastConnectError()));
@@ -4458,7 +4356,7 @@ void App::pollModemConnect() {
         break;
     case ConnectProgress::Failed:
         if (!modem_unreachable_logged_) {
-            shared_state_.addSystemMessage(
+            appendSystemChat(
                 "Could not reach the modem at " + config_.modem.host + ":" +
                 std::to_string(config_.modem.command_port) +
                 (config_.modem.auto_connect && !modem_auto_paused_ ? " - retrying in the background"
@@ -4472,7 +4370,7 @@ void App::pollModemConnect() {
 }
 
 void App::onModemConnected() {
-    shared_state_.addSystemMessage("Connected to modem at " + config_.modem.host + ":" +
+    appendSystemChat("Connected to modem at " + config_.modem.host + ":" +
                                    std::to_string(config_.modem.command_port));
     last_logged_fsm_state_.clear();
     last_reported_dial_hz_ = kDialUnreported;
@@ -4486,6 +4384,7 @@ void App::onModemConnected() {
     // The modem keeps its own saved family; reflect it rather than push ours.
     syncFamilyFromModem();
     applyVoiceSettingsToModem(false);
+    pushPttSettingsToModem();
     // Passive monitoring is opt-in on Skywave and is how this app hears
     // CQ, beacons and broadcast traffic from stations it is not linked
     // to (INTERFACES.md "MONITOR ON|OFF").
@@ -4512,9 +4411,9 @@ void App::connectToStation(const std::string& callsign) {
     if (modem_ && modem_->isConnected() && !normalized.empty()) {
         resetQsyWorkflow(true);
 
-        std::string calling_band = trimSpaces(current_band_);
+        std::string calling_band = gui::trimCopy(current_band_);
         if (calling_band.empty()) {
-            calling_band = trimSpaces(config_.radio.default_band);
+            calling_band = gui::trimCopy(config_.radio.default_band);
         }
         if (!calling_band.empty()) {
             current_band_ = calling_band;
@@ -4538,85 +4437,62 @@ void App::connectToStation(const std::string& callsign) {
             }
         });
     } else if (!normalized.empty()) {
-        shared_state_.addSystemMessage("Cannot call " + normalized + ": the modem is not connected");
+        appendSystemChat("Cannot call " + normalized + ": the modem is not connected");
     }
 }
 
-void App::sendChatMessage(const std::string& text) {
-    if (!modem_ || modem_->getStatus().link_state != LinkState::Connected) {
-        return;
+// Returns true only when the whole line was handed to the modem. On false
+// the reason is in the log and the caller keeps the input.
+bool App::sendChatMessage(const std::string& text) {
+    if (gui::trimCopy(text).empty()) {
+        return false;
     }
-
-    // Use fragmentation for long messages
-    sendFragmentedMessage(text);
+    if (!modem_ || !modem_->isConnected()) {
+        appendSystemChat("Chat not sent: the modem is not connected");
+        return false;
+    }
+    if (modem_->getStatus().link_state != LinkState::Connected) {
+        appendSystemChat("Chat not sent: no station link (call a station first)");
+        return false;
+    }
+    return sendFragmentedMessage(text);
 }
 
-void App::sendFile(const std::string& path) {
+bool App::sendFile(const std::string& path, FileOfferKind kind) {
+    const bool bbs = kind == FileOfferKind::BbsUpload;
+    const std::string what = bbs ? "Cannot upload to the remote BBS" : "Cannot send file";
     if (!modem_ || modem_->getStatus().link_state != LinkState::Connected) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Cannot send file: Not connected";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        appendSystemChat(what + ": not linked to a station");
+        return false;
     }
 
     // Check file exists and size
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Cannot open file: " + path;
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        appendSystemChat(what + ": cannot open " + path);
+        return false;
     }
 
     std::streampos end_pos = file.tellg();
     if (end_pos < 0) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Cannot read file size: " + path;
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        appendSystemChat(what + ": cannot read the size of " + path);
+        return false;
     }
     size_t file_size = static_cast<size_t>(end_pos);
     file.close();
 
     // Reject empty files to avoid zero-length transfer edge cases.
     if (file_size == 0) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Cannot send empty file: " + path;
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        appendSystemChat(what + ": " + path + " is empty");
+        return false;
     }
 
-    // Check size limit (50 KB)
-    if (file_size > 50 * 1024) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "File too large (max 50 KB): " + std::to_string(file_size) + " bytes";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+    // Size limit: Settings > Files (files.max_file_size).
+    const size_t max_size = config_.files.max_file_size;
+    if (max_size > 0 && file_size > max_size) {
+        appendSystemChat("File too large: " + std::to_string(file_size) + " bytes (limit " +
+                         std::to_string(max_size) + " bytes, Settings > Files)");
+        return false;
     }
 
     std::string remote_callsign = current_chat_partner_;
@@ -4624,15 +4500,8 @@ void App::sendFile(const std::string& path) {
         remote_callsign = modem_->getStatus().remote_callsign;
     }
     if (remote_callsign.empty()) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Cannot send file: No connected remote station callsign";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        appendSystemChat(what + ": the linked station's callsign is unknown");
+        return false;
     }
 
     // Extract filename from path
@@ -4643,40 +4512,28 @@ void App::sendFile(const std::string& path) {
     }
 
     if (!file_transfer_mgr_) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "File transfer subsystem not initialized";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        appendSystemChat("File transfer subsystem not initialized");
+        return false;
     }
 
-    std::string transfer_id = file_transfer_mgr_->sendFile(*modem_, remote_callsign, path);
+    std::string transfer_id = file_transfer_mgr_->sendFile(*modem_, remote_callsign, path, kind);
     if (transfer_id.empty()) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Failed to start file transfer: " + filename;
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        const std::string why = file_transfer_mgr_->lastSendError();
+        appendSystemChat((bbs ? "Failed to start BBS upload: " : "Failed to start file transfer: ") +
+                         filename + (why.empty() ? std::string() : " (" + why + ")"));
+        return false;
     }
     syncTransfersFromManager();
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Starting file transfer: " + filename + " (" + std::to_string(file_size) +
-               " bytes), id=" + transfer_id;
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    if (bbs) {
+        appendSystemChat("[BBS] Offered " + filename + " (" + std::to_string(file_size) + " bytes) to " +
+                         normalizeCallsign(remote_callsign) + "'s BBS; it is stored there if that "
+                         "station allows uploads from you");
+    } else {
+        appendSystemChat("Starting file transfer: " + filename + " (" + std::to_string(file_size) +
+                         " bytes), id=" + transfer_id);
+    }
+    return true;
 }
 
 void App::updatePosition(double lat, double lon) {
@@ -4762,14 +4619,7 @@ void App::sendPendingMessages() {
             mail_outbox_.push_back(mail);
         }
 
-        ChatMessage chat_msg;
-        chat_msg.from = "SYSTEM";
-        chat_msg.text = "Sent pending message: " + mail.subject;
-        chat_msg.is_outgoing = false;
-        chat_msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(chat_msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Sent pending message: " + mail.subject);
         break;
     }
 }
@@ -4802,6 +4652,15 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     // Check for special message types
     uint8_t msg_type = data[0];
 
+    // Unknown types and truncated frames are dropped: nothing reaches the
+    // chat log unless it is a well-formed payload of a known type.
+    if (!app_detail::isWellFormedPayload(data)) {
+        std::cerr << "[RX] Dropping malformed or unknown packet 0x" << std::hex
+                  << static_cast<int>(msg_type) << std::dec << " (" << data.size() << " bytes) from "
+                  << sender << "\n";
+        return;
+    }
+
     // Session-only types act on the current link; only the connected peer,
     // over the link itself, may send them.
     const bool from_linked_peer = origin == RxOrigin::Link && isLinkConnected();
@@ -4812,6 +4671,15 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     }
     // A relay delivers chat/mail only, and never another relay packet.
     if (origin == RxOrigin::Mesh && !app_detail::isMeshDeliverablePayload(msg_type)) {
+        return;
+    }
+
+    // Chat text (0xC0 | UTF-8 text)
+    if (msg_type == app_detail::kChatTextMarker) {
+        std::string text;
+        if (app_detail::decodeChatPacket(data, &text)) {
+            receiveChatText(sender, text, relayed_by, from_linked_peer);
+        }
         return;
     }
 
@@ -4830,8 +4698,14 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
             }
         }
 
+        // Route learning gets the link's measured SNR when the packet came
+        // over the link; broadcasts carry no receive SNR.
+        std::optional<float> rx_snr;
+        if (from_linked_peer && modem_) {
+            rx_snr = modem_->getStatus().snr_db;
+        }
         std::vector<uint8_t> relay_payload;
-        const auto relay_result = mesh_relay_->processRelayPacket(data, relay_payload);
+        const RelayResult relay_result = mesh_relay_->processRelayPacket(data, relay_payload, rx_snr);
         if (relay_result == RelayResult::ForUs && !relay_payload.empty() &&
             app_detail::isMeshDeliverablePayload(relay_payload[0])) {
             // Attributed to the header's source, which cannot be verified;
@@ -4851,14 +4725,8 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         return;
     }
 
-    // Typing indicator (0xFE prefix)
-    if (msg_type == 0xFE && data.size() == 1) {
-        processTypingIndicator(sender);
-        return;
-    }
-
-    // Fragmented message (0xFD prefix: 0xFD | frag_idx | total_frags | data...)
-    if (msg_type == 0xFD && data.size() >= 3) {
+    // Fragmented chat (0xFD | frag_idx | total_frags | data...)
+    if (msg_type == app_detail::kChatFragmentMarker) {
         processMessageFragment(sender, data);
         return;
     }
@@ -4868,7 +4736,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         std::string cq_from = sender;
         bool sender_is_hash = isLikelyHashId(cq_from);
 
-        // New CQ payload format is "CQ <CALLSIGN>".
+        // CQ payload format is "CQ <CALLSIGN>".
         if ((cq_from == "UNKNOWN" || sender_is_hash) &&
             data.size() > 4 && data[1] == 'C' && data[2] == 'Q' && data[3] == ' ') {
             std::string candidate(data.begin() + 4, data.end());
@@ -4882,60 +4750,39 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         }
 
         cq_from = normalizeCallsign(cq_from);
-        addHeardStation(cq_from);
         processCQResponse(cq_from);
         return;
     }
 
     // Broadcast message (0xFB prefix: 0xFB | message...)
-    if (msg_type == 0xFB && data.size() > 1) {
+    if (msg_type == 0xFB) {
         std::string broadcast_text(data.begin() + 1, data.end());
-        if (relayed_by.empty()) {
-            addHeardStation(sender);  // a relayed source was not heard
-        }
-
         ChatMessage msg;
         msg.from = sender;
         msg.to = kMailBroadcastTarget;
         msg.via = relayed_by;
+        msg.band = current_band_;  // G19
         msg.text = app_detail::relayAttributionMarker(relayed_by) + "[BROADCAST] " + broadcast_text;
         msg.is_outgoing = false;
         msg.is_broadcast = true;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        msg.timestamp = unixNowSeconds();
         chat_history_.push_back(msg);
         chat_scroll_to_bottom_ = true;
+        playNotificationSound();
         return;
     }
 
-    // Advanced Beacon (0xFA prefix: 0xFA | snr_byte | grid_len | grid_square | flags | message...)
-    if (msg_type == 0xFA && data.size() >= 3) {
-        float snr = static_cast<float>(static_cast<int8_t>(data[1]));  // SNR as signed byte
-        uint8_t grid_len = data[2];
-        std::string grid_square;
-        bool is_email_gateway = false;
-
-        size_t msg_start = 3;
-        if (grid_len > 0 && data.size() >= 3 + grid_len) {
-            grid_square = std::string(data.begin() + 3, data.begin() + 3 + grid_len);
-            msg_start = 3 + grid_len;
+    // Station beacon (0xFA | grid_len | grid | flags | "<CALL> <text>")
+    if (msg_type == 0xFA) {
+        app_detail::StationBeacon beacon;
+        if (!app_detail::decodeStationBeacon(data, &beacon)) {
+            return;
         }
-
-        // Parse flags byte (added after grid square)
-        if (data.size() > msg_start) {
-            uint8_t flags = data[msg_start];
-            is_email_gateway = (flags & 0x01) != 0;
-            msg_start++;
-        }
-
-        std::string beacon_msg;
-        if (data.size() > msg_start) {
-            beacon_msg = std::string(data.begin() + msg_start, data.end());
-        }
+        bool is_email_gateway = beacon.email_gateway;
         std::string beacon_from = normalizeCallsign(sender);
-        std::string beacon_body = beacon_msg;
+        std::string beacon_body = beacon.text;
         if (beacon_from.empty() || beacon_from == "UNKNOWN" || isLikelyHashId(beacon_from)) {
-            auto parsed = extractCallsignPrefix(beacon_msg);
+            auto parsed = extractCallsignPrefix(beacon.text);
             if (!parsed.first.empty()) {
                 beacon_from = parsed.first;
                 beacon_body = parsed.second;
@@ -4951,7 +4798,9 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         if (beacon_from.empty()) {
             beacon_from = "UNKNOWN";
         }
-        processReceivedBeacon(beacon_from, grid_square, beacon_body, snr, is_email_gateway);
+        // No SNR: the broadcast path reports no receive measurement.
+        processReceivedBeacon(beacon_from, app_detail::sanitizeRemoteText(beacon.grid, 8),
+                              beacon_body, std::nullopt, is_email_gateway);
         return;
     }
 
@@ -4963,20 +4812,11 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
             relay_msg.assign(data.begin() + 2, data.end());
         }
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        if (relay_status == kPositionRelayAckStatusRelayed) {
-            msg.text = "[APRS relay ACK from " + sender + "] " +
-                       (relay_msg.empty() ? "Position relay succeeded" : relay_msg);
-        } else {
-            msg.text = "[APRS relay ACK from " + sender + "] " +
-                       (relay_msg.empty() ? "Position relay unavailable" : relay_msg);
-        }
-        msg.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        msg.is_outgoing = false;
-        msg.delivered = true;
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        relay_msg = app_detail::sanitizeRemoteText(relay_msg, kPositionRelayAckTextMax);
+        const bool relayed = relay_status == kPositionRelayAckStatusRelayed;
+        appendSystemChat("[APRS relay ACK from " + sender + "] " +
+                         (relay_msg.empty() ? (relayed ? "Position relay succeeded" : "Position relay unavailable")
+                                            : relay_msg));
         return;
     }
 
@@ -5016,7 +4856,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
                               grid_square,
                               comment,
                               StationLocationSource::DirectPosition,
-                              0.0f,
+                              std::nullopt,
                               false);
 
         bool relay_ok = false;
@@ -5031,24 +4871,12 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
                 relay_status_text = "APRS-IS relay transmit failed";
             }
 
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = relay_ok
+            appendSystemChat(relay_ok
                 ? ("Relayed position for " + sender + " to APRS-IS")
-                : ("Failed to relay position for " + sender + " to APRS-IS");
-            msg.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-            msg.is_outgoing = false;
-            msg.delivered = true;
-            chat_history_.push_back(msg);
+                : ("Failed to relay position for " + sender + " to APRS-IS"));
         } else {
             relay_status_text = "Position received (relay station has no APRS-IS connection)";
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = "Position relay request from " + sender + " (no APRS-IS connection)";
-            msg.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-            msg.is_outgoing = false;
-            msg.delivered = true;
-            chat_history_.push_back(msg);
+            appendSystemChat("Position relay request from " + sender + " (no APRS-IS connection)");
         }
 
         // Send explicit ACK back to the connected station that requested relay.
@@ -5062,7 +4890,9 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
                 relay_status_text.resize(kPositionRelayAckTextMax);
             }
             ack_packet.insert(ack_packet.end(), relay_status_text.begin(), relay_status_text.end());
-            modem_->sendData(ack_packet);
+            if (!modem_->sendData(ack_packet)) {
+                appendSystemChat("Position relay answer to " + sender + " could not be sent");
+            }
         }
 
         chat_scroll_to_bottom_ = true;
@@ -5118,7 +4948,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         }
 
         // Add to heard beacons with position info
-        processReceivedBeacon(beacon_from, grid_square, beacon_text, 0.0f, legacy_gateway_marker);
+        processReceivedBeacon(beacon_from, grid_square, beacon_text, std::nullopt, legacy_gateway_marker);
         recordStationLocation(beacon_from,
                               true,
                               lat,
@@ -5126,14 +4956,15 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
                               grid_square,
                               beacon_text,
                               StationLocationSource::PositionBeacon,
-                              0.0f,
+                              std::nullopt,
                               legacy_gateway_marker);
 
         // Auto-relay to APRS-IS if connected (only under a modem-reported sender).
         const bool relay_to_aprs = !sender_from_payload && beacon_from != "UNKNOWN" &&
                                    aprs_ && aprs_->getState() == APRSState::Connected;
+        bool relayed_to_aprs = false;
         if (relay_to_aprs) {
-            aprs_->sendPositionFor(beacon_from, lat, lon, grid_square, beacon_text);
+            relayed_to_aprs = aprs_->sendPositionFor(beacon_from, lat, lon, grid_square, beacon_text);
         }
 
         ChatMessage msg;
@@ -5141,7 +4972,7 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         msg.text = "[POSITION] " + grid_square + " (" + std::to_string(lat).substr(0, 8) + ", "
                    + std::to_string(lon).substr(0, 9) + ") " + beacon_text;
         if (relay_to_aprs) {
-            msg.text += " [Relayed to APRS]";
+            msg.text += relayed_to_aprs ? " [Relayed to APRS]" : " [APRS relay failed]";
         }
         msg.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         msg.is_outgoing = false;
@@ -5154,14 +4985,20 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     // Pending message notification (0xF9 prefix)
     if (msg_type == 0xF9) {
         // Remote station has pending messages for us
+        // Only for us: the notice names the station it is for.
+        const std::string notice(data.begin() + 1, data.end());
+        const std::string my_call = normalizeCallsign(config_.station.callsign);
+        if (my_call.empty() || extractCallsignPrefix(notice).first != my_call) {
+            return;
+        }
         ChatMessage msg;
         msg.from = sender;
-        msg.text = "[SYSTEM] Station has pending messages for you";
+        msg.text = "[MAIL WAITING] " + app_detail::sanitizeRemoteText(notice, 120);
         msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        msg.timestamp = unixNowSeconds();
         chat_history_.push_back(msg);
         chat_scroll_to_bottom_ = true;
+        playNotificationSound();
         return;
     }
 
@@ -5174,14 +5011,6 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
     // QSY confirmation (0xF1)
     if (msg_type == kQsyConfirmMarker) {
         processQsyConfirm(sender, data);
-        return;
-    }
-
-    // SNR report (0xF8 prefix: 0xF8 | snr_lo | snr_hi) - SNR * 10 as int16
-    if (msg_type == 0xF8 && data.size() >= 3) {
-        int16_t snr_val = static_cast<int16_t>(data[1] | (data[2] << 8));
-        float snr = static_cast<float>(snr_val) / 10.0f;
-        processSNRReport(snr);
         return;
     }
 
@@ -5269,74 +5098,55 @@ void App::processIncomingMessage(const std::vector<uint8_t>& data, const std::st
         return;
     }
 
-    // Regular text message
-    std::string text(data.begin(), data.end());
-
-    ChatMessage msg;
-    msg.from = sender;
-    msg.to = config_.station.callsign;
-    msg.via = relayed_by;
-    msg.text = app_detail::relayAttributionMarker(relayed_by) + text;
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    // Every known type is handled above; nothing falls through as text.
 }
 
 // ============================================================================
 // Chat Typing Indicator and Fragmentation
 // ============================================================================
 
-void App::sendTypingIndicator() {
-    // Typing indicators are disabled by design.
-    return;
-}
-
-void App::processTypingIndicator(const std::string& from) {
-    // Typing indicators are disabled by design.
-    (void)from;
-}
-
-void App::sendFragmentedMessage(const std::string& text) {
+// Chat on the wire: 0xC0 | text, or 0xFD fragments for long lines
+// (app_detail::buildChatPackets). The line is recorded as sent only when
+// every packet was handed to the modem.
+bool App::sendFragmentedMessage(const std::string& text) {
     if (!modem_ || modem_->getStatus().link_state != LinkState::Connected) {
-        return;
+        appendSystemChat("Chat not sent: no station link");
+        return false;
     }
 
-    if (text.size() <= MAX_CHAT_FRAGMENT_SIZE) {
-        // No fragmentation needed
-        modem_->sendText(text);
-    } else {
-        // Fragment the message
-        size_t total_frags = (text.size() + MAX_CHAT_FRAGMENT_SIZE - 1) / MAX_CHAT_FRAGMENT_SIZE;
-        if (total_frags > 255) total_frags = 255;  // Max fragments
-
-        for (size_t i = 0; i < total_frags; ++i) {
-            size_t start = i * MAX_CHAT_FRAGMENT_SIZE;
-            size_t len = std::min(MAX_CHAT_FRAGMENT_SIZE, text.size() - start);
-            std::string frag = text.substr(start, len);
-
-            // Build fragment packet: 0xFD | frag_idx | total_frags | data
-            std::vector<uint8_t> packet;
-            packet.push_back(0xFD);
-            packet.push_back(static_cast<uint8_t>(i));
-            packet.push_back(static_cast<uint8_t>(total_frags));
-            packet.insert(packet.end(), frag.begin(), frag.end());
-
-            modem_->sendData(packet);
+    const auto packets = app_detail::buildChatPackets(text, MAX_CHAT_FRAGMENT_SIZE);
+    if (packets.empty()) {
+        appendSystemChat("Chat not sent: the message is too long (" + std::to_string(text.size()) +
+                         " bytes; at most " +
+                         std::to_string(app_detail::kMaxChatFragments * MAX_CHAT_FRAGMENT_SIZE) + ")");
+        return false;
+    }
+    size_t sent = 0;
+    for (const auto& packet : packets) {
+        if (!modem_->sendData(packet)) {
+            break;
         }
+        ++sent;
+    }
+    if (sent != packets.size()) {
+        appendSystemChat(sent == 0
+                             ? std::string("Chat not sent: the modem did not accept the data")
+                             : "Chat only partly sent (" + std::to_string(sent) + " of " +
+                                   std::to_string(packets.size()) +
+                                   " parts); the station will not see it. Send it again.");
+        return false;
     }
 
-    // Add to chat history
     ChatMessage msg;
     msg.from = config_.station.callsign;
     msg.to = current_chat_partner_;
+    msg.band = current_band_;  // G19
     msg.text = text;
     msg.is_outgoing = true;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    msg.timestamp = unixNowSeconds();
     chat_history_.push_back(msg);
     chat_scroll_to_bottom_ = true;
+    return true;
 }
 
 void App::processMessageFragment(const std::string& from, const std::vector<uint8_t>& data) {
@@ -5353,16 +5163,41 @@ void App::processMessageFragment(const std::string& from, const std::vector<uint
                                  unixNowSeconds(), &full_message)) {
         return;
     }
+    receiveChatText(from, full_message, "", true);
+}
 
+// An incoming chat line. While away, the linked station may also send the
+// away commands (EMAIL:...).
+void App::receiveChatText(const std::string& from, const std::string& text,
+                          const std::string& relayed_by, bool via_link) {
     ChatMessage msg;
     msg.from = from;
     msg.to = config_.station.callsign;
-    msg.text = full_message;
+    msg.via = relayed_by;
+    msg.band = current_band_;  // G19
+    msg.text = app_detail::relayAttributionMarker(relayed_by) + text;
     msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    msg.timestamp = unixNowSeconds();
     chat_history_.push_back(msg);
     chat_scroll_to_bottom_ = true;
+    playNotificationSound();
+
+    if (!away_mode_active_ || !via_link || !relayed_by.empty()) {
+        return;
+    }
+    const std::string sender = normalizeCallsign(from);
+    if (sender.empty() || sender != linkedPeerCallsign()) {
+        return;
+    }
+    app_detail::AwayEmailCommand cmd;
+    if (app_detail::parseAwayEmailCommand(text, &cmd)) {
+        (void)sendChatMessage("[AUTO] " + handleAwayEmailCommand(sender, cmd));
+        return;
+    }
+    const std::string upper = gui::upperCopy(gui::trimCopy(text));
+    if (upper.rfind("EMAIL:", 0) == 0) {
+        (void)sendChatMessage("[AUTO] Email not sent: use EMAIL:<address>:<subject>:<body>");
+    }
 }
 
 void App::pruneFragmentBuffers() {
@@ -5374,31 +5209,25 @@ void App::pruneFragmentBuffers() {
 // ============================================================================
 
 void App::startCQ() {
+    if (!modem_ || !modem_->isConnected()) {
+        appendSystemChat("CQ not started: the modem is not connected");
+        return;
+    }
+    if (modem_->getStatus().link_state != LinkState::Idle) {
+        appendSystemChat("CQ not started: a station link or call is in progress");
+        return;
+    }
     cq_active_ = true;
     cq_current_repeat_ = 0;
     last_cq_sent_ = std::chrono::steady_clock::now() - std::chrono::milliseconds(CQ_INTERVAL_MS);
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Starting CQ...";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat("Starting CQ...");
 }
 
 void App::stopCQ() {
     cq_active_ = false;
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "CQ stopped";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat("CQ stopped");
 }
 
 void App::updateCQ() {
@@ -5420,14 +5249,7 @@ void App::updateCQ() {
 
         if (cq_current_repeat_ >= cq_repeat_count_) {
             cq_active_ = false;
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = "CQ complete (" + std::to_string(cq_repeat_count_) + " calls sent)";
-            msg.is_outgoing = false;
-            msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            chat_history_.push_back(msg);
-            chat_scroll_to_bottom_ = true;
+            appendSystemChat("CQ complete (" + std::to_string(cq_repeat_count_) + " calls sent)");
         }
     }
 }
@@ -5445,21 +5267,20 @@ bool App::sendBroadcastPayload(const std::vector<uint8_t>& payload) {
 }
 
 void App::sendBroadcast(const std::string& message) {
-    if (!modem_) return;
+    if (gui::trimCopy(message).empty()) {
+        return;
+    }
+    if (!modem_ || !modem_->isConnected()) {
+        appendSystemChat("Broadcast not sent: the modem is not connected");
+        return;
+    }
 
     std::vector<uint8_t> packet;
     packet.push_back(0xFB);  // Broadcast marker
     packet.insert(packet.end(), message.begin(), message.end());
 
     if (!sendBroadcastPayload(packet)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Broadcast send failed";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Broadcast not sent: the modem did not accept it");
         return;
     }
 
@@ -5475,45 +5296,32 @@ void App::sendBroadcast(const std::string& message) {
     chat_scroll_to_bottom_ = true;
 }
 
-void App::processCQResponse(const std::string& from) {
-    recent_cq_unix_[normalizeCallsign(from)] = unixNowSeconds();
-    if (config_.psk_reporter.enabled) {
-        float snr = 0.0f;
-        if (modem_) {
-            snr = modem_->getStatus().snr_db;
-        }
-        if (snr >= config_.psk_reporter.min_snr) {
-            queuePSKReporterSpot(from, "", snr);
-        }
-    }
+void App::processCQResponse(const std::string& from, const std::string& family) {
+    // Heard on the monitor: no receive SNR is reported for the frame.
+    queuePSKReporterSpot(from, "", std::nullopt);
+    recordHeardCall(from, family, std::nullopt);
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Heard CQ from " + from;
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat("Heard CQ from " + from);
 }
 
 void App::sendQsySuggestion(const std::string& band, int slot, uint32_t frequency_hz) {
     if (!modem_ || modem_->getStatus().link_state != LinkState::Connected) {
+        appendSystemChat("QSY not proposed: no station link");
         return;
     }
     if (!qsy_initiator_) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "QSY request blocked: only the calling station initiator may propose QSY.";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("QSY request blocked: only the calling station initiator may propose QSY.");
+        return;
+    }
+    std::string why;
+    if (!radioCanTune(&why)) {
+        appendSystemChat("QSY not proposed: " + why + ", so this station could not follow");
         return;
     }
 
-    std::string normalized_band = trimSpaces(band);
+    std::string normalized_band = gui::trimCopy(band);
     if (normalized_band.empty()) {
+        appendSystemChat("QSY not proposed: no band selected");
         return;
     }
     if (normalized_band.size() > 15) {
@@ -5535,6 +5343,12 @@ void App::sendQsySuggestion(const std::string& band, int slot, uint32_t frequenc
             freq_mgr_->getSlotFrequency(normalized_band, safe_slot));
     }
     if (safe_frequency_hz == 0) {
+        appendSystemChat("QSY not proposed: no frequency for " + normalized_band + " slot " +
+                         std::to_string(safe_slot));
+        return;
+    }
+    if (!qsyTargetInBand(normalized_band, safe_slot, safe_frequency_hz)) {
+        appendSystemChat("QSY not proposed: the target is outside the " + normalized_band + " band");
         return;
     }
 
@@ -5542,6 +5356,7 @@ void App::sendQsySuggestion(const std::string& band, int slot, uint32_t frequenc
     writeUint32LE(packet, safe_frequency_hz);
 
     if (!modem_->sendData(packet)) {
+        appendSystemChat("QSY suggestion not sent: the modem did not accept it");
         return;
     }
 
@@ -5559,15 +5374,9 @@ void App::sendQsySuggestion(const std::string& band, int slot, uint32_t frequenc
                         std::chrono::milliseconds(
                             std::clamp(config_.radio.qsy_ack_timeout_ms, 2000, 30000));
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "QSY suggestion sent to " + target + ": " +
+    appendSystemChat("QSY suggestion sent to " + target + ": " +
                normalized_band + " slot " + (safe_slot >= 0 ? "+" : "") + std::to_string(safe_slot) +
-               " (" + std::to_string(safe_frequency_hz / 1000.0).substr(0, 8) + " kHz)";
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+               " (" + std::to_string(safe_frequency_hz / 1000.0).substr(0, 8) + " kHz)");
 }
 
 void App::processQsySuggestion(const std::string& from, const std::vector<uint8_t>& data) {
@@ -5614,15 +5423,9 @@ void App::processQsySuggestion(const std::string& from, const std::vector<uint8_
     qsy_target_slot_ = qsy_suggestion_slot_;
     qsy_target_frequency_hz_ = qsy_suggestion_frequency_hz_;
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = qsy_suggestion_from_ + " suggests QSY to " + qsy_suggestion_band_ +
+    appendSystemChat(qsy_suggestion_from_ + " suggests QSY to " + qsy_suggestion_band_ +
                " slot " + (qsy_suggestion_slot_ >= 0 ? "+" : "") + std::to_string(qsy_suggestion_slot_) +
-               " (" + std::to_string(qsy_suggestion_frequency_hz_ / 1000.0).substr(0, 8) + " kHz)";
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+               " (" + std::to_string(qsy_suggestion_frequency_hz_ / 1000.0).substr(0, 8) + " kHz)");
 
     if (qsy_initiator_) {
         // Collision protection: only the original calling station should initiate QSY.
@@ -5665,16 +5468,10 @@ void App::processQsyConfirm(const std::string& from, const std::vector<uint8_t>&
     qsy_target_slot_ = (slot == 0 ? 1 : slot);
     qsy_target_frequency_hz_ = freq_hz;
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = from_call + std::string(accepted ? " accepted " : " declined ") +
+    appendSystemChat(from_call + std::string(accepted ? " accepted " : " declined ") +
                "QSY to " + band + " slot " +
                (qsy_target_slot_ >= 0 ? "+" : "") + std::to_string(qsy_target_slot_) +
-               " (" + std::to_string(freq_hz / 1000.0).substr(0, 8) + " kHz)";
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+               " (" + std::to_string(freq_hz / 1000.0).substr(0, 8) + " kHz)");
 
     if (!accepted) {
         qsy_workflow_state_ = QsyWorkflowState::Idle;
@@ -5683,15 +5480,37 @@ void App::processQsyConfirm(const std::string& from, const std::vector<uint8_t>&
     }
 
     if (qsy_workflow_state_ == QsyWorkflowState::AwaitingAck) {
-        executeQsyTarget(qsy_target_band_, qsy_target_slot_, qsy_target_frequency_hz_);
+        std::string why;
+        if (!executeQsyTarget(qsy_target_band_, qsy_target_slot_, qsy_target_frequency_hz_, &why)) {
+            // The peer is moving; this station could not. The link will drop
+            // and the QSY recovery brings both back to the calling frequency.
+            appendSystemChat("QSY FAILED: the radio did not move (" + why + "). " + from_call +
+                             " has moved; the link will drop and recover on the calling frequency.");
+            qsy_workflow_state_ = QsyWorkflowState::SidebandActive;
+            qsy_sideband_started_ = std::chrono::steady_clock::now();
+            return;
+        }
+        appendSystemChat("QSY: radio now on " + qsy_target_band_ + " (" +
+                         std::to_string(current_frequency_hz_ / 1000.0).substr(0, 8) + " kHz)");
         qsy_workflow_state_ = QsyWorkflowState::SidebandActive;
         qsy_sideband_started_ = std::chrono::steady_clock::now();
     }
 }
 
 void App::respondToQsySuggestion(bool accept) {
-    if (!qsy_suggestion_pending_ || !modem_ || modem_->getStatus().link_state != LinkState::Connected) {
+    if (!qsy_suggestion_pending_) {
+        appendSystemChat("No QSY suggestion to answer");
         return;
+    }
+    if (!modem_ || modem_->getStatus().link_state != LinkState::Connected) {
+        appendSystemChat("QSY suggestion not answered: the station link is gone");
+        return;
+    }
+    std::string cannot_tune;
+    if (accept && !radioCanTune(&cannot_tune)) {
+        // Accepting would strand the link: decline instead, and say why.
+        appendSystemChat("Declining the QSY: " + cannot_tune + ", so this station cannot move");
+        accept = false;
     }
     qsy_workflow_peer_ = normalizeCallsign(qsy_suggestion_from_);
     qsy_target_band_ = qsy_suggestion_band_;
@@ -5706,25 +5525,27 @@ void App::respondToQsySuggestion(bool accept) {
     writeUint32LE(packet, qsy_target_frequency_hz_);
     packet.push_back(accept ? kQsyConfirmAccepted : kQsyConfirmDeclined);
     if (!modem_->sendData(packet)) {
+        appendSystemChat("QSY answer not sent: the modem did not accept it");
         return;
     }
 
     if (accept) {
-        executeQsyTarget(qsy_target_band_, qsy_target_slot_, qsy_target_frequency_hz_);
+        std::string why;
+        if (!executeQsyTarget(qsy_target_band_, qsy_target_slot_, qsy_target_frequency_hz_, &why)) {
+            appendSystemChat("QSY FAILED: the radio did not move (" + why + "). " + qsy_suggestion_from_ +
+                             " is moving; the link will drop and recover on the calling frequency.");
+        } else {
+            appendSystemChat("QSY: radio now on " + qsy_target_band_ + " (" +
+                             std::to_string(current_frequency_hz_ / 1000.0).substr(0, 8) + " kHz)");
+        }
         qsy_workflow_state_ = QsyWorkflowState::SidebandActive;
         qsy_sideband_started_ = std::chrono::steady_clock::now();
     } else {
         qsy_workflow_state_ = QsyWorkflowState::Idle;
     }
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = std::string(accept ? "Accepted" : "Declined") +
-               " QSY suggestion from " + qsy_suggestion_from_;
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat(std::string(accept ? "Accepted" : "Declined") +
+               " QSY suggestion from " + qsy_suggestion_from_);
 
     qsy_suggestion_pending_ = false;
     qsy_suggestion_from_.clear();
@@ -5762,13 +5583,7 @@ void App::updateQsyWorkflow() {
             return;
         }
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "QSY ACK timeout. Returning to calling frequency and retrying connect.";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("QSY ACK timeout. Returning to calling frequency and retrying connect.");
 
         returnToCallingFrequency("");
         qsy_workflow_state_ = QsyWorkflowState::ReconnectPending;
@@ -5797,13 +5612,7 @@ void App::updateQsyWorkflow() {
             if (!ok) logCommandFailure("Reconnect call to " + peer + " not started", "CONNECT", response);
         });
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Reconnecting to " + qsy_workflow_peer_ + " on calling frequency...";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Reconnecting to " + qsy_workflow_peer_ + " on calling frequency...");
         return;
     }
 
@@ -5819,14 +5628,8 @@ void App::updateQsyWorkflow() {
 
         const int max_attempts = std::clamp(config_.radio.qsy_max_reconnect_attempts, 1, 10);
         if (qsy_reconnect_attempts_ >= max_attempts) {
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = "QSY recovery failed after " + std::to_string(max_attempts) +
-                       " attempts. Disconnecting workflow.";
-            msg.is_outgoing = false;
-            msg.timestamp = unixNowSeconds();
-            chat_history_.push_back(msg);
-            chat_scroll_to_bottom_ = true;
+            appendSystemChat("QSY recovery failed after " + std::to_string(max_attempts) +
+                       " attempts. Disconnecting workflow.");
             resetQsyWorkflow(true);
             return;
         }
@@ -5837,15 +5640,9 @@ void App::updateQsyWorkflow() {
         qsy_reconnect_due_ = now + std::chrono::milliseconds(delay_ms);
         (void)modem_->disconnectStation();
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Reconnect attempt timed out. Scheduling retry " +
+        appendSystemChat("Reconnect attempt timed out. Scheduling retry " +
                    std::to_string(qsy_reconnect_attempts_) + "/" +
-                   std::to_string(max_attempts) + ".";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+                   std::to_string(max_attempts) + ".");
     }
 }
 
@@ -5876,7 +5673,7 @@ bool App::qsyTargetInBand(const std::string& band, int slot, uint32_t frequency_
     if (!freq_mgr_) {
         return false;
     }
-    const auto band_cfg = freq_mgr_->getBand(trimSpaces(band));
+    const auto band_cfg = freq_mgr_->getBand(gui::trimCopy(band));
     if (!band_cfg) {
         return false;
     }
@@ -5890,20 +5687,24 @@ bool App::qsyTargetInBand(const std::string& band, int slot, uint32_t frequency_
     return slot_freq != 0 ? inside(slot_freq) : frequency_hz != 0;
 }
 
-bool App::executeQsyTarget(const std::string& band, int slot, uint32_t frequency_hz) {
-    if (!modem_ || !modem_->isConnected()) {
+bool App::executeQsyTarget(const std::string& band, int slot, uint32_t frequency_hz, std::string* why) {
+    auto fail = [why](const std::string& reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    if (!radioCanTune(why)) {
         return false;
     }
 
-    std::string target_band = trimSpaces(band);
+    std::string target_band = gui::trimCopy(band);
     if (target_band.empty()) {
-        target_band = trimSpaces(current_band_);
+        target_band = gui::trimCopy(current_band_);
     }
     if (target_band.empty()) {
-        target_band = trimSpaces(config_.radio.default_band);
+        target_band = gui::trimCopy(config_.radio.default_band);
     }
     if (target_band.empty()) {
-        return false;
+        return fail("no band");
     }
 
     int target_slot = std::clamp(slot, -120, 120);
@@ -5912,83 +5713,69 @@ bool App::executeQsyTarget(const std::string& band, int slot, uint32_t frequency
     }
 
     if (!qsyTargetInBand(target_band, target_slot, frequency_hz)) {
+        return fail("the target is outside the " + target_band + " band");
+    }
+
+    // The frequency both stations agreed on; the local slot table only
+    // fills in when none was given.
+    uint64_t freq = frequency_hz;
+    if (freq == 0 && freq_mgr_) {
+        freq = freq_mgr_->getSlotFrequency(target_band, target_slot);
+    }
+    if (freq == 0) {
+        return fail("no frequency for " + target_band + " slot " + std::to_string(target_slot));
+    }
+    if (!tuneOperatingFrequency(freq, false, why)) {
         return false;
     }
-
-    bool ok = false;
-    if (freq_mgr_) {
-        ok = radio_ && freq_mgr_->qsyToSlot(*radio_, target_band, target_slot);
-    }
-    if (!ok) {
-        uint64_t freq = frequency_hz;
-        if (freq == 0 && freq_mgr_) {
-            freq = freq_mgr_->getSlotFrequency(target_band, target_slot);
-        }
-        if (freq > 0) {
-            ok = tuneOperatingFrequency(freq, false);
-        }
-    }
-    if (ok) {
-        current_band_ = target_band;
-        current_slot_ = target_slot;
-        if (freq_mgr_) {
-            const uint64_t slot_freq = freq_mgr_->getSlotFrequency(target_band, target_slot);
-            if (slot_freq > 0) {
-                current_frequency_hz_ = static_cast<uint32_t>(slot_freq);
-            }
-        }
-    }
-    return ok;
+    current_band_ = target_band;
+    current_slot_ = target_slot;
+    return true;
 }
 
-void App::returnToCallingFrequency(const std::string& reason) {
-    if (!modem_ || !modem_->isConnected()) {
-        return;
-    }
-
-    std::string band = trimSpaces(qsy_target_band_);
+bool App::returnToCallingFrequency(const std::string& reason) {
+    std::string band = gui::trimCopy(qsy_target_band_);
     if (band.empty()) {
-        band = trimSpaces(current_band_);
+        band = gui::trimCopy(current_band_);
     }
     if (band.empty()) {
-        band = trimSpaces(config_.radio.default_band);
+        band = gui::trimCopy(config_.radio.default_band);
     }
     if (band.empty()) {
         band = "40m";
     }
 
-    bool ok = false;
-    uint64_t calling_freq = 0;
-    if (freq_mgr_) {
-        calling_freq = freq_mgr_->getCallingFrequency(band);
-        ok = radio_ && freq_mgr_->qsyToCallingFrequency(*radio_, band);
+    const uint64_t calling_freq = freq_mgr_ ? freq_mgr_->getCallingFrequency(band) : 0;
+    const std::string mhz = calling_freq > 0 ? std::to_string(calling_freq / 1000000.0).substr(0, 7) + " MHz"
+                                             : std::string("?");
+    if (calling_freq == 0) {
+        if (!reason.empty()) {
+            appendSystemChat(reason + ": no calling frequency is known for " + band);
+        }
+        return false;
     }
-    if (!ok && calling_freq > 0) {
-        ok = tuneOperatingFrequency(calling_freq, false);
+
+    std::string why;
+    if (!radioCanTune(&why)) {
+        // Without CAT control the operator tunes by hand; say so only when
+        // a return was actually called for.
+        if (!reason.empty()) {
+            appendSystemChat(reason + ": " + why + "; set the dial to " + mhz + " yourself");
+        }
+        return false;
     }
-    if (!ok) {
-        return;
+    if (!tuneOperatingFrequency(calling_freq, false, &why)) {
+        appendSystemChat((reason.empty() ? std::string("Return to the calling frequency") : reason) +
+                         " FAILED: the radio did not move to " + mhz + " (" + why + ")");
+        return false;
     }
 
     current_band_ = band;
     current_slot_ = 0;
-    if (calling_freq > 0) {
-        current_frequency_hz_ = static_cast<uint32_t>(calling_freq);
-    }
-
     if (!reason.empty()) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        if (calling_freq > 0) {
-            msg.text = reason + " (" + std::to_string(calling_freq / 1000000.0).substr(0, 7) + " MHz)";
-        } else {
-            msg.text = reason;
-        }
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat(reason + " (" + mhz + ")");
     }
+    return true;
 }
 
 bool App::buildAutoQsyTarget(std::string* band_out, int* slot_out, uint32_t* freq_hz_out) const {
@@ -5996,9 +5783,9 @@ bool App::buildAutoQsyTarget(std::string* band_out, int* slot_out, uint32_t* fre
         return false;
     }
 
-    std::string band = trimSpaces(current_band_);
+    std::string band = gui::trimCopy(current_band_);
     if (band.empty()) {
-        band = trimSpaces(config_.radio.default_band);
+        band = gui::trimCopy(config_.radio.default_band);
     }
     if (band.empty()) {
         band = "40m";
@@ -6023,37 +5810,65 @@ bool App::buildAutoQsyTarget(std::string* band_out, int* slot_out, uint32_t* fre
     return true;
 }
 
-void App::addHeardStation(const std::string& callsign) {
+void App::recordHeardCall(const std::string& callsign, const std::string& family,
+                          std::optional<float> snr) {
     const std::string normalized = normalizeCallsign(callsign);
     if (normalized.empty() || normalized == "UNKNOWN" || isLikelyHashId(normalized)) {
         return;
     }
-
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    char time_str[32];
-    std::strftime(time_str, sizeof(time_str), "%H:%M:%S", std::localtime(&time_t));
-
-    // Remove if already in list
-    heard_stations_.erase(
-        std::remove_if(heard_stations_.begin(), heard_stations_.end(),
-                       [&](const auto& p) { return p.first == normalized; }),
-        heard_stations_.end());
-
-    // Add to front
-    heard_stations_.push_front({normalized, time_str});
-
-    // Limit size
-    while (heard_stations_.size() > MAX_HEARD_STATIONS) {
-        heard_stations_.pop_back();
+    heard_calls_.erase(std::remove_if(heard_calls_.begin(), heard_calls_.end(),
+                                      [&](const HeardCall& c) { return c.callsign == normalized; }),
+                       heard_calls_.end());
+    HeardCall call;
+    call.callsign = normalized;
+    call.timestamp = unixNowSeconds();
+    call.band = current_band_;
+    call.family = family;
+    call.snr_valid = snr.has_value();
+    call.snr_db = snr.value_or(std::numeric_limits<float>::quiet_NaN());
+    heard_calls_.push_front(std::move(call));
+    while (heard_calls_.size() > MAX_HEARD_CALLS) {
+        heard_calls_.pop_back();
     }
 }
 
-bool App::tuneOperatingFrequency(uint64_t freq_hz, bool update_selection) {
-    if (!radio_ || !radio_->isConnected() || freq_hz == 0) {
+bool App::radioCanTune(std::string* why) const {
+    std::string reason;
+    if (!radio_ || normalizeRadioBackend(config_.radio.backend) == "none") {
+        reason = "no radio control is configured (Settings > Radio)";
+    } else if (!radio_->isConnected()) {
+        reason = "the radio is not connected";
+    } else if (radio_->isDryRun()) {
+        reason = "radio control is in dry-run mode (no rig model selected)";
+    }
+    if (why) {
+        *why = reason;
+    }
+    return reason.empty();
+}
+
+std::optional<uint64_t> App::knownDialFrequencyHz() const {
+    if (!radio_) {
+        return std::nullopt;
+    }
+    const RadioController::Status rs = radio_->getStatus();
+    if (!rs.connected || rs.dry_run || rs.frequency_hz == 0) {
+        return std::nullopt;
+    }
+    return rs.frequency_hz;
+}
+
+bool App::tuneOperatingFrequency(uint64_t freq_hz, bool update_selection, std::string* why) {
+    if (freq_hz == 0) {
+        if (why) *why = "no frequency";
+        return false;
+    }
+    if (!radioCanTune(why)) {
         return false;
     }
     if (!radio_->setFrequency(freq_hz)) {
+        const std::string err = radio_->getStatus().last_error;
+        if (why) *why = err.empty() ? std::string("the radio refused the frequency") : err;
         return false;
     }
 
@@ -6071,6 +5886,34 @@ bool App::tuneOperatingFrequency(uint64_t freq_hz, bool update_selection) {
     return true;
 }
 
+// Main-window frequency selector. Tuning needs the rig, not the modem.
+bool App::setOperatingFrequencyFromUi(uint64_t freq_hz) {
+    const std::string khz = std::to_string(freq_hz / 1000.0).substr(0, 8) + " kHz";
+    std::string why;
+    if (tuneOperatingFrequency(freq_hz, true, &why)) {
+        appendSystemChat("Radio tuned to " + khz + " (" + current_band_ + ")");
+        return true;
+    }
+    if (!radio_ || normalizeRadioBackend(config_.radio.backend) == "none") {
+        // No CAT control: the band selection stands, the dial is manual.
+        if (freq_mgr_) {
+            if (auto band = freq_mgr_->frequencyToBand(freq_hz)) {
+                current_band_ = *band;
+            }
+        }
+        appendSystemChat("No radio control: set the dial to " + khz + " yourself");
+        return false;
+    }
+    appendSystemChat("Radio NOT tuned to " + khz + ": " + why);
+    // Show the band the rig is really on.
+    if (auto dial = knownDialFrequencyHz(); dial && freq_mgr_) {
+        if (auto band = freq_mgr_->frequencyToBand(*dial)) {
+            current_band_ = *band;
+        }
+    }
+    return false;
+}
+
 void App::applyRadioConfig() {
     if (!radio_) {
         return;
@@ -6079,135 +5922,182 @@ void App::applyRadioConfig() {
     radio_->stopPttServer();
     radio_->disconnect();
     config_.radio.backend = normalizeRadioBackend(config_.radio.backend);
-    radio_->applyConfig(materializeRadioConfigForController(config_.radio));
+    radio_->applyConfig(resolveRadioConfig(config_.radio));
+    // The PTT server tells the modem client when the modem keys the rig
+    // (ModemStatus::ptt_active: TX badge, mesh busy gate). K5.
+    radio_->onPttRequest([modem = modem_.get()](bool keyed) { modem->setPttActive(keyed); });
 
-    if (config_.radio.ptt_server_enabled) {
-        (void)radio_->startPttServer();
+    if (config_.radio.ptt_server_enabled && !radio_->startPttServer()) {
+        const std::string err = radio_->getStatus().last_error;
+        appendSystemChat("PTT server could not start on " + config_.radio.ptt_server_bind + ":" +
+                         std::to_string(config_.radio.ptt_server_port) +
+                         (err.empty() ? std::string() : " (" + err + ")"));
     }
     if (normalizeRadioBackend(config_.radio.backend) != "none" &&
         config_.radio.auto_connect) {
-        (void)radio_->connect();
+        if (!radio_->connect()) {
+            const std::string err = radio_->getStatus().last_error;
+            appendSystemChat("Radio control could not connect" +
+                             (err.empty() ? std::string() : ": " + err));
+        } else if (radio_->isDryRun()) {
+            appendSystemChat("Radio control is in dry-run mode: frequency and PTT commands do NOT reach a rig");
+        }
     }
+    // Point the modem at the (possibly moved) PTT server.
+    pushPttSettingsToModem();
 }
 
 // ============================================================================
 // Channel Sniffer
 // ============================================================================
 
+// Steps the rig through the band's slots, recording a slot busy if the
+// modem saw it busy at any time while listening there. The rig goes back to
+// where it was when the scan ends, for any reason. With the FrequencyManager
+// slot scanner (K28) the scanner owns timing and busy sampling and this only
+// tunes and reports; otherwise the dwell runs here.
 void App::startChannelSniffer() {
     if (!modem_ || !freq_mgr_) return;
-
-    channel_sniffer_active_ = true;
-    sniffer_current_slot_ = 0;
-    slot_status_.clear();
+    if (channel_sniffer_active_) {
+        appendSystemChat("Channel sniffer is already running");
+        return;
+    }
+    if (!modem_->isConnected()) {
+        appendSystemChat("Channel sniffer needs the modem (its busy detector): connect to the modem first");
+        return;
+    }
+    if (modem_->getStatus().link_state != LinkState::Idle) {
+        appendSystemChat("Channel sniffer not started: a station link or call is in progress");
+        return;
+    }
+    std::string why;
+    if (!radioCanTune(&why)) {
+        appendSystemChat("Channel sniffer needs radio (CAT) control: " + why);
+        return;
+    }
 
     // Scan the currently selected band.
     sniffer_band_ = current_band_.empty() ? std::string("40m") : current_band_;
-
-    // Initialize slot status
-    auto slots = freq_mgr_->getSlots(sniffer_band_);
+    const auto slots = freq_mgr_->getSlots(sniffer_band_);
+    if (slots.empty()) {
+        appendSystemChat("Channel sniffer: no slots are defined for " + sniffer_band_);
+        return;
+    }
+    sniffer_return_freq_hz_ = knownDialFrequencyHz().value_or(current_frequency_hz_);
+    slot_status_.clear();
     for (const auto& slot : slots) {
         slot_status_.push_back({slot.slot_number, false});
     }
-    if (slots.empty()) {
-        channel_sniffer_active_ = false;
+    sniffer_current_slot_ = 0;
+
+    const auto now = std::chrono::steady_clock::now();
+    const SlotScanStep step = freq_mgr_->beginSlotScan(sniffer_band_, sniffer_return_freq_hz_, now);
+    if (step.action != SlotScanStep::Action::Tune) {
+        slot_status_.clear();
+        appendSystemChat("Channel sniffer: the slot scanner could not start on " + sniffer_band_);
         return;
     }
 
-    // Set to first slot
-    if (!tuneOperatingFrequency(slots[0].frequency_hz)) {
-        channel_sniffer_active_ = false;
+    if (!tuneOperatingFrequency(step.frequency_hz, false, &why)) {
+        (void)freq_mgr_->abortSlotScan();
+        slot_status_.clear();
+        appendSystemChat("Channel sniffer not started: the radio did not tune (" + why + ")");
         return;
     }
 
-    sniffer_slot_start_ = std::chrono::steady_clock::now();
+    channel_sniffer_active_ = true;
+    appendSystemChat("Channel sniffer started on " + sniffer_band_ + " (" +
+                     std::to_string(slots.size()) + " slots)");
+}
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Channel sniffer started on " + sniffer_band_;
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+void App::finishChannelSniffer(const std::string& message) {
+    channel_sniffer_active_ = false;
+    // A scanner still running (stopped early) gives back the start frequency.
+    if (freq_mgr_ && freq_mgr_->isScanningSlots()) {
+        if (const auto back = freq_mgr_->abortSlotScan()) {
+            sniffer_return_freq_hz_ = *back;
+        }
+    }
+    std::string back;
+    if (sniffer_return_freq_hz_ > 0) {
+        std::string why;
+        if (tuneOperatingFrequency(sniffer_return_freq_hz_, true, &why)) {
+            back = "; radio back on " + std::to_string(sniffer_return_freq_hz_ / 1000.0).substr(0, 8) + " kHz";
+        } else {
+            back = "; the radio could NOT return to " +
+                   std::to_string(sniffer_return_freq_hz_ / 1000.0).substr(0, 8) + " kHz (" + why + ")";
+        }
+    }
+    sniffer_return_freq_hz_ = 0;
+    appendSystemChat(message + back);
 }
 
 void App::stopChannelSniffer() {
-    channel_sniffer_active_ = false;
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Channel sniffer stopped";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    if (!channel_sniffer_active_) {
+        return;
+    }
+    finishChannelSniffer("Channel sniffer stopped");
 }
 
 void App::updateChannelSniffer() {
     if (!channel_sniffer_active_ || !modem_ || !freq_mgr_) return;
 
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - sniffer_slot_start_);
+    if (!modem_->isConnected()) {
+        finishChannelSniffer("Channel sniffer stopped: the modem disconnected");
+        return;
+    }
+    if (modem_->getStatus().link_state != LinkState::Idle) {
+        finishChannelSniffer("Channel sniffer stopped: a station link or call started");
+        return;
+    }
+    const bool busy_now = modem_->getStatus().busy_detected;
+    const auto now = std::chrono::steady_clock::now();
 
-    if (elapsed.count() >= SNIFFER_DWELL_MS) {
-        auto slots = freq_mgr_->getSlots(sniffer_band_);
-        if (slots.empty()) {
-            channel_sniffer_active_ = false;
-            return;
-        }
+    auto slots = freq_mgr_->getSlots(sniffer_band_);
+    if (slots.empty() || slots.size() != slot_status_.size()) {
+        finishChannelSniffer("Channel sniffer stopped: the slot plan for " + sniffer_band_ + " changed");
+        return;
+    }
 
-        // Record busy status for current slot
-        if (sniffer_current_slot_ < static_cast<int>(slot_status_.size())) {
-            const bool busy = modem_->getStatus().busy_detected;
-            slot_status_[sniffer_current_slot_].second = busy;
-            const int slot_number = slot_status_[sniffer_current_slot_].first;
-            freq_mgr_->updateSlotStatus(sniffer_band_, slot_number, busy ? SlotStatus::InUse : SlotStatus::Available);
-        }
-
-        // Move to next slot
-        sniffer_current_slot_++;
-
-        if (sniffer_current_slot_ >= static_cast<int>(slots.size())) {
-            // Complete - cycle done
-            channel_sniffer_active_ = false;
-
-            // Find best (free) slot. Slot numbers may be negative, so track
-            // "found" separately from the value.
-            int best_slot = 0;
-            bool found_free = false;
-            for (const auto& status : slot_status_) {
-                if (!status.second) {  // Not busy
-                    best_slot = status.first;
-                    found_free = true;
-                    break;
-                }
+    auto best_slot_text = [&]() {
+        int best_slot = 0;
+        bool found_free = false;
+        for (const auto& status : slot_status_) {
+            if (!status.second) {
+                best_slot = status.first;
+                found_free = true;
+                break;
             }
-
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            if (found_free) {
-                const uint64_t freq_hz = freq_mgr_->getSlotFrequency(sniffer_band_, best_slot);
-                const std::string slot_label = (best_slot >= 0 ? "+" : "") + std::to_string(best_slot);
-                msg.text = "Sniffer complete on " + sniffer_band_ + ". Best slot: " + slot_label +
-                           " (" + std::to_string(freq_hz / 1000) + " kHz)";
-            } else {
-                msg.text = "Sniffer complete on " + sniffer_band_ + ". All slots busy!";
-            }
-            msg.is_outgoing = false;
-            msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            chat_history_.push_back(msg);
-            chat_scroll_to_bottom_ = true;
-        } else {
-            // Set frequency to next slot
-            if (!tuneOperatingFrequency(slots[sniffer_current_slot_].frequency_hz)) {
-                channel_sniffer_active_ = false;
-                return;
-            }
-            sniffer_slot_start_ = now;
         }
+        if (!found_free) {
+            return "Sniffer complete on " + sniffer_band_ + ". All slots busy!";
+        }
+        const uint64_t freq_hz = freq_mgr_->getSlotFrequency(sniffer_band_, best_slot);
+        return "Sniffer complete on " + sniffer_band_ + ". Best slot: " + (best_slot >= 0 ? "+" : "") +
+               std::to_string(best_slot) + " (" + std::to_string(freq_hz / 1000) + " kHz)";
+    };
+
+    const int listening = freq_mgr_->scanningSlot();
+    const SlotScanStep step = freq_mgr_->updateSlotScan(busy_now, now, unixNowSeconds());
+    // Mirror the scanner's verdicts for the Frequency window.
+    const auto fresh = freq_mgr_->getSlots(sniffer_band_);
+    for (size_t i = 0; i < fresh.size() && i < slot_status_.size(); ++i) {
+        slot_status_[i].second = fresh[i].status == SlotStatus::InUse;
+        if (fresh[i].slot_number == listening) {
+            sniffer_current_slot_ = static_cast<int>(i);
+        }
+    }
+    if (step.action == SlotScanStep::Action::Tune) {
+        std::string why;
+        if (!tuneOperatingFrequency(step.frequency_hz, false, &why)) {
+            finishChannelSniffer("Channel sniffer stopped: the radio did not tune to the next slot (" +
+                                 why + ")");
+        }
+    } else if (step.action == SlotScanStep::Action::Done) {
+        sniffer_return_freq_hz_ = step.frequency_hz;
+        const auto choice = freq_mgr_->chooseBestSlot(sniffer_band_);
+        finishChannelSniffer("Sniffer complete on " + sniffer_band_ + ": " +
+                             (choice.reason.empty() ? best_slot_text() : choice.reason));
     }
 }
 
@@ -6361,22 +6251,40 @@ void App::updateGPS() {
 
     char buf[256];
     DWORD bytes_read = 0;
-    if (ReadFile(gps_handle_, buf, sizeof(buf) - 1, &bytes_read, nullptr) && bytes_read > 0) {
-        buf[bytes_read] = '\0';
-        gps_buffer_ += buf;
+    if (!ReadFile(gps_handle_, buf, sizeof(buf) - 1, &bytes_read, nullptr)) {
+        const std::string port = gps_port_;
+        closeGPSPort();
+        appendSystemChat("GPS: read error on " + port + "; port closed");
+        return;
+    }
+    if (bytes_read > 0) {
+        gps_buffer_.append(buf, bytes_read);
         processGPSData();
     }
 #else
     if (gps_serial_fd_ < 0) return;
 
     char buf[256];
-    ssize_t n = read(gps_serial_fd_, buf, sizeof(buf) - 1);
+    const ssize_t n = read(gps_serial_fd_, buf, sizeof(buf));
     if (n > 0) {
-        buf[n] = '\0';
-        gps_buffer_ += buf;
+        gps_buffer_.append(buf, static_cast<size_t>(n));
         processGPSData();
+    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        // Unplugged or failed device: close it so the UI shows it closed.
+        const std::string port = gps_port_;
+        const std::string err = std::strerror(errno);
+        closeGPSPort();
+        appendSystemChat("GPS: read error on " + port + " (" + err + "); port closed");
+        return;
     }
 #endif
+    // A fix nobody has confirmed for a while is no fix.
+    if (gps_fix_valid_ &&
+        std::chrono::steady_clock::now() - last_gps_update_ > std::chrono::milliseconds(GPS_FIX_STALE_MS)) {
+        gps_fix_valid_ = false;
+        appendSystemChat("GPS fix lost (no valid position for " +
+                         std::to_string(GPS_FIX_STALE_MS / 1000) + " s)");
+    }
 }
 
 void App::processGPSData() {
@@ -6402,102 +6310,22 @@ void App::processGPSData() {
     }
 }
 
+// One NMEA parser for the app (NMEAParser: checksum, GGA/RMC/GLL).
 void App::parseNMEASentence(const std::string& sentence) {
-    // Parse NMEA sentences
-    // $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,...
-    // $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,...
-
-    if (sentence.substr(0, 6) == "$GPGGA" || sentence.substr(0, 6) == "$GNGGA") {
-        // Parse GGA sentence
-        std::vector<std::string> fields;
-        std::string field;
-        for (char c : sentence) {
-            if (c == ',' || c == '*') {
-                fields.push_back(field);
-                field.clear();
-            } else {
-                field += c;
-            }
-        }
-        if (!field.empty()) fields.push_back(field);
-
-        if (fields.size() >= 10) {
-            try {
-                // Fix quality (0=invalid, 1=GPS, 2=DGPS)
-                int fix_quality = std::stoi(fields[6]);
-                gps_fix_valid_ = (fix_quality > 0);
-
-                if (gps_fix_valid_) {
-                    // Parse latitude: DDMM.MMMM
-                    double lat_raw = std::stod(fields[2]);
-                    int lat_deg = static_cast<int>(lat_raw / 100);
-                    double lat_min = lat_raw - (lat_deg * 100);
-                    double lat = lat_deg + lat_min / 60.0;
-                    if (fields[3] == "S") lat = -lat;
-
-                    // Parse longitude: DDDMM.MMMM
-                    double lon_raw = std::stod(fields[4]);
-                    int lon_deg = static_cast<int>(lon_raw / 100);
-                    double lon_min = lon_raw - (lon_deg * 100);
-                    double lon = lon_deg + lon_min / 60.0;
-                    if (fields[5] == "W") lon = -lon;
-
-                    // Update position
-                    my_lat_ = lat;
-                    my_lon_ = lon;
-                    last_gps_update_ = std::chrono::steady_clock::now();
-
-                    // Update APRS if configured
-                    if (aprs_) {
-                        aprs_->setMyPosition(lat, lon);
-                    }
-                }
-            } catch (const std::exception&) {
-                // Malformed NMEA field - ignore this sentence
-                gps_fix_valid_ = false;
-            }
-        }
-    } else if (sentence.substr(0, 6) == "$GPRMC" || sentence.substr(0, 6) == "$GNRMC") {
-        // Parse RMC sentence (can also provide position)
-        std::vector<std::string> fields;
-        std::string field;
-        for (char c : sentence) {
-            if (c == ',' || c == '*') {
-                fields.push_back(field);
-                field.clear();
-            } else {
-                field += c;
-            }
-        }
-        if (!field.empty()) fields.push_back(field);
-
-        if (fields.size() >= 10 && fields[2] == "A") {  // A = Active (valid fix)
-            try {
-                double lat_raw = std::stod(fields[3]);
-                int lat_deg = static_cast<int>(lat_raw / 100);
-                double lat_min = lat_raw - (lat_deg * 100);
-                double lat = lat_deg + lat_min / 60.0;
-                if (fields[4] == "S") lat = -lat;
-
-                double lon_raw = std::stod(fields[5]);
-                int lon_deg = static_cast<int>(lon_raw / 100);
-                double lon_min = lon_raw - (lon_deg * 100);
-                double lon = lon_deg + lon_min / 60.0;
-                if (fields[6] == "W") lon = -lon;
-
-                gps_fix_valid_ = true;
-                my_lat_ = lat;
-                my_lon_ = lon;
-                last_gps_update_ = std::chrono::steady_clock::now();
-
-                if (aprs_) {
-                    aprs_->setMyPosition(lat, lon);
-                }
-            } catch (const std::exception&) {
-                // Malformed NMEA field - ignore this sentence
-                gps_fix_valid_ = false;
-            }
-        }
+    NMEAParser parser;
+    const GPSData fix = parser.parse(sentence);
+    if (!fix.valid || !app_detail::isValidLatLon(fix.latitude, fix.longitude)) {
+        return;
+    }
+    if (!gps_fix_valid_) {
+        appendSystemChat("GPS fix acquired");
+    }
+    gps_fix_valid_ = true;
+    my_lat_ = fix.latitude;
+    my_lon_ = fix.longitude;
+    last_gps_update_ = std::chrono::steady_clock::now();
+    if (aprs_) {
+        aprs_->setMyPosition(fix.latitude, fix.longitude, fix.altitude_m);
     }
 }
 
@@ -6514,15 +6342,16 @@ void App::startEmailGateway() {
     relay_diagnostics_.queue_policy_state = "idle";
     relay_diagnostics_.last_result = "idle";
     relay_diagnostics_.last_error.clear();
+    last_outbox_retry_ = last_email_check_;
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Email gateway started";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    if (!emailAccountConfigured(config_)) {
+        appendSystemChat("Email gateway started, but no SMTP or Winlink account is configured "
+                         "(Settings > Email): nothing can be delivered yet");
+    } else {
+        appendSystemChat("Email gateway started");
+    }
+    // Deliver whatever was waiting.
+    sendQueuedEmails();
 }
 
 void App::stopEmailGateway() {
@@ -6531,14 +6360,10 @@ void App::stopEmailGateway() {
     relay_diagnostics_.queue_policy_state = "stopped";
     relay_diagnostics_.last_result = "stopped";
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Email gateway stopped";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat(email_outbox_.empty()
+                         ? std::string("Email gateway stopped")
+                         : "Email gateway stopped; " + std::to_string(email_outbox_.size()) +
+                               " outgoing email(s) stay queued until it is started again");
 }
 
 void App::updateEmailGateway() {
@@ -6553,15 +6378,15 @@ void App::updateEmailGateway() {
     bool poll_pop3 = false;
     bool poll_winlink = false;
 
-    if (!trimSpaces(config_.email.pop3_host).empty()) {
+    if (!gui::trimCopy(config_.email.pop3_host).empty()) {
         auto pop3_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_pop3_check_);
         poll_pop3 = pop3_elapsed.count() >= pop3_interval_sec;
     }
 
     if (config_.email.winlink_telnet_enabled &&
-        !trimSpaces(config_.email.winlink_telnet_host).empty() &&
+        !gui::trimCopy(config_.email.winlink_telnet_host).empty() &&
         !normalizeCallsign(config_.email.winlink_telnet_callsign).empty() &&
-        !trimSpaces(config_.email.winlink_telnet_password).empty()) {
+        !gui::trimCopy(config_.email.winlink_telnet_password).empty()) {
         auto winlink_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_winlink_check_);
         poll_winlink = winlink_elapsed.count() >= winlink_interval_sec;
     }
@@ -6588,9 +6413,9 @@ bool App::startEmailGatewayJob(bool poll_pop3, bool poll_winlink, bool send_outb
 
     EmailGatewayJobInput input;
 
-    if (poll_pop3 && !trimSpaces(config_.email.pop3_host).empty()) {
+    if (poll_pop3 && !gui::trimCopy(config_.email.pop3_host).empty()) {
         input.poll_pop3 = true;
-        input.pop3.host = trimSpaces(config_.email.pop3_host);
+        input.pop3.host = gui::trimCopy(config_.email.pop3_host);
         input.pop3.port = config_.email.pop3_port;
         input.pop3.use_tls = config_.email.pop3_use_tls;
         input.pop3.username = config_.email.pop3_username;
@@ -6601,12 +6426,12 @@ bool App::startEmailGatewayJob(bool poll_pop3, bool poll_winlink, bool send_outb
 
     const bool winlink_ready =
         config_.email.winlink_telnet_enabled &&
-        !trimSpaces(config_.email.winlink_telnet_host).empty() &&
+        !gui::trimCopy(config_.email.winlink_telnet_host).empty() &&
         !normalizeCallsign(config_.email.winlink_telnet_callsign).empty() &&
-        !trimSpaces(config_.email.winlink_telnet_password).empty();
+        !gui::trimCopy(config_.email.winlink_telnet_password).empty();
     if (poll_winlink && winlink_ready) {
         input.poll_winlink = true;
-        input.winlink_fetch.host = trimSpaces(config_.email.winlink_telnet_host);
+        input.winlink_fetch.host = gui::trimCopy(config_.email.winlink_telnet_host);
         input.winlink_fetch.port = config_.email.winlink_telnet_port;
         input.winlink_fetch.use_tls = config_.email.winlink_telnet_use_tls;
         input.winlink_fetch.callsign = normalizeCallsign(config_.email.winlink_telnet_callsign);
@@ -6675,7 +6500,7 @@ void App::keepInboundLocally(const std::string& from,
                              const std::string& subject,
                              const std::string& body,
                              const std::string& message_id) {
-    const std::string mid = trimSpaces(message_id);
+    const std::string mid = gui::trimCopy(message_id);
     if (!mid.empty()) {
         const bool seen = std::any_of(mail_inbox_.begin(), mail_inbox_.end(),
                                       [&](const MailMessage& m) { return m.message_id == mid; });
@@ -6686,9 +6511,9 @@ void App::keepInboundLocally(const std::string& from,
 
     MailMessage mail;
     mail.message_id = mid;
-    mail.from = trimSpaces(from).empty() ? std::string("EMAIL") : trimSpaces(from);
-    mail.to = trimSpaces(to);
-    mail.subject = trimSpaces(subject).empty() ? std::string("Internet message") : subject;
+    mail.from = gui::trimCopy(from).empty() ? std::string("EMAIL") : gui::trimCopy(from);
+    mail.to = gui::trimCopy(to);
+    mail.subject = gui::trimCopy(subject).empty() ? std::string("Internet message") : subject;
     mail.body = body;
     mail.display_body = body;
     mail.timestamp = unixNowSeconds();
@@ -6705,20 +6530,47 @@ void App::keepInboundLocally(const std::string& from,
                      " in the local inbox (no radio callsign to relay to)");
 }
 
-void App::relayEmailToRadio(const Message& email) {
-    // Convert email to store-and-forward message for radio
-    Message radio_msg;
-    radio_msg.from_callsign = config_.station.callsign;
-    radio_msg.to_callsign = email.to_callsign;  // Should be a callsign
-    radio_msg.subject = email.subject;
-    radio_msg.body = email.body;
-    radio_msg.status = MessageStatus::Pending;
-    radio_msg.created_at = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
-    if (store_) {
-        store_->createMessage(radio_msg);
+// Messages window "Send Email": validated, stored, queued, and handed to
+// the gateway at once when it runs. True only when it was really queued.
+bool App::queueOutgoingEmail(const std::string& to, const std::string& subject,
+                             const std::string& body, const std::string& from,
+                             std::string* error) {
+    auto refuse = [&](const std::string& why) {
+        if (error) *error = why;
+        appendSystemChat("Email not queued: " + why);
+        return false;
+    };
+    const std::string addr = gui::trimCopy(to);
+    if (!looksLikeEmailAddress(addr)) {
+        return refuse("\"" + addr + "\" is not an email address");
     }
+    if (!store_ || !store_->isOpen()) {
+        return refuse("the message store is not open");
+    }
+    Message email;
+    email.type = MessageType::Email;
+    email.status = MessageStatus::Pending;
+    email.from_callsign = gui::trimCopy(from).empty() ? normalizeCallsign(config_.station.callsign) : from;
+    email.to_callsign = addr;
+    email.subject = subject;
+    email.body = body;
+    email.created_at = unixNowSeconds();
+    email.id = store_->createMessage(email);
+    if (email.id <= 0) {
+        return refuse("it could not be stored");
+    }
+    relayRadioToEmail(email);
+    if (!emailAccountConfigured(config_)) {
+        appendSystemChat("Email to " + addr + " queued, but no SMTP or Winlink account is configured "
+                         "(Settings > Email); it will be sent once one is");
+    } else if (!email_gateway_active_) {
+        appendSystemChat("Email to " + addr + " queued; the email gateway is stopped. "
+                         "Start it (Settings > Email) to send.");
+    } else {
+        appendSystemChat("Email to " + addr + " queued for delivery");
+        sendQueuedEmails();
+    }
+    return true;
 }
 
 void App::relayRadioToEmail(const Message& msg) {
@@ -6744,7 +6596,7 @@ void App::applyInboundEmail(const EmailGatewayJobOutput& output) {
             return false;
         }
 
-        const std::string mid = trimSpaces(message_id);
+        const std::string mid = gui::trimCopy(message_id);
         if (!mid.empty()) {
             const bool already_queued = std::any_of(radio_outbox_.begin(), radio_outbox_.end(),
                                                     [&](const Message& m) { return m.message_id == mid; });
@@ -6759,9 +6611,9 @@ void App::applyInboundEmail(const EmailGatewayJobOutput& output) {
         Message msg;
         msg.type = MessageType::Email;
         msg.status = MessageStatus::Pending;
-        msg.from_callsign = trimSpaces(from).empty() ? "EMAIL" : trimSpaces(from);
+        msg.from_callsign = gui::trimCopy(from).empty() ? "EMAIL" : gui::trimCopy(from);
         msg.to_callsign = target_callsign;
-        msg.subject = trimSpaces(subject).empty() ? ("Internet message for " + target_callsign)
+        msg.subject = gui::trimCopy(subject).empty() ? ("Internet message for " + target_callsign)
                                                   : subject;
         msg.body = body;
         msg.message_id = mid;
@@ -6826,7 +6678,7 @@ void App::applyInboundEmail(const EmailGatewayJobOutput& output) {
             relay_diagnostics_.last_error.clear();
             relay_diagnostics_.gateway_health = "active";
             for (const auto& inbound : wl_result.messages) {
-                const std::string subject = trimSpaces(inbound.subject).empty()
+                const std::string subject = gui::trimCopy(inbound.subject).empty()
                     ? std::string("Winlink inbound message")
                     : inbound.subject;
                 const std::string body = inbound.body.empty() ? inbound.raw : inbound.body;
@@ -6846,14 +6698,8 @@ void App::applyInboundEmail(const EmailGatewayJobOutput& output) {
     }
 
     if (queued_for_radio > 0) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Queued " + std::to_string(queued_for_radio) +
-                   " inbound internet message(s) for radio relay";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Queued " + std::to_string(queued_for_radio) +
+                   " inbound internet message(s) for radio relay");
     }
 }
 
@@ -6873,13 +6719,13 @@ void App::prepareQueuedEmails(EmailGatewayJobInput& input) {
         return;
     }
 
-    const bool smtp_ready = !trimSpaces(config_.email.smtp_host).empty() &&
-                            !trimSpaces(config_.email.smtp_username).empty();
+    const bool smtp_ready = !gui::trimCopy(config_.email.smtp_host).empty() &&
+                            !gui::trimCopy(config_.email.smtp_username).empty();
     const bool winlink_telnet_ready =
         config_.email.winlink_telnet_enabled &&
-        !trimSpaces(config_.email.winlink_telnet_host).empty() &&
+        !gui::trimCopy(config_.email.winlink_telnet_host).empty() &&
         !normalizeCallsign(config_.email.winlink_telnet_callsign).empty() &&
-        !trimSpaces(config_.email.winlink_telnet_password).empty();
+        !gui::trimCopy(config_.email.winlink_telnet_password).empty();
 
     relay_diagnostics_.last_attempt_unix = unixNowSeconds();
     relay_diagnostics_.last_mode = "internet-relay";
@@ -6894,7 +6740,7 @@ void App::prepareQueuedEmails(EmailGatewayJobInput& input) {
 
     input.winlink_send_ready = winlink_telnet_ready;
     if (winlink_telnet_ready) {
-        input.winlink_send.host = trimSpaces(config_.email.winlink_telnet_host);
+        input.winlink_send.host = gui::trimCopy(config_.email.winlink_telnet_host);
         input.winlink_send.port = config_.email.winlink_telnet_port;
         input.winlink_send.use_tls = config_.email.winlink_telnet_use_tls;
         input.winlink_send.callsign = normalizeCallsign(config_.email.winlink_telnet_callsign);
@@ -6908,6 +6754,8 @@ void App::prepareQueuedEmails(EmailGatewayJobInput& input) {
         input.smtp.username = config_.email.smtp_username;
         input.smtp.password = config_.email.smtp_password;
         input.smtp.from = config_.email.smtp_username;  // Use SMTP login as From
+        // Operator name as the From display name (K20).
+        input.smtp.from_name = gui::trimCopy(config_.station.name);
     }
 
     email_inflight_ = std::move(email_outbox_);
@@ -6915,11 +6763,15 @@ void App::prepareQueuedEmails(EmailGatewayJobInput& input) {
     for (const auto& msg : email_inflight_) {
         EmailGatewayOutgoing out;
         out.store_id = msg.id;
-        out.to = trimSpaces(msg.to_callsign);
+        out.to = gui::trimCopy(msg.to_callsign);
         out.subject = msg.subject.empty()
             ? ("Radio message from " + msg.from_callsign)
             : msg.subject;
         out.body = msg.body;
+        // Same outbox item, same Winlink id: a retry cannot duplicate it.
+        out.winlink_message_id = stableWinlinkMessageId(
+            normalizeCallsign(config_.station.callsign) + "|" + msg.message_id + "|" +
+            std::to_string(msg.id) + "|" + std::to_string(msg.created_at));
         input.outgoing.push_back(std::move(out));
     }
 }
@@ -6942,7 +6794,7 @@ void App::applyEmailSendResults(const EmailGatewayJobOutput& output) {
             failed.push_back(msg);
             continue;
         }
-        relay_diagnostics_.last_target = trimSpaces(msg.to_callsign);
+        relay_diagnostics_.last_target = gui::trimCopy(msg.to_callsign);
         relay_diagnostics_.last_attempt_unix = unixNowSeconds();
         relay_diagnostics_.last_failover_reason.clear();
 
@@ -6983,6 +6835,8 @@ void App::applyEmailSendResults(const EmailGatewayJobOutput& output) {
                 : ("relay-ok/" + lowerAscii(result.relay_mode));
             relay_diagnostics_.last_error.clear();
             relay_diagnostics_.gateway_health = "relay-ok";
+            appendSystemChat("[EMAIL] Sent to " + gui::trimCopy(msg.to_callsign) +
+                             (result.relay_mode.empty() ? std::string() : " via " + result.relay_mode));
         } else {
             relay_diagnostics_.total_fail++;
             relay_diagnostics_.consecutive_failures++;
@@ -6993,6 +6847,13 @@ void App::applyEmailSendResults(const EmailGatewayJobOutput& output) {
             if (store_ && store_->isOpen()) {
                 store_->markAsFailed(msg.id);
             }
+            // Said once per message; it stays queued and is retried.
+            if (msg.retry_count == 0) {
+                appendSystemChat("[EMAIL] Not sent to " + gui::trimCopy(msg.to_callsign) + ": " +
+                                 (result.error.empty() ? std::string("delivery failed") : result.error) +
+                                 " (kept queued, retrying)");
+            }
+            msg.retry_count++;
             failed.push_back(msg);
         }
     }
@@ -7018,7 +6879,7 @@ void App::recordStationLocation(const std::string& callsign,
                                 const std::string& grid_square,
                                 const std::string& details,
                                 StationLocationSource source,
-                                float snr,
+                                std::optional<float> snr,
                                 bool email_gateway,
                                 int64_t timestamp) {
     const std::string normalized = normalizeCallsign(callsign);
@@ -7040,7 +6901,8 @@ void App::recordStationLocation(const std::string& callsign,
 
     entry.callsign = normalized;
     entry.source = source;
-    entry.snr_db = snr;
+    // NaN = not measured (the windows show "-").
+    entry.snr_db = snr.value_or(std::numeric_limits<float>::quiet_NaN());
     entry.email_gateway = email_gateway;
     entry.timestamp = timestamp > 0 ? timestamp : unixNowSeconds();
 
@@ -7087,7 +6949,7 @@ void App::seedStationLocationsFromHistory() {
                               it->grid_square,
                               it->message,
                               StationLocationSource::Beacon,
-                              it->snr_db,
+                              std::nullopt,  // history is not a current measurement
                               it->email_gateway,
                               it->timestamp);
     }
@@ -7101,87 +6963,75 @@ void App::onAprsPositionReceived(const APRSPosition& pos) {
                           "",
                           pos.comment,
                           StationLocationSource::APRS,
-                          0.0f,
+                          std::nullopt,
                           false,
                           pos.timestamp);
 }
 
 void App::sendBeacon() {
-    if (!modem_) return;
-
-    // Build advanced beacon packet:
-    // 0xFA | snr_byte | grid_len | grid_square | flags | message
-    // flags byte: bit 0 = email gateway available
-    std::vector<uint8_t> packet;
-    packet.push_back(0xFA);  // Beacon marker
-
-    // Include current local SNR as signed byte
-    float snr = modem_->getStatus().snr_db;
-    packet.push_back(static_cast<uint8_t>(static_cast<int8_t>(snr)));
-
-    // Include grid square (length-prefixed for parsing)
-    std::string grid = config_.station.grid_square;
-    if (grid.size() > 8) grid = grid.substr(0, 8);  // Max 8-char grid
-    packet.push_back(static_cast<uint8_t>(grid.size()));
-    packet.insert(packet.end(), grid.begin(), grid.end());
-
-    // Flags byte
-    uint8_t flags = 0;
-    const bool email_gateway_available = isEmailGatewayConfigured(config_);
-    if (email_gateway_available) {
-        flags |= 0x01;  // Bit 0: email gateway available
+    if (!modem_ || !modem_->isConnected()) {
+        appendSystemChat("Beacon not sent: the modem is not connected");
+        return;
     }
-    packet.push_back(flags);
-
-    // Include callsign and beacon text.
-    // Keep legacy [EG] marker in the text so older clients still detect gateway capability.
-    std::string beacon_text = trimSpaces(config_.beacon.beacon_text);
-    if (email_gateway_available && beacon_text.find(kBeaconEmailGatewayMarker) == std::string::npos) {
-        if (!beacon_text.empty()) {
-            beacon_text += " ";
-        }
-        beacon_text += kBeaconEmailGatewayMarker;
-    }
-
-    std::string beacon = config_.station.callsign;
-    if (!beacon_text.empty()) {
-        beacon += " " + beacon_text;
-    }
-    packet.insert(packet.end(), beacon.begin(), beacon.end());
-
-    // Send as beacon (uses 4x spreading for maximum range)
-    if (!sendBroadcastPayload(packet)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Beacon send failed";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+    const std::string call = normalizeCallsign(config_.station.callsign);
+    if (call.empty()) {
+        appendSystemChat("Beacon not sent: no callsign is set (Settings > Station)");
         return;
     }
 
-    last_beacon_sent_ = std::chrono::steady_clock::now();
+    // 0xFA | grid_len | grid | flags | "<CALL> <text>" (app_detail::encodeStationBeacon)
+    app_detail::StationBeacon beacon;
+    beacon.grid = gui::trimCopy(config_.station.grid_square);
+    beacon.email_gateway = isEmailGatewayConfigured(config_);
+    beacon.text = call;
+    const std::string beacon_text = gui::trimCopy(config_.beacon.beacon_text);
+    if (!beacon_text.empty()) {
+        beacon.text += " " + beacon_text;
+    }
 
+    last_beacon_sent_ = std::chrono::steady_clock::now();
+    if (!sendBroadcastPayload(app_detail::encodeStationBeacon(beacon))) {
+        appendSystemChat("Beacon not sent: the modem did not accept it");
+    }
 }
 
 void App::updateBeacon() {
-    if (!config_.beacon.enabled || !modem_) return;
-    beacon_enabled_ = config_.beacon.enabled;  // Keep member synced
+    // The toolbar shows beacon_enabled_: keep it in step with the setting
+    // whatever happens below.
+    beacon_enabled_ = config_.beacon.enabled;
+    if (!config_.beacon.enabled || !modem_ || !modem_->isConnected()) return;
 
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_beacon_sent_);
 
-    if (elapsed.count() >= config_.beacon.interval_sec) {
-        sendBeacon();
+    if (elapsed.count() >= std::max(60, config_.beacon.interval_sec)) {
+        sendBeacon();  // stamps last_beacon_sent_ even on failure: no retry storm
+    }
+}
+
+// Gateway scoring input: when a gateway was heard and, if measured, how
+// well. An unmeasured sighting refreshes last_seen only.
+void App::recordGatewaySighting(const std::string& callsign, std::optional<float> snr_db, int64_t when) {
+    const std::string gateway_call = normalizeCallsign(callsign);
+    if (gateway_call.empty()) {
+        return;
+    }
+    auto& stats = gateway_stats_[gateway_call];
+    stats.last_seen = when;
+    auto& band_hour = gateway_stats_[gatewayBandHourKey(gateway_call, current_band_, localHourFromUnix(when))];
+    band_hour.last_seen = when;
+    if (snr_db && std::isfinite(*snr_db)) {
+        stats.snr_accum += *snr_db;
+        stats.snr_samples++;
+        band_hour.snr_accum += *snr_db;
+        band_hour.snr_samples++;
     }
 }
 
 void App::processReceivedBeacon(const std::string& from, const std::string& grid_square,
-                                  const std::string& message, float snr, bool email_gateway) {
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+                                const std::string& message, std::optional<float> snr,
+                                bool email_gateway, const std::string& family) {
+    const int64_t now = unixNowSeconds();
     recordStationLocation(from,
                           false,
                           0.0,
@@ -7205,26 +7055,22 @@ void App::processReceivedBeacon(const std::string& from, const std::string& grid
     beacon.callsign = from;
     beacon.grid_square = grid_square;
     beacon.message = message;
-    beacon.snr_db = snr;
+    beacon.snr_db = snr.value_or(std::numeric_limits<float>::quiet_NaN());  // NaN = not measured
     beacon.timestamp = now;
     beacon.has_pending_messages = has_pending;
     beacon.email_gateway = email_gateway;
+    // Where/how it was heard (G19).
+    beacon.band = current_band_;
+    beacon.family = family;
+    beacon.snr_valid = snr.has_value();
 
     if (email_gateway) {
-        const std::string gateway_call = normalizeCallsign(from);
-        auto& stats = gateway_stats_[gateway_call];
-        stats.snr_accum += snr;
-        stats.snr_samples++;
-        stats.last_seen = now;
-
-        const int hour_local = localHourFromUnix(now);
-        auto& band_hour = gateway_stats_[gatewayBandHourKey(gateway_call, current_band_, hour_local)];
-        band_hour.snr_accum += snr;
-        band_hour.snr_samples++;
-        band_hour.last_seen = now;
+        recordGatewaySighting(from, snr, now);
     }
 
     if (mesh_relay_ && mesh_relay_->isEnabled()) {
+        // Hearing a station directly is a one-hop route; its quality is
+        // unknown without a measurement.
         mesh_relay_->processBeaconRoute(normalizeCallsign(from), snr);
     }
 
@@ -7244,7 +7090,7 @@ void App::processReceivedBeacon(const std::string& from, const std::string& grid
         BeaconRecord rec;
         rec.callsign = from;
         rec.grid_square = grid_square;
-        rec.snr_db = snr;
+        rec.snr_db = snr.value_or(std::numeric_limits<float>::quiet_NaN());
         rec.message = message;
         rec.has_pending = has_pending;
         rec.email_gateway = email_gateway;
@@ -7253,10 +7099,8 @@ void App::processReceivedBeacon(const std::string& from, const std::string& grid
         store_->saveBeacon(rec);
     }
 
-    // Queue PSK Reporter spot for beacon/CQ
-    if (config_.psk_reporter.enabled && snr >= config_.psk_reporter.min_snr) {
-        queuePSKReporterSpot(from, grid_square, snr);
-    }
+    // PSK Reporter: a reception report (SNR only when measured).
+    queuePSKReporterSpot(from, grid_square, snr);
 
     // If we have pending messages, send notification
     if (has_pending) {
@@ -7264,23 +7108,20 @@ void App::processReceivedBeacon(const std::string& from, const std::string& grid
     }
 
     // System message
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Heard beacon from " + from;
+    std::string text = "Heard beacon from " + from;
     if (!grid_square.empty()) {
-        msg.text += " [" + grid_square + "]";
+        text += " [" + grid_square + "]";
     }
-    msg.text += " (SNR: " + std::to_string(static_cast<int>(snr)) + " dB)";
+    if (snr) {
+        text += " (SNR: " + std::to_string(static_cast<int>(std::lround(*snr))) + " dB)";
+    }
     if (has_pending) {
-        msg.text += " [MESSAGES WAITING]";
+        text += " [MESSAGES WAITING]";
     }
     if (email_gateway) {
-        msg.text += " [EMAIL GATEWAY]";
+        text += " [EMAIL GATEWAY]";
     }
-    msg.is_outgoing = false;
-    msg.timestamp = now;
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat(text);
 }
 
 void App::checkPendingMessagesForStation(const std::string& callsign) {
@@ -7298,171 +7139,21 @@ void App::checkPendingMessagesForStation(const std::string& callsign) {
     packet.insert(packet.end(), notification.begin(), notification.end());
 
     if (!sendBroadcastPayload(packet)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Pending message notification send failed";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+        appendSystemChat("Could not tell " + callsign + " that mail is waiting (modem did not accept the notice)");
     }
-
 }
 
 // ============================================================================
 // QSO Management
 // ============================================================================
 
-void App::startQSO(const std::string& callsign) {
+void App::startQSO(const std::string& /*callsign*/) {
     qso_active_ = true;
     qso_start_time_ = std::chrono::steady_clock::now();
-    snr_exchanged_ = false;
-    snr_report_seq_ = 0;
-    remote_snr_db_ = 0.0f;
-    last_snr_exchange_sent_ = std::chrono::steady_clock::now();
-    last_remote_snr_update_ = std::chrono::steady_clock::time_point{};
-    if (SNR_KEEPALIVE_ENABLED) {
-        const bool lead_side = config_.station.callsign <= callsign;
-        next_snr_keepalive_due_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(
-            lead_side ? SNR_KEEPALIVE_LEAD_START_MS : SNR_KEEPALIVE_FOLLOW_START_MS);
-    } else {
-        next_snr_keepalive_due_ = std::chrono::steady_clock::time_point{};
-    }
-
-    if (modem_) {
-        local_snr_db_ = modem_->getStatus().snr_db;
-    }
-
 }
 
 void App::endQSO() {
     qso_active_ = false;
-    snr_exchanged_ = false;
-    snr_report_seq_ = 0;
-    last_snr_exchange_sent_ = std::chrono::steady_clock::time_point{};
-    last_remote_snr_update_ = std::chrono::steady_clock::time_point{};
-    next_snr_keepalive_due_ = std::chrono::steady_clock::time_point{};
-}
-
-void App::exchangeSNR(bool force) {
-    if (!SNR_KEEPALIVE_ENABLED) return;
-    if (!modem_) return;
-    if (!force && snr_exchanged_) return;
-
-    // Get current SNR
-    local_snr_db_ = modem_->getStatus().snr_db;
-
-    // Send SNR report packet
-    std::vector<uint8_t> packet;
-    packet.reserve(8);
-    packet.push_back(0xF8);  // SNR report marker
-
-    // Send as 2-byte signed integer (SNR * 10 for one decimal)
-    int16_t snr_val = static_cast<int16_t>(local_snr_db_ * 10);
-    packet.push_back(static_cast<uint8_t>(snr_val & 0xFF));
-    packet.push_back(static_cast<uint8_t>((snr_val >> 8) & 0xFF));
-    // Add a tiny fixed trailer so keep-alive packets are not ultra-short payloads.
-    // Legacy receivers parse the first 3 bytes and ignore the rest.
-    packet.push_back('S');
-    packet.push_back('N');
-    packet.push_back('R');
-    uint16_t seq = snr_report_seq_++;
-    packet.push_back(static_cast<uint8_t>(seq & 0xFF));
-    packet.push_back(static_cast<uint8_t>((seq >> 8) & 0xFF));
-
-    if (!modem_->sendData(packet)) {
-        return;
-    }
-    snr_exchanged_ = true;
-    last_snr_exchange_sent_ = std::chrono::steady_clock::now();
-
-}
-
-void App::processSNRReport(float remote_snr) {
-    remote_snr_db_ = remote_snr;
-    last_remote_snr_update_ = std::chrono::steady_clock::now();
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Remote station reports your signal: " + std::to_string(static_cast<int>(remote_snr)) + " dB";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
-
-}
-
-bool App::canSendSNRKeepAlive() const {
-    if (!SNR_KEEPALIVE_ENABLED) {
-        return false;
-    }
-    if (!modem_ || !modem_->isConnected()) {
-        return false;
-    }
-    if (!qso_active_ || modem_->getStatus().link_state != LinkState::Connected) {
-        return false;
-    }
-
-    const auto& status = modem_->getStatus();
-    if (status.ptt_active || status.tx_buffer_bytes > 0 || status.busy_detected) {
-        return false;
-    }
-
-    if (file_transfer_mgr_ && !file_transfer_mgr_->getActiveTransfers().empty()) {
-        return false;
-    }
-    if (modem_->millisSinceLastDataSend() < SNR_KEEPALIVE_TX_GUARD_MS) {
-        return false;
-    }
-
-    return true;
-}
-
-void App::updateSNRKeepAlive() {
-    if (!SNR_KEEPALIVE_ENABLED) {
-        return;
-    }
-    if (!canSendSNRKeepAlive()) {
-        return;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (next_snr_keepalive_due_.time_since_epoch().count() == 0) {
-        next_snr_keepalive_due_ = now + std::chrono::milliseconds(SNR_KEEPALIVE_LEAD_START_MS);
-    }
-    if (now < next_snr_keepalive_due_) {
-        return;
-    }
-    if (last_remote_snr_update_.time_since_epoch().count() != 0) {
-        auto remote_age = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_remote_snr_update_);
-        if (remote_age.count() < SNR_KEEPALIVE_TX_GUARD_MS) {
-            next_snr_keepalive_due_ = now + std::chrono::milliseconds(SNR_KEEPALIVE_TX_GUARD_MS);
-            return;
-        }
-    }
-
-    exchangeSNR(true);
-    next_snr_keepalive_due_ = now + std::chrono::milliseconds(SNR_KEEPALIVE_INTERVAL_MS);
-}
-
-std::string App::formatQSODuration() const {
-    if (!qso_active_) return "00:00:00";
-
-    auto now = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - qso_start_time_);
-    auto total_secs = duration.count();
-
-    int hours = static_cast<int>(total_secs / 3600);
-    int mins = static_cast<int>((total_secs % 3600) / 60);
-    int secs = static_cast<int>(total_secs % 60);
-
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hours, mins, secs);
-    return std::string(buf);
 }
 
 // ============================================================================
@@ -7470,63 +7161,110 @@ std::string App::formatQSODuration() const {
 // ============================================================================
 
 void App::enableAwayMode() {
+    if (away_mode_active_) {
+        appendSystemChat("Away mode is already on");
+        return;
+    }
     away_mode_active_ = true;
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Away mode enabled: " + config_.away.away_message;
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
-
+    appendSystemChat("Away mode enabled: " + config_.away.away_message);
 }
 
 void App::disableAwayMode() {
+    if (!away_mode_active_) {
+        appendSystemChat("Away mode is already off");
+        return;
+    }
     away_mode_active_ = false;
+    appendSystemChat("Away mode disabled");
+}
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Away mode disabled";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+// What a station linked to this one while it is away may ask for.
+std::string App::awayCommandHelp() const {
+    if (config_.away.allow_email_gateway && emailAccountConfigured(config_)) {
+        return " | Internet email: send EMAIL:<address>:<subject>:<body>";
+    }
+    return "";
+}
 
+// EMAIL:<to>:<subject>:<body> from the linked station while away. Goes out
+// through the same internet relay as gateway mail, under the same rules:
+// away.allow_email_gateway, a configured account, and the relay allowlist
+// (which fails closed).
+std::string App::handleAwayEmailCommand(const std::string& from, const app_detail::AwayEmailCommand& cmd) {
+    const std::string sender = normalizeCallsign(from);
+    std::string refusal;
+    if (!config_.away.allow_email_gateway) {
+        refusal = "email relay is not offered by this station";
+    } else if (!emailAccountConfigured(config_)) {
+        refusal = "this station has no email account configured";
+    } else if (!senderAllowedForGateway(config_, sender)) {
+        refusal = sender + " is not on this station's email relay list";
+        appendSystemChat("[EMAIL] Refused away-mode email from " + sender +
+                         ": not in Settings > Email > allowed relays");
+    } else if (!store_ || !store_->isOpen()) {
+        refusal = "this station cannot store mail right now";
+    }
+    if (!refusal.empty()) {
+        return "Email not sent: " + refusal;
+    }
+
+    Message email;
+    email.type = MessageType::Email;
+    email.status = MessageStatus::Pending;
+    email.from_callsign = sender;
+    email.to_callsign = cmd.to;
+    email.subject = cmd.subject.empty() ? ("Radio message from " + sender) : cmd.subject;
+    email.body = cmd.body;
+    email.created_at = unixNowSeconds();
+    email.message_id = MessageStore::generateMessageId(sender);
+    email.id = store_->createMessage(email);
+    if (email.id <= 0) {
+        return "Email not sent: this station could not store it";
+    }
+    relayRadioToEmail(email);
+    appendSystemChat("[EMAIL] Away mode: queued email from " + sender + " to " + cmd.to);
+    if (!email_gateway_active_) {
+        return "Email to " + cmd.to + " queued; it goes out when the operator starts the email gateway";
+    }
+    sendQueuedEmails();
+    return "Email to " + cmd.to + " queued for internet delivery";
 }
 
 void App::processAwayModeRequest(const std::string& from, const std::vector<uint8_t>& data) {
-    if (!away_mode_active_) return;
     if (data.size() < 2) return;  // Need at least 0xF6 + command byte
+    if (!away_mode_active_) {
+        sendAwayModeResponse(from, "Operator is at the station (away mode is off)");
+        return;
+    }
 
-    // data[0] is 0xF6 (away mode request marker), data[1] is the actual command
-    uint8_t request_type = data[1];
-
+    // data[0] is 0xF6 (away mode request marker), data[1] is the actual command.
+    // Every request gets an answer, a refusal included.
+    const uint8_t request_type = data[1];
     switch (request_type) {
-        case 0x01:  // Query messages
-            if (config_.away.allow_message_query && store_) {
-                auto messages = store_->getPendingMessages(from);
-                std::string response = "You have " + std::to_string(messages.size()) + " pending message(s)";
-                sendAwayModeResponse(from, response);
+        case 0x01: {  // Query messages
+            if (!config_.away.allow_message_query || !store_) {
+                sendAwayModeResponse(from, "Message queries are not offered by this station");
+                break;
             }
+            auto messages = store_->getPendingMessages(from);
+            sendAwayModeResponse(from, "You have " + std::to_string(messages.size()) + " pending message(s)");
             break;
+        }
 
         case 0x02:  // Query BBS files
-            if (config_.away.allow_bbs_access) {
-                refreshBBSFiles();
-                std::string response = "BBS has " + std::to_string(bbs_files_.size()) + " file(s) available";
-                sendAwayModeResponse(from, response);
+            if (!config_.away.allow_bbs_access) {
+                sendAwayModeResponse(from, "BBS access is not offered by this station");
+                break;
             }
+            refreshBBSFiles();
+            sendAwayModeResponse(from, "BBS has " + std::to_string(bbs_files_.size()) + " file(s) available");
             break;
 
         case 0x03:  // Leave message
             if (data.size() > 2) {
-                std::string message(data.begin() + 2, data.end());
-
-                // Store the message
-                if (store_) {
+                const std::string message(data.begin() + 2, data.end());
+                bool stored = false;
+                if (store_ && store_->isOpen()) {
                     Message msg;
                     msg.type = MessageType::Private;
                     msg.status = MessageStatus::Pending;
@@ -7534,32 +7272,40 @@ void App::processAwayModeRequest(const std::string& from, const std::vector<uint
                     msg.to_callsign = config_.station.callsign;
                     msg.subject = "Away mode message";
                     msg.body = message;
-                    msg.created_at = std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    store_->createMessage(msg);
+                    msg.created_at = unixNowSeconds();
+                    stored = store_->createMessage(msg) > 0;
                 }
-
-                sendAwayModeResponse(from, "Message received and stored");
+                sendAwayModeResponse(from, stored ? "Message received and stored"
+                                                  : "Message received (not stored: no message store)");
 
                 ChatMessage chat_msg;
                 chat_msg.from = from;
                 chat_msg.text = "[AWAY MSG] " + message;
                 chat_msg.is_outgoing = false;
-                chat_msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
+                chat_msg.timestamp = unixNowSeconds();
                 chat_history_.push_back(chat_msg);
                 chat_scroll_to_bottom_ = true;
+                playNotificationSound();
+            } else {
+                sendAwayModeResponse(from, "Empty message not stored");
             }
             break;
 
-        case 0x04:  // Email gateway request
-            if (config_.away.allow_email_gateway) {
-                sendAwayModeResponse(from, "Email gateway available. Send EMAIL:<to>:<subject>:<body>");
+        case 0x04: {  // Email: optional "to:subject:body" after the command byte
+            const std::string args(data.begin() + 2, data.end());
+            app_detail::AwayEmailCommand cmd;
+            if (!args.empty() && app_detail::parseAwayEmailCommand("EMAIL:" + args, &cmd)) {
+                sendAwayModeResponse(from, handleAwayEmailCommand(from, cmd));
+            } else if (config_.away.allow_email_gateway && emailAccountConfigured(config_)) {
+                sendAwayModeResponse(from, "Email relay available. Send EMAIL:<address>:<subject>:<body>");
+            } else {
+                sendAwayModeResponse(from, "Email relay is not offered by this station");
             }
             break;
+        }
 
         default:
-            sendAwayModeResponse(from, config_.away.away_message);
+            sendAwayModeResponse(from, config_.away.away_message + awayCommandHelp());
             break;
     }
 }
@@ -7571,14 +7317,16 @@ void App::sendAwayModeResponse(const std::string& to, const std::string& respons
     packet.push_back(0xF7);  // Away mode response marker
     packet.insert(packet.end(), response.begin(), response.end());
 
-    modem_->sendData(packet);
+    if (!modem_->sendData(packet)) {
+        appendSystemChat("Away reply to " + to + " not sent: the modem did not accept it");
+        return;
+    }
 
     ChatMessage msg;
     msg.from = config_.station.callsign;
     msg.text = "[AWAY REPLY to " + to + "] " + response;
     msg.is_outgoing = true;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    msg.timestamp = unixNowSeconds();
     chat_history_.push_back(msg);
     chat_scroll_to_bottom_ = true;
 }
@@ -7587,14 +7335,27 @@ void App::sendAwayModeResponse(const std::string& to, const std::string& respons
 // Ping (Status Check Without Full QSO)
 // ============================================================================
 
+// The ping response's SNR byte: what the responder measured of the request.
+// Broadcast frames reach the app without a receive SNR, so it is sent as
+// kPingSnrUnknown and shown as "not measured".
+constexpr uint8_t kPingSnrUnknown = 0x80;  // int8 -128
+
 void App::sendPing(const std::string& callsign) {
-    if (!modem_) return;
-    if (ping_in_progress_) {
-        // Already waiting for a ping response
-        return;
-    }
     std::string target = normalizeCallsign(callsign);
     if (target.empty()) {
+        appendSystemChat("Ping not sent: no callsign given");
+        return;
+    }
+    if (!modem_ || !modem_->isConnected()) {
+        appendSystemChat("Ping not sent: the modem is not connected");
+        return;
+    }
+    if (ping_in_progress_) {
+        const auto waited = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - ping_sent_time_).count();
+        const long long left = std::max<long long>(0, PING_TIMEOUT_MS / 1000 - waited);
+        appendSystemChat("Ping to " + target + " not sent: still waiting for " + ping_target_ +
+                         " (gives up in " + std::to_string(left) + " s)");
         return;
     }
 
@@ -7614,21 +7375,14 @@ void App::sendPing(const std::string& callsign) {
     request.push_back(static_cast<uint8_t>(grid.size()));
     request.insert(request.end(), grid.begin(), grid.end());
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
     if (!sendBroadcastPayload(request)) {
-        msg.text = "Ping to " + target + " could not be sent";
-    } else {
-        ping_in_progress_ = true;
-        ping_target_ = target;
-        ping_sent_time_ = std::chrono::steady_clock::now();
-        msg.text = "Ping sent to " + target;
+        appendSystemChat("Ping to " + target + " could not be sent");
+        return;
     }
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    ping_in_progress_ = true;
+    ping_target_ = target;
+    ping_sent_time_ = std::chrono::steady_clock::now();
+    appendSystemChat("Ping sent to " + target);
 }
 
 void App::processPingRequest(const std::string& from, const std::vector<uint8_t>& data) {
@@ -7644,6 +7398,7 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
     std::string target, origin, remote_grid;
     if (!field(&target) || !field(&origin)) return;
     (void)field(&remote_grid);
+    remote_grid = app_detail::sanitizeRemoteText(remote_grid, 8);
     if (normalizeCallsign(target) != normalizeCallsign(config_.station.callsign)) {
         return;  // addressed to another station
     }
@@ -7659,21 +7414,19 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
     response.insert(response.end(), origin.begin(), origin.end());
     response.push_back(static_cast<uint8_t>(self.size()));
     response.insert(response.end(), self.begin(), self.end());
-    float snr = modem_ ? modem_->getStatus().snr_db : 0.0f;
-    response.push_back(static_cast<uint8_t>(static_cast<int8_t>(std::clamp(snr, -127.0f, 127.0f))));
+    response.push_back(kPingSnrUnknown);
     std::string grid = config_.station.grid_square;
     if (grid.size() > 8) grid = grid.substr(0, 8);
     response.push_back(static_cast<uint8_t>(grid.size()));
     response.insert(response.end(), grid.begin(), grid.end());
-    (void)sendBroadcastPayload(response);
+    const bool answered = sendBroadcastPayload(response);
 
     // Add to ping results
     PingResult result;
     result.callsign = origin;
     result.grid_square = remote_grid;
-    result.snr_db = snr;
-    result.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    result.snr_db = std::numeric_limits<float>::quiet_NaN();  // not measured
+    result.timestamp = unixNowSeconds();
     result.online = true;
 
     ping_results_.push_front(result);
@@ -7681,22 +7434,12 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
         ping_results_.pop_back();
     }
     if (isKnownEmailGateway(origin)) {
-        const std::string gateway_call = origin;
-        auto& stats = gateway_stats_[gateway_call];
-        stats.snr_accum += snr;
-        stats.snr_samples++;
-        stats.last_seen = result.timestamp;
-
-        const int hour_local = localHourFromUnix(result.timestamp);
-        auto& band_hour = gateway_stats_[gatewayBandHourKey(gateway_call, current_band_, hour_local)];
-        band_hour.snr_accum += snr;
-        band_hour.snr_samples++;
-        band_hour.last_seen = result.timestamp;
+        recordGatewaySighting(origin, std::nullopt, result.timestamp);
     }
     if (store_ && store_->isOpen()) {
         PingRecord rec;
         rec.callsign = origin;
-        rec.snr_db = snr;
+        rec.snr_db = std::numeric_limits<float>::quiet_NaN();
         rec.grid_square = remote_grid;
         rec.band = current_band_;
         rec.online = true;
@@ -7704,18 +7447,12 @@ void App::processPingRequest(const std::string& from, const std::vector<uint8_t>
         store_->savePingResult(rec);
     }
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Ping from " + origin;
+    std::string text = "Ping from " + origin;
     if (!remote_grid.empty()) {
-        msg.text += " [" + remote_grid + "]";
+        text += " [" + remote_grid + "]";
     }
-    msg.text += " - responded";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    text += answered ? " - responded" : " - the response could not be sent";
+    appendSystemChat(text);
 }
 
 void App::processPingResponse(const std::string& from, const std::vector<uint8_t>& data) {
@@ -7732,24 +7469,27 @@ void App::processPingResponse(const std::string& from, const std::vector<uint8_t
     };
     std::string origin, responder, remote_grid;
     if (!field(&origin) || !field(&responder) || data.size() <= at) return;
-    const float remote_snr = static_cast<float>(static_cast<int8_t>(data[at++]));
+    const uint8_t snr_byte = data[at++];
     (void)field(&remote_grid);
+    remote_grid = app_detail::sanitizeRemoteText(remote_grid, 8);
     if (responder.empty()) responder = from;
     if (normalizeCallsign(origin) != normalizeCallsign(config_.station.callsign) ||
         normalizeCallsign(responder) != normalizeCallsign(ping_target_)) {
         return;
     }
-    (void)from;
 
     ping_in_progress_ = false;
+    std::optional<float> remote_snr;
+    if (snr_byte != kPingSnrUnknown) {
+        remote_snr = static_cast<float>(static_cast<int8_t>(snr_byte));
+    }
 
     // Add to results
     PingResult result;
     result.callsign = ping_target_;
     result.grid_square = remote_grid;
-    result.snr_db = remote_snr;
-    result.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    result.snr_db = remote_snr.value_or(std::numeric_limits<float>::quiet_NaN());
+    result.timestamp = unixNowSeconds();
     result.online = true;
 
     ping_results_.push_front(result);
@@ -7757,22 +7497,12 @@ void App::processPingResponse(const std::string& from, const std::vector<uint8_t
         ping_results_.pop_back();
     }
     if (isKnownEmailGateway(ping_target_)) {
-        const std::string gateway_call = normalizeCallsign(ping_target_);
-        auto& stats = gateway_stats_[gateway_call];
-        stats.snr_accum += remote_snr;
-        stats.snr_samples++;
-        stats.last_seen = result.timestamp;
-
-        const int hour_local = localHourFromUnix(result.timestamp);
-        auto& band_hour = gateway_stats_[gatewayBandHourKey(gateway_call, current_band_, hour_local)];
-        band_hour.snr_accum += remote_snr;
-        band_hour.snr_samples++;
-        band_hour.last_seen = result.timestamp;
+        recordGatewaySighting(ping_target_, remote_snr, result.timestamp);
     }
     if (store_ && store_->isOpen()) {
         PingRecord rec;
         rec.callsign = ping_target_;
-        rec.snr_db = remote_snr;
+        rec.snr_db = result.snr_db;
         rec.grid_square = remote_grid;
         rec.band = current_band_;
         rec.online = true;
@@ -7780,18 +7510,15 @@ void App::processPingResponse(const std::string& from, const std::vector<uint8_t
         store_->savePingResult(rec);
     }
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Pong from " + ping_target_;
+    std::string text = "Pong from " + ping_target_;
     if (!remote_grid.empty()) {
-        msg.text += " [" + remote_grid + "]";
+        text += " [" + remote_grid + "]";
     }
-    msg.text += " - SNR: " + std::to_string(static_cast<int>(remote_snr)) + " dB";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    if (remote_snr) {
+        text += " - SNR: " + std::to_string(static_cast<int>(*remote_snr)) + " dB";
+    }
+    appendSystemChat(text);
+    playNotificationSound();
 }
 
 void App::updatePing() {
@@ -7806,8 +7533,8 @@ void App::updatePing() {
         // Add timeout result
         PingResult result;
         result.callsign = ping_target_;
-        result.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        result.snr_db = std::numeric_limits<float>::quiet_NaN();
+        result.timestamp = unixNowSeconds();
         result.online = false;
 
         ping_results_.push_front(result);
@@ -7817,7 +7544,7 @@ void App::updatePing() {
         if (store_ && store_->isOpen()) {
             PingRecord rec;
             rec.callsign = ping_target_;
-            rec.snr_db = 0.0f;
+            rec.snr_db = std::numeric_limits<float>::quiet_NaN();
             rec.grid_square.clear();
             rec.band = current_band_;
             rec.online = false;
@@ -7825,14 +7552,7 @@ void App::updatePing() {
             store_->savePingResult(rec);
         }
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Ping to " + ping_target_ + " timed out";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Ping to " + ping_target_ + " timed out");
     }
 }
 
@@ -7871,10 +7591,11 @@ bool App::isWeakSignalLink(const std::string& callsign) const {
             score_sum += (threshold - 4.0f);
             score_samples++;
         }
-    }
-    if (snr_exchanged_ || std::fabs(remote_snr_db_) > 0.01f) {
-        score_sum += remote_snr_db_;
-        score_samples++;
+        // How the peer hears us: the modem's RSNR (STATUS / EVT:SNR).
+        if (status.link_state == LinkState::Connected && status.remote_snr_valid) {
+            score_sum += status.remote_snr_db;
+            score_samples++;
+        }
     }
 
     const std::string normalized = normalizeCallsign(callsign);
@@ -7926,7 +7647,8 @@ std::string App::selectBestGateway(float* score_out) const {
             continue;
         }
 
-        float score = beacon.snr_db;
+        // Unmeasured sightings (NaN) start from a neutral 0 dB.
+        float score = std::isfinite(beacon.snr_db) ? beacon.snr_db : 0.0f;
         auto it = gateway_stats_.find(cs);
         if (it != gateway_stats_.end()) {
             const GatewayStats& stats = it->second;
@@ -8162,17 +7884,9 @@ void App::processMailAck(const std::string& from, const std::vector<uint8_t>& da
             recordGatewayRelayResult(from, ack);
         }
 
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = std::string("Mail ") + (ack ? "ACK" : "NACK") + " from " + from +
-                   " for MID " + message_id;
-        if (!reason.empty()) {
-            msg.text += ": " + reason;
-        }
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat(std::string("Mail ") + (ack ? "delivered (ACK)" : "REFUSED (NACK)") + " from " + from +
+                         " for MID " + message_id +
+                         (reason.empty() ? std::string() : ": " + app_detail::sanitizeRemoteText(reason, 140)));
         return;
     }
 }
@@ -8182,6 +7896,65 @@ void App::persistMailReadState(const MailMessage& mail) {
         return;
     }
     store_->setMailReadState(mail.message_id, mail.read);
+}
+
+// Calls the best heard email gateway for queued internet mail. Never
+// while the operator has a link, a call, a CQ or a QSY in progress; at most
+// GATEWAY_MAX_CALL_ATTEMPTS calls per batch, spaced by an exponential
+// backoff. Returns true when a call was started.
+bool App::tryAutoConnectGateway(const std::string& why) {
+    if (!modem_ || !modem_->isConnected()) {
+        relay_diagnostics_.queue_policy_state = "modem-offline";
+        return false;
+    }
+    const ModemStatus st = modem_->getStatus();
+    const bool modem_free = st.link_state == LinkState::Idle && pending_connect_target_.empty() &&
+                            qsy_workflow_state_ == QsyWorkflowState::Idle && !cq_active_ &&
+                            !channel_sniffer_active_;
+    if (!modem_free) {
+        relay_diagnostics_.queue_policy_state = "wait-link-idle";
+        return false;
+    }
+    if (gateway_call_attempts_ >= GATEWAY_MAX_CALL_ATTEMPTS) {
+        relay_diagnostics_.queue_policy_state = "gave-up";
+        relay_diagnostics_.gateway_health = "gateway-unreachable";
+        if (!gateway_gave_up_logged_) {
+            gateway_gave_up_logged_ = true;
+            appendSystemChat("Stopped calling email gateways after " +
+                             std::to_string(GATEWAY_MAX_CALL_ATTEMPTS) +
+                             " attempts; the internet mail stays queued (sending new mail or linking "
+                             "to a gateway tries again)");
+        }
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < gateway_next_call_) {
+        relay_diagnostics_.queue_policy_state = "wait-connect-retry";
+        relay_diagnostics_.gateway_health = "waiting-connect-retry";
+        return false;
+    }
+    float score = 0.0f;
+    const std::string best = selectBestGateway(&score);
+    if (best.empty()) {
+        relay_diagnostics_.queue_policy_state = "no-gateway";
+        relay_diagnostics_.gateway_health = "no-gateway-heard";
+        relay_diagnostics_.last_error = "No email gateway beacon heard";
+        return false;
+    }
+
+    gateway_call_attempts_++;
+    gateway_next_call_ = now + std::chrono::seconds(app_detail::gatewayRetryDelaySec(gateway_call_attempts_));
+    auto_gateway_target_ = best;
+    relay_diagnostics_.last_target = best;
+    relay_diagnostics_.last_gateway_score = score;
+    relay_diagnostics_.last_mode = "hf-gateway";
+    relay_diagnostics_.queue_policy_state = "connecting";
+    relay_diagnostics_.gateway_health = "connecting";
+    appendSystemChat("Calling email gateway " + best + " for " + why + " (attempt " +
+                     std::to_string(gateway_call_attempts_) + "/" +
+                     std::to_string(GATEWAY_MAX_CALL_ATTEMPTS) + ")");
+    connectToStation(best);
+    return true;
 }
 
 void App::processQueuedGatewayMail() {
@@ -8215,39 +7988,7 @@ void App::processQueuedGatewayMail() {
     const bool live_weak = status.snr_db <= weak_threshold;
     const bool connected = status.link_state == LinkState::Connected;
     if (!connected) {
-        const auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_gateway_connect_attempt_);
-        if (elapsed.count() < GATEWAY_CONNECT_RETRY_MS) {
-            relay_diagnostics_.queue_policy_state = "wait-connect-retry";
-            relay_diagnostics_.gateway_health = "waiting-connect-retry";
-            return;
-        }
-
-        float score = 0.0f;
-        std::string best = selectBestGateway(&score);
-        if (best.empty()) {
-            relay_diagnostics_.queue_policy_state = "no-gateway";
-            relay_diagnostics_.gateway_health = "no-gateway-heard";
-            relay_diagnostics_.last_error = "No email gateway beacon heard";
-            return;
-        }
-
-        last_gateway_connect_attempt_ = now;
-        auto_gateway_target_ = best;
-        relay_diagnostics_.last_target = best;
-        relay_diagnostics_.last_gateway_score = score;
-        relay_diagnostics_.queue_policy_state = "connecting";
-        relay_diagnostics_.gateway_health = "connecting";
-        connectToStation(best);
-
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Auto-connecting to best email gateway " + best +
-                   " (score " + std::to_string(score).substr(0, 4) + ")";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        (void)tryAutoConnectGateway("queued internet mail");
         return;
     }
     if (channel_busy) {
@@ -8266,24 +8007,18 @@ void App::processQueuedGatewayMail() {
     const bool remote_is_gateway = isKnownEmailGateway(remote) ||
                                    (!pinned_gateway.empty() && remote == pinned_gateway);
     if (!remote_is_gateway) {
+        // Never tear down the operator's QSO for queued mail: it waits until
+        // the link ends, then a gateway is called.
         relay_diagnostics_.queue_policy_state = "connected-non-gateway";
-        relay_diagnostics_.gateway_health = "searching-gateway";
-        const auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_gateway_connect_attempt_);
-        if (elapsed.count() >= GATEWAY_CONNECT_RETRY_MS) {
-            float score = 0.0f;
-            std::string best = selectBestGateway(&score);
-            if (!best.empty() && best != remote) {
-                modem_->disconnectStation();
-                connectToStation(best);
-                last_gateway_connect_attempt_ = now;
-                auto_gateway_target_ = best;
-                relay_diagnostics_.last_target = best;
-                relay_diagnostics_.last_gateway_score = score;
-            }
+        relay_diagnostics_.gateway_health = "waiting-for-link-to-end";
+        if (!gateway_waiting_logged_) {
+            gateway_waiting_logged_ = true;
+            appendSystemChat("Queued internet mail waits until the link with " + remote +
+                             " ends (" + remote + " is not an email gateway)");
         }
         return;
     }
+    gateway_waiting_logged_ = false;
 
     float selected_score = 0.0f;
     const std::string selected_gateway = selectBestGateway(&selected_score);
@@ -8417,28 +8152,32 @@ void App::updateReliableMail() {
         return std::max(MAIL_MAX_RETRIES, retries);
     };
 
+    const bool linked = status.link_state == LinkState::Connected;
     for (auto& mail : mail_outbox_) {
-        if (mail.status == MessageStatus::Pending && !mail.needs_gateway && !mail.is_broadcast) {
-            if (!mail.weak_signal_profile) {
-                std::string weak_ref = remote;
-                if (looksLikeEmailAddress(mail.to) && !pinned_gateway.empty()) {
-                    weak_ref = pinned_gateway;
-                }
-                if (!weak_ref.empty()) {
-                    mail.weak_signal_profile = isWeakSignalLink(weak_ref) || live_weak || channel_busy;
-                } else {
-                    mail.weak_signal_profile = live_weak || channel_busy;
-                }
-            }
-            if (looksLikeEmailAddress(mail.to) && !connected_gateway) {
+        if (mail.is_broadcast) {
+            continue;
+        }
+        const bool to_email = looksLikeEmailAddress(mail.to);
+        // Private mail to a station travels over the link only to that
+        // station (A3); anything else waits for it, or went via the mesh.
+        const bool direct_ok = to_email ? connected_gateway
+                                        : (linked && app_detail::privateMailGoesDirect(remote, mail.to));
+
+        if (mail.status == MessageStatus::Pending && !mail.needs_gateway) {
+            if (to_email && !connected_gateway) {
                 mail.needs_gateway = true;
                 continue;
             }
-            if (channel_busy) {
+            if (!direct_ok || channel_busy || (now - mail.timestamp) < 2) {
                 continue;
             }
-            if ((now - mail.timestamp) < 2) {
-                continue;
+            if (!mail.weak_signal_profile) {
+                std::string weak_ref = remote;
+                if (to_email && !pinned_gateway.empty()) {
+                    weak_ref = pinned_gateway;
+                }
+                mail.weak_signal_profile =
+                    (!weak_ref.empty() && isWeakSignalLink(weak_ref)) || live_weak || channel_busy;
             }
             if (sendMailWirePacket(mail)) {
                 mail.status = MessageStatus::Sent;
@@ -8446,12 +8185,24 @@ void App::updateReliableMail() {
                 if (store_ && store_->isOpen() && mail.store_id > 0) {
                     store_->markAsSent(mail.store_id);
                 }
+                appendSystemChat("Mail sent to " + mail.to + ", awaiting ACK [MID " + mail.message_id + "]");
             } else {
                 mail.timestamp = now;
             }
             continue;
         }
-        if (mail.status != MessageStatus::Sent || mail.is_broadcast) {
+        if (mail.status != MessageStatus::Sent) {
+            continue;
+        }
+        // Handed to the mesh: the recipient's ACK cannot come back over a
+        // link, so there is nothing to time out.
+        if (mesh_sent_mail_ids_.count(mail.message_id) > 0) {
+            continue;
+        }
+        if (!to_email && !direct_ok) {
+            // The recipient is no longer linked: wait for the next link
+            // instead of burning retries into the void.
+            mail.status = MessageStatus::Pending;
             continue;
         }
         const int ack_timeout_sec = adaptiveAckTimeoutSec(mail);
@@ -8465,6 +8216,8 @@ void App::updateReliableMail() {
             if (store_ && store_->isOpen() && mail.store_id > 0) {
                 store_->markAsFailed(mail.store_id);
             }
+            appendSystemChat("Mail to " + mail.to + " FAILED: no acknowledgement after " +
+                             std::to_string(mail.retry_count + 1) + " tries [MID " + mail.message_id + "]");
             continue;
         }
 
@@ -8472,7 +8225,7 @@ void App::updateReliableMail() {
             continue;
         }
         if (!sendMailWirePacket(mail)) {
-            if (looksLikeEmailAddress(mail.to)) {
+            if (to_email) {
                 mail.needs_gateway = true;
             }
             mail.timestamp = now;
@@ -8654,8 +8407,17 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
         const bool sender_allowed = via_link && !radio_sender.empty() && radio_sender != "UNKNOWN" &&
                                     senderAllowedForGateway(config_, radio_sender);
         const bool gateway_permitted = !away_mode_active_ || config_.away.allow_email_gateway;
-        if (!gateway_ready || !sender_allowed || !gateway_permitted) {
+        if (!gateway_ready || !gateway_permitted) {
             sendMailAck(message_id, false, "Gateway unavailable");
+            appendSystemChat("[EMAIL] Refused internet mail from " + radio_sender + " to " + mail.to +
+                             (gateway_ready ? ": email relay is off in away mode"
+                                            : ": this station is not configured as an email gateway"));
+            return;
+        }
+        if (!sender_allowed) {
+            sendMailAck(message_id, false, "Not authorised to relay through this gateway");
+            appendSystemChat("[EMAIL] Refused internet mail from " + radio_sender +
+                             ": not in Settings > Email > allowed relays");
             return;
         }
 
@@ -8663,7 +8425,7 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
         outbound_email.type = MessageType::Email;
         outbound_email.status = MessageStatus::Pending;
         outbound_email.from_callsign = normalized_from;
-        outbound_email.to_callsign = trimSpaces(mail.to);
+        outbound_email.to_callsign = gui::trimCopy(mail.to);
         outbound_email.subject = mail.subject;
         outbound_email.body = mail.body;
         outbound_email.priority = static_cast<int>(mail.priority);
@@ -8675,6 +8437,7 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
         relayRadioToEmail(outbound_email);
         sendQueuedEmails();
         sendMailAck(message_id, true, "Queued for internet relay");
+        appendSystemChat("[EMAIL] Queued internet mail from " + radio_sender + " to " + mail.to);
         return;
     }
 
@@ -8693,35 +8456,40 @@ void App::processReliableMailReceived(const std::string& from, const std::vector
         sendMailAck(message_id, true, "Delivered");
     }
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "New mail from " + from + ": " + mail.subject;  // subject carries any relay marker
-    if (mail.is_broadcast) {
-        msg.text += " [BROADCAST]";
-    }
-    msg.is_outgoing = false;
-    msg.timestamp = mail.timestamp;
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    // The subject carries any relay marker.
+    appendSystemChat("New mail from " + from + ": " + mail.subject +
+                     (mail.is_broadcast ? " [BROADCAST]" : ""));
+    playNotificationSound();
 }
 
 void App::sendMail(const std::string& to, const std::string& subject, const std::string& body) {
     if (!modem_) return;
 
-    const std::string to_raw = trimSpaces(to);
+    const std::string to_raw = gui::trimCopy(to);
     if (to_raw.empty()) {
+        appendSystemChat("Mail not sent: no recipient");
         return;
     }
     const bool to_email = looksLikeEmailAddress(to_raw);
     const std::string to_field = to_email ? to_raw : normalizeCallsign(to_raw);
     if (to_field.empty() || to_field.size() > kMailMaxAddressLen) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Mail destination is invalid or too long";
-        msg.is_outgoing = false;
-        msg.timestamp = unixNowSeconds();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
+        appendSystemChat("Mail destination is invalid or too long");
+        return;
+    }
+    if (normalizeCallsign(config_.station.callsign).empty()) {
+        appendSystemChat("Mail not sent: no callsign is set (Settings > Station)");
+        return;
+    }
+    // store.max_pending_messages bounds the undelivered outbox.
+    const size_t undelivered = static_cast<size_t>(std::count_if(
+        mail_outbox_.begin(), mail_outbox_.end(), [](const MailMessage& m) {
+            return !m.is_broadcast && (m.status == MessageStatus::Pending || m.status == MessageStatus::Sent);
+        }));
+    const int max_pending = config_.store.max_pending_messages;
+    if (max_pending > 0 && undelivered >= static_cast<size_t>(max_pending)) {
+        appendSystemChat("Mail not queued: " + std::to_string(undelivered) +
+                         " messages are already waiting for delivery (limit " + std::to_string(max_pending) +
+                         ", Settings > Store)");
         return;
     }
 
@@ -8738,15 +8506,17 @@ void App::sendMail(const std::string& to, const std::string& subject, const std:
     mail.status = MessageStatus::Pending;
     mail.priority = clampMailPriority(mail_priority_input_);
     mail.winlink_payload = to_email && config_.email.winlink_compat_mode;
-    mail.message_id = MessageStore::generateMessageId(mail.from.empty() ? "N0CALL" : mail.from);
+    mail.message_id = MessageStore::generateMessageId(mail.from);
     if (mail.message_id.size() > kMailMaxMessageIdLen) {
         mail.message_id.resize(kMailMaxMessageIdLen);
     }
 
+    bool stored = false;
     if (store_ && store_->isOpen()) {
         const int64_t id = store_->createMessage(makeStoreMailMessage(mail, config_.station.callsign, true));
         if (id > 0) {
             mail.store_id = id;
+            stored = true;
         }
     }
 
@@ -8754,99 +8524,77 @@ void App::sendMail(const std::string& to, const std::string& subject, const std:
     const bool channel_busy = status.busy_detected || status.ptt_active || status.tx_buffer_bytes > 0;
     const float weak_threshold = static_cast<float>(config_.email.weak_signal_snr_threshold_db);
     const bool live_weak = status.snr_db <= weak_threshold;
+    const bool connected = status.link_state == LinkState::Connected;
+    const std::string remote = linkedPeerCallsign();
 
-    bool sent = false;
+    std::string outcome;
     if (to_email) {
-        const bool connected = status.link_state == LinkState::Connected;
-        std::string remote = normalizeCallsign(status.remote_callsign);
-        if (remote.empty()) {
-            remote = normalizeCallsign(current_chat_partner_);
-        }
+        // Internet mail goes over the link only when the linked station is
+        // an email gateway; otherwise it waits for one (never preempting a
+        // QSO: see tryAutoConnectGateway()).
         const std::string pinned_gateway = normalizeCallsign(auto_gateway_target_);
-        const bool connected_gateway = isKnownEmailGateway(remote) ||
-                                       (!pinned_gateway.empty() && remote == pinned_gateway);
-        if (!remote.empty()) {
-            mail.weak_signal_profile = isWeakSignalLink(remote) || live_weak || channel_busy;
-        } else if (!pinned_gateway.empty()) {
-            mail.weak_signal_profile = isWeakSignalLink(pinned_gateway) || live_weak || channel_busy;
-        } else {
-            mail.weak_signal_profile = live_weak || channel_busy;
-        }
+        const bool connected_gateway = connected && !remote.empty() &&
+                                       (isKnownEmailGateway(remote) ||
+                                        (!pinned_gateway.empty() && remote == pinned_gateway));
+        const std::string weak_ref = connected_gateway ? remote : pinned_gateway;
+        mail.weak_signal_profile = (!weak_ref.empty() && isWeakSignalLink(weak_ref)) || live_weak || channel_busy;
 
-        // If currently linked, try sending via that station even if gateway beacons were missed.
-        // The remote station can still return an explicit NACK if gateway relay is unavailable.
-        if (!channel_busy && connected && !remote.empty()) {
-            sent = sendMailWirePacket(mail);
-            if (!connected_gateway) {
-                relay_diagnostics_.last_error =
-                    "Connected station not marked as gateway; attempted relay anyway";
-            }
+        if (connected_gateway && !channel_busy && sendMailWirePacket(mail)) {
+            mail.status = MessageStatus::Sent;
+            outcome = "Email for " + to_field + " sent to gateway " + remote + ", awaiting ACK";
         } else {
             mail.needs_gateway = true;
-            sent = false;
-            if (!connected) {
-                float score = 0.0f;
-                std::string gateway = selectBestGateway(&score);
-                if (!gateway.empty()) {
-                    auto_gateway_target_ = gateway;
-                    mail.weak_signal_profile = isWeakSignalLink(gateway) || live_weak || channel_busy;
-                    connectToStation(gateway);
-                    last_gateway_connect_attempt_ = std::chrono::steady_clock::now();
-                    relay_diagnostics_.last_target = gateway;
-                    relay_diagnostics_.last_gateway_score = score;
-                    relay_diagnostics_.last_mode = "hf-gateway";
-                    relay_diagnostics_.queue_policy_state = "connecting";
-                }
+            gateway_call_attempts_ = 0;  // new mail: calling gateways may start over
+            gateway_gave_up_logged_ = false;
+            gateway_next_call_ = {};
+            if (connected && !connected_gateway) {
+                outcome = "Email for " + to_field + " queued: " + remote +
+                          " is not an email gateway; a gateway is called when this link ends";
+            } else if (connected) {
+                outcome = "Email for " + to_field + " queued (channel busy)";
+            } else if (tryAutoConnectGateway("email to " + to_field)) {
+                outcome = "Email for " + to_field + " queued; calling a gateway";
+            } else if (selectBestGateway().empty()) {
+                outcome = "Email for " + to_field + " queued: no email gateway heard yet";
+            } else {
+                outcome = "Email for " + to_field + " queued for gateway delivery";
             }
+        }
+    } else if (connected && app_detail::privateMailGoesDirect(remote, to_field)) {
+        mail.weak_signal_profile = isWeakSignalLink(remote) || live_weak || channel_busy;
+        if (!channel_busy && sendMailWirePacket(mail)) {
+            mail.status = MessageStatus::Sent;
+            outcome = "Mail sent to " + to_field + ", awaiting ACK";
+        } else {
+            outcome = channel_busy ? "Mail for " + to_field + " queued (channel busy)"
+                                   : "Mail for " + to_field + " queued (the modem did not accept it yet)";
         }
     } else {
-        std::string direct_remote = normalizeCallsign(modem_->getStatus().remote_callsign);
-        if (direct_remote.empty()) {
-            direct_remote = normalizeCallsign(current_chat_partner_);
-        }
-        if (!direct_remote.empty()) {
-            mail.weak_signal_profile = isWeakSignalLink(direct_remote);
-        }
-        mail.weak_signal_profile = mail.weak_signal_profile || live_weak || channel_busy;
-        sent = !channel_busy && sendMailWirePacket(mail);
-        if (!sent && config_.email.hf_store_forward_enabled && !channel_busy) {
-            std::vector<uint8_t> wire_packet;
-            if (buildReliableMailWirePacket(mail, config_, &wire_packet)) {
-                sent = forwardPacketViaMesh(wire_packet, to_field, mail.message_id);
-            }
-        }
-    }
-
-    if (to_email && !sent) {
-        mail.needs_gateway = true;
-    }
-
-    if (sent) {
-        mail.status = MessageStatus::Sent;
-        if (store_ && store_->isOpen() && mail.store_id > 0) {
-            store_->markAsSent(mail.store_id);
+        // Not linked to the recipient: hand it to the mesh when relaying is
+        // on, else it waits until the recipient is linked.
+        mail.weak_signal_profile = live_weak || channel_busy;
+        std::vector<uint8_t> wire_packet;
+        if (config_.email.hf_store_forward_enabled && modem_->isConnected() && !channel_busy &&
+            buildReliableMailWirePacket(mail, config_, &wire_packet) &&
+            forwardPacketViaMesh(wire_packet, to_field, mail.message_id)) {
+            mail.status = MessageStatus::Sent;
+            mesh_sent_mail_ids_.insert(mail.message_id);
+            outcome = "Mail for " + to_field + " handed to the mesh relay (no delivery ACK on this path)";
+        } else if (connected) {
+            outcome = "Mail for " + to_field + " queued: the link is with " +
+                      (remote.empty() ? std::string("another station") : remote) +
+                      "; it is sent when " + to_field + " is linked";
+        } else {
+            outcome = "Mail for " + to_field + " queued until " + to_field + " is linked";
         }
     }
 
+    if (mail.status == MessageStatus::Sent && store_ && store_->isOpen() && mail.store_id > 0) {
+        store_->markAsSent(mail.store_id);
+    }
     mail_outbox_.push_back(mail);
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    if (to_email) {
-        msg.text = sent
-            ? ("Email relay message sent to gateway for " + to_field + " [MID " + mail.message_id + "]")
-            : ("Email relay queued for gateway delivery to " + to_field + " [MID " + mail.message_id + "]");
-    } else {
-        msg.text = sent
-            ? ("Mail sent to " + to_field + " [MID " + mail.message_id + "]")
-            : ((status.link_state == LinkState::Connected && channel_busy)
-                   ? ("Mail queued (channel busy) for " + to_field + " [MID " + mail.message_id + "]")
-                   : ("Mail queued (link unavailable) for " + to_field + " [MID " + mail.message_id + "]"));
-    }
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat(outcome + " [MID " + mail.message_id + "]" +
+                     (stored ? std::string() : " (not saved: message store unavailable)"));
 }
 
 void App::sendBroadcastMail(const std::string& subject, const std::string& body) {
@@ -8887,15 +8635,9 @@ void App::sendBroadcastMail(const std::string& subject, const std::string& body)
     }
     mail_outbox_.push_back(mail);
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = sent
+    appendSystemChat(sent
         ? ("Broadcast mail sent: " + mail.subject + " [MID " + mail.message_id + "]")
-        : ("Broadcast mail send failed: modem not connected or TX failed [MID " + mail.message_id + "]");
-    msg.is_outgoing = false;
-    msg.timestamp = unixNowSeconds();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+        : ("Broadcast mail send failed: modem not connected or TX failed [MID " + mail.message_id + "]"));
 }
 
 void App::processMailReceived(const std::string& from, const std::vector<uint8_t>& data, bool via_link,
@@ -8958,13 +8700,15 @@ void App::processMailReceived(const std::string& from, const std::vector<uint8_t
             if (!via_link || !isEmailGatewayConfigured(config_) ||
                 !senderAllowedForGateway(config_, mail.from) ||
                 (away_mode_active_ && !config_.away.allow_email_gateway)) {
+                appendSystemChat("[EMAIL] Refused internet mail from " + mail.from + " to " + mail.to +
+                                 " (gateway off, or sender not in the allowed relays)");
                 return;
             }
             Message outbound_email;
             outbound_email.type = MessageType::Email;
             outbound_email.status = MessageStatus::Pending;
             outbound_email.from_callsign = mail.from;
-            outbound_email.to_callsign = trimSpaces(mail.to);
+            outbound_email.to_callsign = gui::trimCopy(mail.to);
             outbound_email.subject = mail.subject;
             outbound_email.body = mail.body;
             outbound_email.priority = static_cast<int>(mail.priority);
@@ -9004,16 +8748,10 @@ void App::processMailReceived(const std::string& from, const std::vector<uint8_t
     }
     persistMailReadState(mail_inbox_.back());
 
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "New mail from " + from + ": " + mail.subject;  // subject carries any relay marker
-    if (mail.is_broadcast) {
-        msg.text += " [BROADCAST]";
-    }
-    msg.is_outgoing = false;
-    msg.timestamp = mail.timestamp;
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    // The subject carries any relay marker.
+    appendSystemChat("New mail from " + from + ": " + mail.subject +
+                     (mail.is_broadcast ? " [BROADCAST]" : ""));
+    playNotificationSound();
 }
 
 void App::loadMailFromStore() {
@@ -9168,163 +8906,65 @@ bool App::isStationLinkConnected(bool refresh) {
     return false;
 }
 
-void App::requestWeatherForecast(const std::string& location) {
-    if (!modem_) return;
+namespace {
 
-    // Must be connected to a remote station
-    if (!isStationLinkConnected(true)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Weather request failed: Not connected to a remote station";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+const char* weatherTypeName(uint8_t type) {
+    switch (type) {
+        case 0x01: return "FORECAST";
+        case 0x02: return "METAR";
+        case 0x03: return "TAF";
+        case 0x04: return "MARINE";
+        case 0x05: return "ALERT";
+        default: return "UNKNOWN";
     }
-
-    // Build weather request packet: 0xE4 | 0x80 | type(1) | location
-    // 0x80 flag indicates REQUEST (vs response)
-    std::vector<uint8_t> packet;
-    packet.push_back(0xE4);  // Weather marker
-    packet.push_back(0x81);  // Type: Forecast REQUEST (0x80 | 0x01)
-
-    packet.insert(packet.end(), location.begin(), location.end());
-
-    modem_->sendData(packet);
-
-    weather_request_pending_ = true;
-    weather_request_time_ = std::chrono::steady_clock::now();
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Requesting weather forecast for " + location + "...";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
 }
 
-void App::requestMETAR(const std::string& airport_code) {
-    if (!modem_) return;
+}  // namespace
 
-    // Must be connected to a remote station
-    if (!isStationLinkConnected(true)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Weather request failed: Not connected to a remote station";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+// One request path for every weather product (0xE4 | 0x80|type | query),
+// answered by the linked station (0xE4 | type | loc_len | loc | report).
+bool App::requestWeather(uint8_t type, const std::string& query) {
+    const std::string name = weatherTypeName(type);
+    std::string q = gui::trimCopy(query);
+    if (type == 0x02 || type == 0x03 || type == 0x04) {
+        q = gui::upperCopy(q);
+    }
+    if (q.empty()) {
+        appendSystemChat("Weather " + name + " request not sent: nothing to look up");
+        return false;
+    }
+    if (q.size() > 64 || app_detail::containsControlChars(q)) {
+        appendSystemChat("Weather " + name + " request not sent: the query is too long or invalid");
+        return false;
+    }
+    if (!modem_ || !isStationLinkConnected(true)) {
+        appendSystemChat("Weather " + name + " request not sent: not linked to a station");
+        weather_request_pending_ = false;
+        return false;
     }
 
-    // Build METAR request packet: 0xE4 | 0x82 | airport_code
     std::vector<uint8_t> packet;
-    packet.push_back(0xE4);  // Weather marker
-    packet.push_back(0x82);  // Type: METAR REQUEST (0x80 | 0x02)
-
-    std::string code = airport_code;
-    std::transform(code.begin(), code.end(), code.begin(), ::toupper);
-    packet.insert(packet.end(), code.begin(), code.end());
-
-    modem_->sendData(packet);
+    packet.push_back(0xE4);                                  // Weather marker
+    packet.push_back(static_cast<uint8_t>(0x80 | type));     // REQUEST flag | type
+    packet.insert(packet.end(), q.begin(), q.end());
+    if (!modem_->sendData(packet)) {
+        appendSystemChat("Weather " + name + " request not sent: the modem did not accept it");
+        weather_request_pending_ = false;
+        return false;
+    }
 
     weather_request_pending_ = true;
     weather_request_time_ = std::chrono::steady_clock::now();
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Requesting METAR for " + code + "...";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    appendSystemChat("Requesting weather " + name + " for " + q + "...");
+    return true;
 }
 
-void App::requestTAF(const std::string& airport_code) {
-    if (!modem_) return;
-
-    // Must be connected to a remote station
-    if (!isStationLinkConnected(true)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Weather request failed: Not connected to a remote station";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
+// Weather window "Cancel": a response that still arrives is ignored.
+void App::cancelWeatherRequest() {
+    if (weather_request_pending_) {
+        appendSystemChat("Weather request cancelled");
     }
-
-    // Build TAF request packet: 0xE4 | 0x83 | airport_code
-    std::vector<uint8_t> packet;
-    packet.push_back(0xE4);  // Weather marker
-    packet.push_back(0x83);  // Type: TAF REQUEST (0x80 | 0x03)
-
-    std::string code = airport_code;
-    std::transform(code.begin(), code.end(), code.begin(), ::toupper);
-    packet.insert(packet.end(), code.begin(), code.end());
-
-    modem_->sendData(packet);
-
-    weather_request_pending_ = true;
-    weather_request_time_ = std::chrono::steady_clock::now();
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Requesting TAF for " + code + "...";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
-}
-
-void App::requestMarineWeather(const std::string& zone) {
-    if (!modem_) return;
-
-    // Must be connected to a remote station
-    if (!isStationLinkConnected(true)) {
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Weather request failed: Not connected to a remote station";
-        msg.is_outgoing = false;
-        msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-        return;
-    }
-
-    // Build marine weather request packet: 0xE4 | 0x84 | zone
-    std::vector<uint8_t> packet;
-    packet.push_back(0xE4);  // Weather marker
-    packet.push_back(0x84);  // Type: Marine REQUEST (0x80 | 0x04)
-
-    std::string zone_code = zone;
-    std::transform(zone_code.begin(), zone_code.end(), zone_code.begin(), ::toupper);
-    packet.insert(packet.end(), zone_code.begin(), zone_code.end());
-
-    modem_->sendData(packet);
-
-    weather_request_pending_ = true;
-    weather_request_time_ = std::chrono::steady_clock::now();
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Requesting marine weather for zone " + zone_code + "...";
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
+    weather_request_pending_ = false;
 }
 
 void App::processWeatherMessage(const std::string& from, const std::vector<uint8_t>& data) {
@@ -9350,115 +8990,120 @@ void App::processWeatherMessage(const std::string& from, const std::vector<uint8
             return;
         }
         handleWeatherRequest(wx_type, query, requester);
+        return;
+    }
+
+    // RESPONSE: 0xE4 | type | location_len | location | report
+    if (data.size() < 3) return;
+    uint8_t loc_len = data[2];
+    if (data.size() < 3u + loc_len) return;
+
+    std::string sender = normalizeCallsign(from);
+    if (sender.empty()) {
+        sender = "UNKNOWN";
+    }
+    // Only an answer to our own outstanding request is shown: a cancelled
+    // or timed-out request's late answer is dropped.
+    if (!weather_request_pending_) {
+        appendSystemChat("Ignored a late weather answer from " + sender + " (request cancelled or timed out)");
+        return;
+    }
+    weather_request_pending_ = false;
+
+    std::string location(data.begin() + 3, data.begin() + 3 + loc_len);
+    std::string report;
+    if (data.size() > 3u + loc_len) {
+        report = std::string(data.begin() + 3 + loc_len, data.end());
+    }
+    location = app_detail::sanitizeRemoteText(location, 64);
+
+    WeatherReport wx_report;
+    wx_report.location = location;
+    wx_report.report = report;
+    wx_report.source_station = sender;
+    wx_report.timestamp = unixNowSeconds();
+    wx_report.type = weatherTypeName(wx_type);
+    if (wx_report.type == "ALERT") {
+        wx_report.severity = inferWeatherAlertSeverity(report);
+        wx_report.expires_utc = extractWeatherAlertExpiryUtc(report);
     } else {
-        // This is a weather RESPONSE
-        // Format: 0xE4 | type | location_len | location | report
-        if (data.size() < 3) return;
+        wx_report.severity = "N/A";
+        wx_report.expires_utc = "N/A";
+    }
 
-        weather_request_pending_ = false;
+    // Add to reports (limit to 50) and keep a copy in the store.
+    weather_reports_.insert(weather_reports_.begin(), wx_report);
+    while (weather_reports_.size() > 50) {
+        weather_reports_.pop_back();
+    }
+    if (store_ && store_->isOpen()) {
+        (void)store_->saveWeatherReport(wx_report.type, wx_report.location, wx_report.report,
+                                        wx_report.timestamp);
+    }
 
-        uint8_t loc_len = data[2];
-        if (data.size() < 3 + loc_len) return;
-
-        std::string location(data.begin() + 3, data.begin() + 3 + loc_len);
-        std::string report;
-        if (data.size() > 3 + loc_len) {
-            report = std::string(data.begin() + 3 + loc_len, data.end());
+    // System notification
+    std::string text = "Weather " + wx_report.type + " received from " + sender + " for " + location;
+    if (wx_report.type == "ALERT") {
+        std::string excerpt = report;
+        if (excerpt.size() > 120) {
+            excerpt.resize(120);
+            excerpt += "...";
         }
-        std::string sender = normalizeCallsign(from);
-        if (sender.empty()) {
-            sender = "UNKNOWN";
-        }
+        text = "[WEATHER ALERT] " + location +
+               " | From " + sender +
+               " | UTC " + utcDateTimeStringFromUnix(wx_report.timestamp) +
+               " | Severity " + wx_report.severity +
+               " | Expires " + wx_report.expires_utc +
+               " | " + excerpt;
+    }
+    appendSystemChat(text);
+    playNotificationSound();
+}
 
-        WeatherReport wx_report;
-        wx_report.location = location;
-        wx_report.report = report;
-        wx_report.source_station = sender;
-        wx_report.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        wx_report.is_request_pending = false;
-
-        switch (wx_type) {
-            case 0x01: wx_report.type = "FORECAST"; break;
-            case 0x02: wx_report.type = "METAR"; break;
-            case 0x03: wx_report.type = "TAF"; break;
-            case 0x04: wx_report.type = "MARINE"; break;
-            case 0x05: wx_report.type = "ALERT"; break;
-            default: wx_report.type = "UNKNOWN"; break;
-        }
-        if (wx_report.type == "ALERT") {
-            wx_report.severity = inferWeatherAlertSeverity(report);
-            wx_report.expires_utc = extractWeatherAlertExpiryUtc(report);
+// Weather reports kept from earlier sessions (store weather cache).
+void App::loadWeatherCache() {
+    if (!store_ || !store_->isOpen()) {
+        return;
+    }
+    for (const auto& cached : store_->loadWeatherReports(50)) {
+        WeatherReport wx;
+        wx.type = cached.type;
+        wx.location = cached.location;
+        wx.report = cached.report;
+        wx.source_station = "CACHE";
+        wx.timestamp = cached.timestamp;
+        if (wx.type == "ALERT") {
+            wx.severity = inferWeatherAlertSeverity(wx.report);
+            wx.expires_utc = extractWeatherAlertExpiryUtc(wx.report);
         } else {
-            wx_report.severity = "N/A";
-            wx_report.expires_utc = "N/A";
+            wx.severity = "N/A";
+            wx.expires_utc = "N/A";
         }
-
-        // Add to reports (limit to 50)
-        weather_reports_.insert(weather_reports_.begin(), wx_report);
-        while (weather_reports_.size() > 50) {
-            weather_reports_.pop_back();
-        }
-
-        // System notification
-        ChatMessage msg;
-        msg.from = "SYSTEM";
-        msg.text = "Weather " + wx_report.type + " received from " + sender + " for " + location;
-        if (wx_report.type == "ALERT") {
-            std::string excerpt = report;
-            if (excerpt.size() > 120) {
-                excerpt.resize(120);
-                excerpt += "...";
-            }
-            msg.text = "[WEATHER ALERT] " + location +
-                       " | From " + sender +
-                       " | UTC " + utcDateTimeStringFromUnix(wx_report.timestamp) +
-                       " | Severity " + wx_report.severity +
-                       " | Expires " + wx_report.expires_utc +
-                       " | " + excerpt;
-        }
-        msg.is_outgoing = false;
-        msg.timestamp = wx_report.timestamp;
-        chat_history_.push_back(msg);
-        chat_scroll_to_bottom_ = true;
-
+        weather_reports_.push_back(std::move(wx));
     }
 }
 
 void App::handleWeatherRequest(uint8_t request_type, const std::string& query, const std::string& requester) {
-    // Handle incoming weather request from connected station
-    // Fetch data from internet asynchronously and send response
-
-    std::string type_name;
-    switch (request_type) {
-        case 0x01: type_name = "FORECAST"; break;
-        case 0x02: type_name = "METAR"; break;
-        case 0x03: type_name = "TAF"; break;
-        case 0x04: type_name = "MARINE"; break;
-        default: type_name = "UNKNOWN"; break;
+    // Handle incoming weather request from connected station: fetch from the
+    // internet on the worker and answer. Every request gets an answer.
+    const std::string type_name = weatherTypeName(request_type);
+    appendSystemChat("Weather " + type_name + " request from " + requester + " for: " +
+                     app_detail::sanitizeRemoteText(query, 64));
+    if (type_name == "UNKNOWN") {
+        (void)sendWeatherResponse(request_type, app_detail::sanitizeRemoteText(query, 64),
+                                  "Request refused: unknown weather product");
+        return;
     }
-
-    ChatMessage msg;
-    msg.from = "SYSTEM";
-    msg.text = "Weather " + type_name + " request from " + requester + " for: " +
-               app_detail::sanitizeRemoteText(query, 64);
-    msg.is_outgoing = false;
-    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    chat_history_.push_back(msg);
-    chat_scroll_to_bottom_ = true;
-
-    // Start async fetch
     fetchWeatherAsync(request_type, query, requester);
 }
 
-void App::sendWeatherResponse(uint8_t type, const std::string& location, const std::string& report) {
-    if (!modem_) return;
+bool App::sendWeatherResponse(uint8_t type, const std::string& location, const std::string& report) {
+    if (!modem_) return false;
 
     // Build response packet: 0xE4 | type | location_len | location | report
     std::vector<uint8_t> packet;
     packet.push_back(0xE4);  // Weather marker
-    packet.push_back(type);  // Type (no 0x80 flag = response)
+    packet.push_back(type & 0x0F);  // Type (no 0x80 flag = response)
 
     // Location (length-prefixed)
     uint8_t loc_len = static_cast<uint8_t>(std::min(location.size(), size_t(255)));
@@ -9468,7 +9113,11 @@ void App::sendWeatherResponse(uint8_t type, const std::string& location, const s
     // Report data
     packet.insert(packet.end(), report.begin(), report.end());
 
-    modem_->sendData(packet);
+    if (!modem_->sendData(packet)) {
+        appendSystemChat("Weather answer for " + location + " could not be sent (modem did not accept it)");
+        return false;
+    }
+    return true;
 }
 
 // Convert Maidenhead grid square to lat/lon
@@ -9778,7 +9427,7 @@ std::string App::httpGet(const std::string& host, const std::string& path, bool 
         // Build HTTP request
         std::string request = "GET " + current_path + " HTTP/1.1\r\n";
         request += "Host: " + current_host + "\r\n";
-        request += "User-Agent: Skywave-Link/1.0\r\n";
+        request += std::string("User-Agent: Skywave-Link/") + SKYWAVE_LINK_VERSION + "\r\n";
         request += "Accept: */*\r\n";
         request += "Connection: close\r\n\r\n";
 
@@ -10383,6 +10032,38 @@ std::string App::fetchWeatherReport(uint8_t type, const std::string& query) {
             break;
         }
 
+        case 0x05: {
+            // Active alerts (api.weather.gov): a two-letter US state, or a
+            // point from a grid square, "lat,lon" or a place name.
+            const std::string q = trim(query);
+            std::string alerts_path;
+            std::string where = q;
+            const bool state_code = q.size() == 2 && std::isalpha(static_cast<unsigned char>(q[0])) &&
+                                    std::isalpha(static_cast<unsigned char>(q[1]));
+            if (state_code) {
+                std::string area = q;
+                std::transform(area.begin(), area.end(), area.begin(), ::toupper);
+                alerts_path = "/alerts/active?area=" + url_encode(area);
+                where = area;
+            } else {
+                double lat = 0.0, lon = 0.0;
+                if (gridSquareToLatLon(q, lat, lon) || parse_lat_lon(q, lat, lon) ||
+                    geocode_location(q, lat, lon)) {
+                    alerts_path = "/alerts/active?point=" + format_coords(lat, lon);
+                }
+            }
+            if (alerts_path.empty()) {
+                result = "Could not resolve location: " + q;
+                break;
+            }
+            const std::string raw = httpGet("api.weather.gov", alerts_path, true);
+            result = app_detail::formatWeatherAlerts(raw, where);
+            if (result.empty()) {
+                result = "Weather alerts unavailable for " + where;
+            }
+            break;
+        }
+
         default:
             result = "Unknown weather type";
             break;
@@ -10395,6 +10076,8 @@ void App::fetchWeatherAsync(uint8_t type, const std::string& query, const std::s
     // Remote queries end up in URLs and HTTP request lines.
     if (query.empty() || query.size() > 64 || app_detail::containsControlChars(query)) {
         appendSystemChat("Weather request from " + requester + " rejected: invalid query");
+        (void)sendWeatherResponse(type, app_detail::sanitizeRemoteText(query, 64),
+                                  "Request refused: the query is empty, too long or invalid");
         return;
     }
 
@@ -10408,7 +10091,13 @@ void App::fetchWeatherAsync(uint8_t type, const std::string& query, const std::s
             std::any_of(worker->queue.begin(), worker->queue.end(),
                         [&](const WeatherJob& job) { return job.requester == requester; });
         if (requester_busy || worker->queue.size() >= WeatherWorker::kMaxQueued) {
-            worker->rejected.push_back(requester);
+            WeatherJob refused;
+            refused.type = type;
+            refused.query = query;
+            refused.requester = requester;
+            refused.result = requester_busy ? "Request refused: your previous request is still being fetched"
+                                            : "Request refused: this station is busy, try again shortly";
+            worker->rejected.push_back(std::move(refused));
         } else {
             WeatherJob job;
             job.type = type;
@@ -10455,15 +10144,19 @@ void App::fetchWeatherAsync(uint8_t type, const std::string& query, const std::s
 // Deliver completed weather fetches to the station that asked for them.
 void App::processWeatherFetchResult() {
     std::vector<WeatherJob> done;
-    std::vector<std::string> rejected;
+    std::vector<WeatherJob> rejected;
     {
         std::lock_guard<std::mutex> lock(weather_worker_->mutex);
         done.swap(weather_worker_->done);
         rejected.swap(weather_worker_->rejected);
     }
 
-    for (const auto& requester : rejected) {
-        appendSystemChat("Weather request from " + requester + " dropped: a request is already pending");
+    // Refused requests are answered too, so the requester is not left waiting.
+    for (const auto& job : rejected) {
+        appendSystemChat("Weather request from " + job.requester + " refused: " + job.result);
+        if (linkedPeerCallsign() == job.requester) {
+            (void)sendWeatherResponse(job.type, job.query, job.result);
+        }
     }
 
     for (const auto& job : done) {
@@ -10474,10 +10167,11 @@ void App::processWeatherFetchResult() {
                              ") discarded: station no longer linked");
             continue;
         }
-        if (!job.result.empty()) {
-            sendWeatherResponse(job.type, job.query, job.result);
-        } else {
-            sendWeatherResponse(job.type, job.query, "Weather data not available for " + job.query);
+        const std::string& report =
+            job.result.empty() ? "Weather data not available for " + job.query : job.result;
+        if (sendWeatherResponse(job.type, job.query, report)) {
+            appendSystemChat("Weather " + std::string(weatherTypeName(job.type)) + " for " + job.query +
+                             " sent to " + job.requester);
         }
     }
 }
@@ -10499,13 +10193,15 @@ void App::syncTransfersFromManager() {
     auto append_transfers = [&ui_transfers](const std::vector<TransferProgress>& list) {
         for (const auto& t : list) {
             FileTransfer ui{};
+            ui.transfer_id = t.transfer_id;
             ui.filename = t.filename;
             ui.remote_callsign = t.remote_callsign;
             ui.total_bytes = t.total_bytes;
             ui.transferred_bytes = t.transferred_bytes;
             ui.is_upload = (t.direction == TransferDirection::Upload);
             ui.completed = (t.state == TransferState::Completed);
-            ui.failed = (t.state == TransferState::Failed || t.state == TransferState::Cancelled);
+            ui.failed = (t.state == TransferState::Failed);
+            ui.cancelled = (t.state == TransferState::Cancelled);
             ui.error = t.error_message;
             ui.started_at = t.started_at;
             ui_transfers.push_back(std::move(ui));
@@ -10517,286 +10213,132 @@ void App::syncTransfersFromManager() {
     transfers_ = std::move(ui_transfers);
 }
 
-bool App::isImageFile(const std::string& filename) const {
-    std::string lower = filename;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-
-    return lower.ends_with(".jpg") || lower.ends_with(".jpeg") ||
-           lower.ends_with(".png") || lower.ends_with(".gif") ||
-           lower.ends_with(".bmp") || lower.ends_with(".webp");
-}
-
-std::string App::getFileTypeDescription(const std::string& filename) const {
-    std::string lower = filename;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-
-    if (lower.ends_with(".jpg") || lower.ends_with(".jpeg")) return "JPEG Image";
-    if (lower.ends_with(".png")) return "PNG Image";
-    if (lower.ends_with(".gif")) return "GIF Image";
-    if (lower.ends_with(".bmp")) return "Bitmap Image";
-    if (lower.ends_with(".webp")) return "WebP Image";
-    if (lower.ends_with(".pdf")) return "PDF Document";
-    if (lower.ends_with(".txt")) return "Text File";
-    if (lower.ends_with(".log")) return "Log File";
-    if (lower.ends_with(".adi") || lower.ends_with(".adif")) return "ADIF Log";
-    if (lower.ends_with(".cabrillo") || lower.ends_with(".cbr")) return "Cabrillo Log";
-    if (lower.ends_with(".qsl")) return "QSL Card";
-
-    // Extract extension
-    size_t dot_pos = lower.find_last_of('.');
-    if (dot_pos != std::string::npos) {
-        return lower.substr(dot_pos + 1) + " file";
-    }
-    return "Unknown";
-}
-
 // ============================================================================
-// PSK Reporter Functions
+// PSK Reporter (R1: IPFIX upload by PskReporterClient)
 // ============================================================================
 
+// A reception report: the station heard, on the rig-confirmed dial
+// frequency, with the SNR only when one was measured. No dial frequency
+// (no rig, or dry-run) means no spot: a guessed frequency is worse than none.
 void App::queuePSKReporterSpot(const std::string& callsign, const std::string& grid,
-                                float snr, uint32_t freq_hz) {
+                               std::optional<float> snr) {
     if (!config_.psk_reporter.enabled) return;
-    if (callsign.empty()) return;
+    const std::string call = normalizeCallsign(callsign);
+    if (call.empty() || call == "UNKNOWN" || isLikelyHashId(call)) return;
+    if (snr && *snr < static_cast<float>(config_.psk_reporter.min_snr)) return;
+    const auto dial = knownDialFrequencyHz();
+    if (!dial) return;
+    updatePSKReporter();  // creates the client once a callsign is set
+    if (!psk_client_) return;
 
-    std::lock_guard<std::mutex> lock(psk_reporter_mutex_);
-
-    PSKReporterSpot spot;
-    spot.callsign = callsign;
-    spot.grid_square = grid;
-    spot.snr_db = snr;
-    spot.frequency_hz = (freq_hz > 0) ? freq_hz : current_frequency_hz_;
-    spot.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
-    // Avoid duplicates within short time window (30 seconds)
-    auto it = std::find_if(psk_reporter_queue_.begin(), psk_reporter_queue_.end(),
-        [&](const PSKReporterSpot& s) {
-            return s.callsign == callsign &&
-                   (spot.timestamp - s.timestamp) < 30;
-        });
-
-    if (it == psk_reporter_queue_.end()) {
-        psk_reporter_queue_.push_back(spot);
+    PskReporterSpot spot;
+    spot.callsign = call;
+    spot.frequency_hz = *dial;
+    spot.has_snr = snr.has_value();
+    spot.snr_db = snr ? static_cast<int>(std::lround(*snr)) : 0;
+    spot.mode = "SKYWAVE";
+    double lat = 0.0, lon = 0.0;
+    const std::string locator = app_detail::sanitizeRemoteText(gui::trimCopy(grid), 8);
+    if (!locator.empty() && gridSquareToLatLon(locator, lat, lon)) {
+        spot.locator = locator;
     }
+    spot.flow_start_unix = static_cast<uint32_t>(unixNowSeconds());
+    psk_client_->addSpot(spot);
+    refreshPskStatus();
+}
+
+void App::refreshPskStatus() {
+    if (!psk_client_) {
+        psk_status_ = PskReporterStatus{};
+        return;
+    }
+    psk_status_.active = true;
+    psk_status_.queued_spots = psk_client_->queuedSpots();
+    psk_status_.spots_sent = psk_client_->spotsSent();
+    psk_status_.last_upload_unix = psk_client_->lastUploadUnix();
+    psk_status_.next_upload_unix = psk_client_->nextUploadDueUnix();
+    psk_status_.upload_in_progress = psk_client_->uploadInProgress();
+    psk_status_.last_error = psk_client_->lastError();
 }
 
 void App::updatePSKReporter() {
-    if (!config_.psk_reporter.enabled) return;
-
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        now - last_psk_reporter_upload_);
-
-    if (elapsed.count() >= config_.psk_reporter.upload_interval_sec) {
-        uploadPSKReporterSpots();
-        last_psk_reporter_upload_ = now;
-    }
-}
-
-void App::uploadPSKReporterSpots() {
-    std::vector<PSKReporterSpot> spots_to_upload;
-
-    {
-        std::lock_guard<std::mutex> lock(psk_reporter_mutex_);
-        if (psk_reporter_queue_.empty()) return;
-        spots_to_upload = std::move(psk_reporter_queue_);
-        psk_reporter_queue_.clear();
-    }
-
-    if (config_.station.callsign.empty()) {
-        std::cerr << "[PSKReporter] Cannot upload: callsign not configured\n";
+    if (!config_.psk_reporter.enabled) {
+        if (psk_client_) {
+            psk_client_.reset();  // queued spots go with it
+            psk_receiver_key_.clear();
+            refreshPskStatus();
+        }
         return;
     }
 
-    std::string payload = generatePSKReporterPayload(
-        config_.station.callsign,
-        config_.station.grid_square,
-        config_.psk_reporter.antenna,
-        spots_to_upload
-    );
+    PskReporterReceiver rx;
+    rx.callsign = normalizeCallsign(config_.station.callsign);
+    rx.locator = gui::trimCopy(config_.station.grid_square);
+    rx.software = std::string("Skywave Link ") + SKYWAVE_LINK_VERSION;
+    rx.antenna = gui::trimCopy(config_.psk_reporter.antenna);
+    if (rx.callsign.empty()) {
+        return;  // nothing can be reported without our own callsign
+    }
+    const std::string key = rx.callsign + "|" + rx.locator + "|" + rx.antenna;
+    if (!psk_client_) {
+        psk_client_ = std::make_unique<PskReporterClient>(rx);
+        psk_receiver_key_ = key;
+    } else if (key != psk_receiver_key_) {
+        psk_client_->setReceiver(rx);
+        psk_receiver_key_ = key;
+    }
 
-    if (!sendPSKReporterUDP(payload)) {
-        std::cerr << "[PSKReporter] Upload failed, re-queueing spots\n";
-        std::lock_guard<std::mutex> lock(psk_reporter_mutex_);
-        for (const auto& spot : spots_to_upload) {
-            psk_reporter_queue_.push_back(spot);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_psk_poll_ < std::chrono::seconds(1)) {
+        return;
+    }
+    last_psk_poll_ = now;
+    psk_client_->poll(static_cast<uint64_t>(unixNowSeconds()));
+
+    // Status for the operator: Settings status line, new errors, uploads.
+    refreshPskStatus();
+    const std::string err = psk_client_->lastError();
+    if (err != psk_last_error_shown_) {
+        psk_last_error_shown_ = err;
+        if (!err.empty()) {
+            appendSystemChat("PSK Reporter: " + err);
         }
+    }
+    const uint64_t uploaded = psk_client_->lastUploadUnix();
+    if (uploaded != 0 && uploaded != psk_last_upload_shown_) {
+        psk_last_upload_shown_ = uploaded;
+        std::cerr << "[PSKReporter] upload at " << uploaded << ", " << psk_client_->spotsSent()
+                  << " spots sent in total\n";
     }
 }
 
-std::string App::generatePSKReporterPayload(const std::string& reporter_call,
-                                             const std::string& reporter_grid,
-                                             const std::string& antenna,
-                                             const std::vector<PSKReporterSpot>& spots) {
-    // PSK Reporter uses a binary format over UDP
-    // Format documentation: https://pskreporter.info/pskdev.html
-    // Header: 0x00 0x0A (version), then TLV records
-
-    std::string payload;
-
-    // Header (version 0x000A)
-    payload.push_back(0x00);
-    payload.push_back(0x0A);
-
-    // Sequence number (4 bytes, little endian)
-    static uint32_t sequence = 0;
-    sequence++;
-    payload.push_back(sequence & 0xFF);
-    payload.push_back((sequence >> 8) & 0xFF);
-    payload.push_back((sequence >> 16) & 0xFF);
-    payload.push_back((sequence >> 24) & 0xFF);
-
-    // Random ID (4 bytes) - use a fixed ID per session
-    static uint32_t session_id = static_cast<uint32_t>(
-        std::chrono::system_clock::now().time_since_epoch().count() & 0xFFFFFFFF);
-    payload.push_back(session_id & 0xFF);
-    payload.push_back((session_id >> 8) & 0xFF);
-    payload.push_back((session_id >> 16) & 0xFF);
-    payload.push_back((session_id >> 24) & 0xFF);
-
-    // Receiver info record (type 0x99 0x92)
-    std::string rx_record;
-    rx_record.push_back(0x99);
-    rx_record.push_back(0x92);
-
-    // Receiver callsign (length-prefixed string)
-    rx_record.push_back(static_cast<char>(reporter_call.length()));
-    rx_record += reporter_call;
-
-    // Receiver locator (length-prefixed string)
-    rx_record.push_back(static_cast<char>(reporter_grid.length()));
-    rx_record += reporter_grid;
-
-    // Software name and version
-    std::string sw_name = "Skywave Link";
-    std::string sw_version = "1.0";
-    rx_record.push_back(static_cast<char>(sw_name.length()));
-    rx_record += sw_name;
-    rx_record.push_back(static_cast<char>(sw_version.length()));
-    rx_record += sw_version;
-
-    // Antenna (length-prefixed)
-    rx_record.push_back(static_cast<char>(antenna.length()));
-    rx_record += antenna;
-
-    // Record length (2 bytes, big endian) at position 2-3
-    uint16_t rx_len = static_cast<uint16_t>(rx_record.length());
-    std::string rx_header;
-    rx_header.push_back((rx_len >> 8) & 0xFF);
-    rx_header.push_back(rx_len & 0xFF);
-    payload += rx_header + rx_record;
-
-    // Sender info records (type 0x99 0x93)
-    for (const auto& spot : spots) {
-        std::string tx_record;
-        tx_record.push_back(0x99);
-        tx_record.push_back(0x93);
-
-        // Sender callsign
-        tx_record.push_back(static_cast<char>(spot.callsign.length()));
-        tx_record += spot.callsign;
-
-        // Frequency (4 bytes, big endian)
-        uint32_t freq = spot.frequency_hz;
-        tx_record.push_back((freq >> 24) & 0xFF);
-        tx_record.push_back((freq >> 16) & 0xFF);
-        tx_record.push_back((freq >> 8) & 0xFF);
-        tx_record.push_back(freq & 0xFF);
-
-        // SNR (1 byte, signed)
-        int8_t snr_byte = static_cast<int8_t>(std::max(-128.0f, std::min(127.0f, spot.snr_db)));
-        tx_record.push_back(static_cast<char>(snr_byte));
-
-        // Mode (length-prefixed string)
-        std::string mode = "SKYWAVE";
-        tx_record.push_back(static_cast<char>(mode.length()));
-        tx_record += mode;
-
-        // Sender locator (if known)
-        tx_record.push_back(static_cast<char>(spot.grid_square.length()));
-        if (!spot.grid_square.empty()) {
-            tx_record += spot.grid_square;
-        }
-
-        // Timestamp (4 bytes, Unix time, big endian)
-        uint32_t ts = static_cast<uint32_t>(spot.timestamp);
-        tx_record.push_back((ts >> 24) & 0xFF);
-        tx_record.push_back((ts >> 16) & 0xFF);
-        tx_record.push_back((ts >> 8) & 0xFF);
-        tx_record.push_back(ts & 0xFF);
-
-        // Record length header
-        uint16_t tx_len = static_cast<uint16_t>(tx_record.length());
-        std::string tx_header;
-        tx_header.push_back((tx_len >> 8) & 0xFF);
-        tx_header.push_back(tx_len & 0xFF);
-        payload += tx_header + tx_record;
+// Settings "Upload Now".
+void App::uploadPSKReporterSpots() {
+    if (!config_.psk_reporter.enabled) {
+        appendSystemChat("PSK Reporter is disabled: enable it first");
+        return;
     }
-
-    return payload;
-}
-
-bool App::sendPSKReporterUDP(const std::string& payload) {
-    // PSK Reporter server: report.pskreporter.info port 4739
-    const char* host = "report.pskreporter.info";
-    const int port = 4739;
-
-#ifdef _WIN32
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        std::cerr << "[PSKReporter] WSAStartup failed\n";
-        return false;
+    if (normalizeCallsign(config_.station.callsign).empty()) {
+        appendSystemChat("PSK Reporter: set your callsign first (Settings > Station)");
+        return;
     }
-#endif
-
-    // Create UDP socket
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        std::cerr << "[PSKReporter] Failed to create socket\n";
-#ifdef _WIN32
-        WSACleanup();
-#endif
-        return false;
+    updatePSKReporter();
+    if (!psk_client_ || psk_client_->queuedSpots() == 0) {
+        appendSystemChat(knownDialFrequencyHz()
+                             ? std::string("PSK Reporter: no spots waiting to upload")
+                             : std::string("PSK Reporter: no spots waiting (spots need a rig-reported "
+                                           "dial frequency: connect radio control)"));
+        return;
     }
-
-    // Resolve hostname
-    struct hostent* he = gethostbyname(host);
-    if (!he) {
-        std::cerr << "[PSKReporter] Failed to resolve " << host << "\n";
-#ifdef _WIN32
-        closesocket(sock);
-        WSACleanup();
-#else
-        close(sock);
-#endif
-        return false;
+    const size_t waiting = psk_client_->queuedSpots();
+    if (psk_client_->flushNow(static_cast<uint64_t>(unixNowSeconds()))) {
+        appendSystemChat("PSK Reporter: uploading " + std::to_string(waiting) + " spot(s)");
+    } else {
+        const std::string err = psk_client_->lastError();
+        appendSystemChat("PSK Reporter upload not started" + (err.empty() ? std::string() : ": " + err));
+        psk_last_error_shown_ = err;
     }
-
-    struct sockaddr_in server_addr;
-    std::memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    std::memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
-
-    // Send payload
-    ssize_t sent = sendto(sock, payload.data(), payload.size(), 0,
-                          reinterpret_cast<struct sockaddr*>(&server_addr),
-                          sizeof(server_addr));
-
-#ifdef _WIN32
-    closesocket(sock);
-    WSACleanup();
-#else
-    close(sock);
-#endif
-
-    if (sent != static_cast<ssize_t>(payload.size())) {
-        std::cerr << "[PSKReporter] Failed to send UDP packet\n";
-        return false;
-    }
-
-    return true;
+    refreshPskStatus();
 }
 
 } // namespace skylink
@@ -10807,12 +10349,7 @@ bool App::sendPSKReporterUDP(const std::string& payload) {
 // ---------------------------------------------------------------------------
 
 namespace {
-std::string trimCopy(const std::string& v) {
-    size_t a = v.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return "";
-    size_t b = v.find_last_not_of(" \t\r\n");
-    return v.substr(a, b - a + 1);
-}
+using skylink::gui::trimCopy;
 std::vector<std::string> splitBar(const std::string& v) {
     std::vector<std::string> out;
     size_t p = 0;
@@ -10916,7 +10453,7 @@ void skylink::App::runTestScript() {
     } else if (cmd == "disconnect") {
         if (modem_) modem_->sendCommand("DISCONNECT");
     } else if (cmd == "chat") {
-        sendChatMessage(arg);
+        if (!sendChatMessage(arg)) testLog("chat not sent");
     } else if (cmd == "file") {
         sendFile(arg);
     } else if (cmd == "file_accept" || cmd == "file_decline") {
@@ -10942,9 +10479,37 @@ void skylink::App::runTestScript() {
         requestWeatherForecast(arg);
     } else if (cmd == "metar") {
         requestMETAR(arg);
+    } else if (cmd == "wx_alerts") {
+        requestWeatherAlerts(arg);
+    } else if (cmd == "wx_cancel") {
+        cancelWeatherRequest();
+    } else if (cmd == "away_on") {
+        enableAwayMode();
+    } else if (cmd == "away_off") {
+        disableAwayMode();
+    } else if (cmd == "save_config") {
+        if (!saveConfig(true)) testLog("save_config failed");
+    } else if (cmd == "email") {
+        auto f = splitBar(arg);
+        if (f.size() >= 3) {
+            if (!queueOutgoingEmail(f[0], f[1], f[2], "")) testLog("email not queued");
+        } else {
+            testLog("email needs TO|SUBJECT|BODY");
+        }
+    } else if (cmd == "qsy") {
+        auto f = splitBar(arg);
+        sendQsySuggestion(f[0], f.size() > 1 ? std::atoi(f[1].c_str()) : 1, 0);
+    } else if (cmd == "psk_upload") {
+        uploadPSKReporterSpots();
+    } else if (cmd == "tune") {
+        if (!setOperatingFrequencyFromUi(static_cast<uint64_t>(std::atoll(arg.c_str())))) {
+            testLog("tune failed");
+        }
     } else if (cmd == "bbs_upload") {
         auto f = splitBar(arg);
         uploadToBBS(f[0], f.size() > 1 ? f[1] : "");
+    } else if (cmd == "bbs_send") {
+        if (!sendFile(arg, FileOfferKind::BbsUpload)) testLog("bbs_send not started");
     } else if (cmd == "bbs_announce") {
         for (const auto& b : bbs_files_) {
             if (!b.remote) announceBBSFile(b);
@@ -10952,8 +10517,6 @@ void skylink::App::runTestScript() {
     } else if (cmd == "bbs_fetch") {
         auto f = splitBar(arg);
         if (f.size() >= 2) requestRemoteBBSDownload(f[0], f[1]);
-    } else if (cmd == "snr") {
-        exchangeSNR(true);
     } else if (cmd == "position") {
         auto f = splitBar(arg);
         if (f.size() >= 2) updatePosition(std::atof(f[0].c_str()), std::atof(f[1].c_str()));
@@ -11023,7 +10586,8 @@ void skylink::App::dumpTestReport(const std::string& path) {
           << jsonEsc(t.remote_callsign) << "\", \"upload\": " << (t.is_upload ? "true" : "false")
           << ", \"bytes\": " << t.transferred_bytes << ", \"total\": " << t.total_bytes
           << ", \"completed\": " << (t.completed ? "true" : "false") << ", \"failed\": "
-          << (t.failed ? "true" : "false") << ", \"error\": \"" << jsonEsc(t.error) << "\"}";
+          << (t.failed ? "true" : "false") << ", \"cancelled\": " << (t.cancelled ? "true" : "false")
+          << ", \"error\": \"" << jsonEsc(t.error) << "\"}";
     }
     auto mails = [&](const char* name, const std::vector<MailMessage>& v) {
         o << "\n  ],\n  \"" << name << "\": [";
@@ -11037,9 +10601,9 @@ void skylink::App::dumpTestReport(const std::string& path) {
     };
     mails("mail_inbox", mail_inbox_);
     mails("mail_outbox", mail_outbox_);
-    o << "\n  ],\n  \"heard_stations\": [";
-    for (size_t i = 0; i < heard_stations_.size(); ++i) {
-        o << (i ? ", " : "") << "\"" << jsonEsc(heard_stations_[i].first) << "\"";
+    o << "\n  ],\n  \"heard_calls\": [";
+    for (size_t i = 0; i < heard_calls_.size(); ++i) {
+        o << (i ? ", " : "") << "\"" << jsonEsc(heard_calls_[i].callsign) << "\"";
     }
     o << "],\n  \"heard_beacons\": [";
     for (size_t i = 0; i < heard_beacons_.size(); ++i) {
@@ -11056,7 +10620,7 @@ void skylink::App::dumpTestReport(const std::string& path) {
         const auto& w = weather_reports_[i];
         o << (i ? ", " : "") << "{\"type\": \"" << jsonEsc(w.type) << "\", \"loc\": \""
           << jsonEsc(w.location) << "\", \"from\": \"" << jsonEsc(w.source_station)
-          << "\", \"pending\": " << (w.is_request_pending ? "true" : "false") << ", \"len\": "
+          << "\", \"len\": "
           << w.report.size() << "}";
     }
     o << "],\n  \"bbs_files\": [";
@@ -11065,6 +10629,9 @@ void skylink::App::dumpTestReport(const std::string& path) {
         o << (i ? ", " : "") << "{\"file\": \"" << jsonEsc(b.filename) << "\", \"remote\": "
           << (b.remote ? "true" : "false") << ", \"uploader\": \"" << jsonEsc(b.uploader) << "\"}";
     }
-    o << "]\n}\n";
+    o << "],\n  \"psk\": {\"active\": " << (psk_status_.active ? "true" : "false")
+      << ", \"queued\": " << psk_status_.queued_spots << ", \"sent\": " << psk_status_.spots_sent
+      << ", \"error\": \"" << jsonEsc(psk_status_.last_error) << "\"},\n";
+    o << "  \"voice_tx_dropped\": " << voice_tx_dropped_ << "\n}\n";
     testLog("report written: " + path);
 }

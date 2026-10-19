@@ -2,6 +2,9 @@
 
 #include "skywave_link/settings_window.hpp"
 #include "skywave_link/aprs_client.hpp"
+#include "skywave_link/gui_util.hpp"
+#include "skywave_link/mesh_relay.hpp"
+#include "skywave_link/modern_style.hpp"
 #include "skywave_link/radio_controller.hpp"
 #include <SDL.h>
 #include <imgui.h>
@@ -86,21 +89,6 @@ struct HamlibModelEntry {
     std::string name;
 };
 
-static std::string trimCopy(const std::string& input) {
-    const auto first = input.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) {
-        return {};
-    }
-    const auto last = input.find_last_not_of(" \t\r\n");
-    return input.substr(first, last - first + 1);
-}
-
-static std::string upperCopy(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    return value;
-}
-
 static int collectHamlibModel(const struct rig_caps* caps, rig_ptr_t data) {
     auto* models = static_cast<std::vector<HamlibModelEntry>*>(data);
     if (!models || !caps || caps->rig_model == RIG_MODEL_NONE ||
@@ -110,8 +98,8 @@ static int collectHamlibModel(const struct rig_caps* caps, rig_ptr_t data) {
 
     HamlibModelEntry entry;
     entry.model = static_cast<int>(caps->rig_model);
-    entry.manufacturer = trimCopy(caps->mfg_name);
-    entry.name = trimCopy(caps->model_name);
+    entry.manufacturer = skylink::gui::trimCopy(caps->mfg_name);
+    entry.name = skylink::gui::trimCopy(caps->model_name);
     if (entry.manufacturer.empty()) {
         entry.manufacturer = "Other";
     }
@@ -168,34 +156,6 @@ static const HamlibModelEntry* findHamlibModelById(int model_id) {
     return nullptr;
 }
 
-static std::string normalizeRadioBackend(const std::string& backend) {
-    const std::string upper = upperCopy(trimCopy(backend));
-    if (upper == "HAMLIB") {
-        return "hamlib";
-    }
-    if (upper == "KENWOOD_TCP" || upper == "KENWOOD TCP") {
-        return "kenwood_tcp";
-    }
-    return "none";
-}
-
-// Skywave bandwidth families (WAVEFORM.md).
-static std::string normalizeModemFamily(const std::string& family) {
-    const std::string upper = upperCopy(trimCopy(family));
-    if (upper == "MID" || upper == "NARROW" || upper == "ULTRA") {
-        return upper;
-    }
-    return "WIDE";
-}
-
-static const char* liveVoiceCodecDisplayLabel(const std::string& codec) {
-    // Codec2 rates offered by Skywave (VOICE.md).
-    if (codec == "700C") return "700C";
-    if (codec == "1300") return "1300";
-    if (codec == "2400") return "2400";
-    if (codec == "3200") return "3200";
-    return codec.c_str();
-}
 
 static std::string liveVoiceHotkeyDisplayLabel(const std::string& hotkey) {
     constexpr char kScancodePrefix[] = "SCANCODE:";
@@ -222,6 +182,85 @@ namespace skylink {
 SettingsWindow::SettingsWindow(SharedAppState& state)
     : WindowBase(state) {}
 
+bool SettingsWindow::saveSettings(const std::string& what) {
+    std::string error;
+    bool ok = false;
+    if (onSaveSettings) {
+        ok = onSaveSettings(error);
+    } else if (state_.config) {
+        ok = gui::saveAppConfig(*state_.config, error);
+    } else {
+        error = "no configuration loaded";
+    }
+
+    if (ok) {
+        postStatus(what.empty() ? std::string("Settings saved")
+                                : what + " applied and saved",
+                   StatusKind::Success);
+    } else {
+        postStatus((what.empty() ? std::string("Settings not saved")
+                                 : what + " applied for this session but not saved") +
+                       ": " + error,
+                   StatusKind::Error);
+    }
+    return ok;
+}
+
+void SettingsWindow::sendModemControl(const std::string& command, const std::string& what) {
+    ModemClient* modem = state_.modem;
+    if (!modem || !modem->isConnected()) {
+        postStatus(what + " not sent: the modem is not connected", StatusKind::Error);
+        return;
+    }
+    std::weak_ptr<int> alive = alive_;
+    const bool sent = modem->sendCommandAsync(
+        command, [this, alive, command, what](bool ok, const std::string& response) {
+            if (alive.expired()) return;
+            if (ok) {
+                postStatus(what + ": modem accepted " + command, StatusKind::Success);
+                parseModemControlReply(response);
+            } else {
+                postStatus(what + " refused: " +
+                               (response.empty() ? std::string("no answer from the modem")
+                                                 : response),
+                           StatusKind::Error);
+            }
+            modem_controls_queried_ = false;  // re-read the live values
+        });
+    if (!sent) {
+        postStatus(what + " not sent: modem command channel unavailable", StatusKind::Error);
+    }
+}
+
+void SettingsWindow::parseModemControlReply(const std::string& response) {
+    const std::string reply = gui::upperCopy(gui::trimCopy(response));
+    if (reply.rfind("CWID ", 0) == 0) {
+        const std::string value = gui::trimCopy(reply.substr(5));
+        if (value == "ON") modem_cwid_ = 1;
+        else if (value == "OFF") modem_cwid_ = 0;
+    } else if (reply.rfind("MAXMODE ", 0) == 0) {
+        modem_max_mode_ = gui::trimCopy(reply.substr(8));
+    }
+}
+
+void SettingsWindow::queryModemControls() {
+    ModemClient* modem = state_.modem;
+    if (!modem || !modem->isConnected()) {
+        modem_controls_queried_ = false;
+        modem_cwid_ = -1;
+        modem_max_mode_.clear();
+        return;
+    }
+    if (modem_controls_queried_) return;
+    modem_controls_queried_ = true;
+    std::weak_ptr<int> alive = alive_;
+    for (const char* query : {"CWID", "MAXMODE"}) {
+        (void)modem->sendCommandAsync(query, [this, alive](bool ok, const std::string& response) {
+            if (!alive.expired() && ok) parseModemControlReply(response);
+        });
+    }
+}
+
 void SettingsWindow::render() {
     auto& config_ = *state_.config;
     auto* modem_ = state_.modem;
@@ -232,6 +271,21 @@ void SettingsWindow::render() {
     auto& gps_baud_ = *state_.gps_baud;
     auto& gps_fix_valid_ = *state_.gps_fix_valid;
     auto& email_gateway_active_ = *state_.email_gateway_active;
+    const ui::Palette& pal = ui::palette();
+
+    // Most fields take effect at once; "Save Settings" (and every Apply
+    // button) writes them to the config file so they survive a crash or
+    // force-quit, not only a clean exit.
+    ui::PushButtonColor(pal.accent);
+    if (ImGui::Button("Save Settings")) {
+        saveSettings("");
+    }
+    ui::PopButtonColor();
+    ImGui::SetItemTooltip("Write all settings to %s",
+                          AppConfig::getDefaultConfigPath().c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("Apply buttons also save.");
+    ui::StatusLine(status_);
 
     // Eleven tabs do not fit the window side by side; scroll instead of
     // squeezing every label down to "Away M...".
@@ -252,10 +306,18 @@ void SettingsWindow::render() {
             }
 
             if (ImGui::Button("Apply")) {
-                if (onApplyCallsign) {
-                    onApplyCallsign(callsign_input_);
+                const std::string call = gui::normalizeCallsign(callsign_input_);
+                if (call.empty()) {
+                    postStatus("Enter a callsign first", StatusKind::Error);
                 } else {
-                    config_.station.callsign = callsign_input_;
+                    std::strncpy(callsign_input_, call.c_str(), state_.callsign_input_size - 1);
+                    callsign_input_[state_.callsign_input_size - 1] = '\0';
+                    if (onApplyCallsign) {
+                        onApplyCallsign(call);
+                    } else {
+                        config_.station.callsign = call;
+                    }
+                    saveSettings("Station settings");
                 }
             }
             ImGui::EndTabItem();
@@ -288,16 +350,20 @@ void SettingsWindow::render() {
             static int data_port_input = kDefaultDataPort;
             data_port_input = config_.modem.data_port;
             if (ImGui::InputInt("Data Port", &data_port_input)) {
-                config_.modem.data_port = static_cast<uint16_t>(data_port_input);
+                config_.modem.data_port =
+                    static_cast<uint16_t>(std::clamp(data_port_input, 1, 65535));
             }
 
             static int voice_port_input = kDefaultVoicePort;
             voice_port_input = config_.modem.voice_port;
             if (ImGui::InputInt("Voice Port", &voice_port_input)) {
-                config_.modem.voice_port = static_cast<uint16_t>(voice_port_input);
+                config_.modem.voice_port =
+                    static_cast<uint16_t>(std::clamp(voice_port_input, 1, 65535));
             }
+            ImGui::TextDisabled("Host and port changes take effect on the next modem "
+                                "connect (Disconnect, then Connect).");
 
-            config_.modem.family = normalizeModemFamily(config_.modem.family);
+            config_.modem.family = gui::normalizeModemFamily(config_.modem.family);
             int family_idx = current_choice_index(kFamilyChoices, kFamilyChoiceCount,
                                                   config_.modem.family);
             if (ImGui::BeginCombo("Bandwidth Family", kFamilyChoices[family_idx].display)) {
@@ -317,13 +383,64 @@ void SettingsWindow::render() {
                 }
                 ImGui::EndCombo();
             }
-            if (modem_ && modem_->isConnected()) {
-                const ModemStatus ms = modem_->getStatus();
+            const bool modem_up = modem_ && modem_->isConnected();
+            const ModemStatus ms = modem_ ? modem_->getStatus() : ModemStatus{};
+            if (modem_up) {
                 ImGui::TextDisabled("Modem is running %s, mode %s.", ms.family.c_str(),
                                     ms.mode.c_str());
             }
             ImGui::TextDisabled("The modem saves its family and accepts a change "
                                 "only while idle.");
+
+            // Live ladder controls (INTERFACES.md "Mode and Link"): sent to
+            // the modem at once, never stored in the app's config.
+            ImGui::SeparatorText("Link mode");
+            queryModemControls();
+            if (!modem_up) ImGui::BeginDisabled();
+            {
+                const std::string mode_preview =
+                    !modem_up ? std::string("(modem offline)")
+                              : (ms.mode_pinned ? ms.mode : std::string("AUTO"));
+                if (ImGui::BeginCombo("Mode", mode_preview.c_str())) {
+                    if (ImGui::Selectable("AUTO", !ms.mode_pinned)) {
+                        sendModemControl("MODE AUTO", "Mode");
+                    }
+                    for (int m = gui::kMinLadderMode; m <= gui::kMaxLadderMode; ++m) {
+                        const std::string name = gui::ladderModeName(m);
+                        if (ImGui::Selectable(name.c_str(), ms.mode_pinned && ms.mode == name)) {
+                            sendModemControl("MODE " + name, "Mode");
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SetItemTooltip("AUTO lets the modem adapt; a fixed mode pins it.");
+
+                const std::string max_preview =
+                    !modem_up ? std::string("(modem offline)")
+                              : (modem_max_mode_.empty() ? std::string("(unknown)")
+                                                         : modem_max_mode_);
+                if (ImGui::BeginCombo("Max Mode", max_preview.c_str())) {
+                    for (int m = gui::kMinLadderMode; m <= gui::kMaxLadderMode; ++m) {
+                        const std::string name = gui::ladderModeName(m);
+                        if (ImGui::Selectable(name.c_str(), modem_max_mode_ == name)) {
+                            sendModemControl("MAXMODE " + name, "Max mode");
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SetItemTooltip("Highest mode the modem may promote to (M%d = no cap).",
+                                      gui::kMaxLadderMode);
+
+                bool cwid = modem_cwid_ == 1;
+                if (ImGui::Checkbox("CW ID after disconnect", &cwid)) {
+                    sendModemControl(cwid ? "CWID ON" : "CWID OFF", "CW ID");
+                }
+                if (modem_up && modem_cwid_ < 0) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(state unknown)");
+                }
+            }
+            if (!modem_up) ImGui::EndDisabled();
 
             bool auto_connect = config_.modem.auto_connect;
             if (ImGui::Checkbox("Auto-connect on startup", &auto_connect)) {
@@ -333,7 +450,7 @@ void SettingsWindow::render() {
             ImGui::Separator();
             if (ImGui::Button("Connect")) {
                 config_.modem.host = modem_host_input_;
-                config_.modem.command_port = static_cast<uint16_t>(modem_port_input_);
+                config_.modem.command_port = static_cast<uint16_t>(std::clamp(modem_port_input_, 1, 65535));
                 if (onConnectModem) onConnectModem();
             }
             ImGui::SameLine();
@@ -343,17 +460,18 @@ void SettingsWindow::render() {
             ImGui::SameLine();
             if (ImGui::Button("Apply Modem Settings")) {
                 config_.modem.host = modem_host_input_;
-                config_.modem.command_port = static_cast<uint16_t>(modem_port_input_);
+                config_.modem.command_port =
+                    static_cast<uint16_t>(std::clamp(modem_port_input_, 1, 65535));
                 if (onApplyModemConfig) onApplyModemConfig();
+                saveSettings("Modem settings");
             }
 
             // Show connection status
-            if (modem_ && modem_->isConnected()) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Connected");
+            ImGui::SameLine();
+            if (modem_up) {
+                ImGui::TextColored(pal.success, "Connected");
             } else {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.2f, 1.0f), "Disconnected");
+                ImGui::TextColored(pal.danger, "Disconnected");
             }
             ImGui::EndTabItem();
         }
@@ -375,7 +493,7 @@ void SettingsWindow::render() {
                 "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"
             };
 
-            std::string backend = normalizeRadioBackend(config_.radio.backend);
+            std::string backend = gui::normalizeRadioBackend(config_.radio.backend);
             config_.radio.backend = backend;
             config_.radio.enabled = (backend != "none");
 
@@ -624,16 +742,30 @@ void SettingsWindow::render() {
                 ImGui::Text("Status: %s%s",
                             radio_status.connected ? "Connected" : "Disconnected",
                             radio_status.dry_run ? " (dry-run)" : "");
+                if (radio_status.dry_run) {
+                    ui::WarningText("DRY-RUN: no rig is controlled (no Hamlib model chosen). "
+                                    "Frequency changes and PTT are simulated only; nothing "
+                                    "is keyed or tuned.");
+                }
                 ImGui::Text("PTT Server: %s", radio_status.ptt_server_running ? "Running" : "Stopped");
                 if (!radio_status.last_error.empty()) {
-                    ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.35f, 1.0f),
-                                       "Last Error: %s",
-                                       radio_status.last_error.c_str());
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal.danger);
+                    ImGui::TextWrapped("Last Error: %s", radio_status.last_error.c_str());
+                    ImGui::PopStyleColor();
                 }
             }
 
             if (ImGui::Button("Apply Radio Config")) {
                 if (onApplyRadioConfig) onApplyRadioConfig();
+                saveSettings("Radio settings");
+                if (state_.radio) {
+                    const RadioController::Status after = state_.radio->getStatus();
+                    if (!after.last_error.empty()) {
+                        postStatus("Radio settings saved, but the radio reports: " +
+                                       after.last_error,
+                                   StatusKind::Error);
+                    }
+                }
             }
             ImGui::EndTabItem();
         }
@@ -641,7 +773,6 @@ void SettingsWindow::render() {
         if (ImGui::BeginTabItem("Voice")) {
             const VoiceStatus voice_status =
                 modem_ ? modem_->getVoiceStatus() : VoiceStatus{};
-            config_.voice.codec = "AUTO";
 
             static const char* kVoiceModes[] = {
                 "OFF", "CONNECTED", "BROADCAST"
@@ -663,11 +794,22 @@ void SettingsWindow::render() {
                 ImGui::EndCombo();
             }
 
-            // Skywave picks the Codec2 rate from the live ladder mode
-            // (VOICE.md AUTO table) and steps it down when AMC demotes, so
-            // the app has no separate voice-bandwidth selector.
-            ImGui::TextDisabled("Codec rate is chosen automatically from the "
-                                "link mode.");
+            // AUTO: Skywave picks the Codec2 rate from the live ladder mode
+            // (VOICE.md AUTO table) and steps it down when AMC demotes. A
+            // fixed rate is sent as VOICECODEC on Apply Voice Config.
+            config_.voice.codec = gui::normalizeVoiceCodec(config_.voice.codec);
+            if (ImGui::BeginCombo("Codec", config_.voice.codec.c_str())) {
+                for (const std::string& codec : gui::voiceCodecChoices()) {
+                    if (ImGui::Selectable(codec.c_str(), config_.voice.codec == codec)) {
+                        config_.voice.codec = codec;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled(config_.voice.codec == "AUTO"
+                                    ? "AUTO picks the rate from the link mode."
+                                    : "A fixed rate the link mode cannot carry in real "
+                                      "time is buffered (RT=NO).");
 
             bool auto_start = config_.voice.auto_start;
             if (ImGui::Checkbox("Auto-start Voice", &auto_start)) {
@@ -680,7 +822,7 @@ void SettingsWindow::render() {
                 liveVoiceHotkeyDisplayLabel(config_.voice.ptt_hotkey);
             ImGui::Text("PTT Hotkey: %s", hotkey_label.c_str());
             if (hotkey_capture_active) {
-                ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.28f, 1.0f),
+                ImGui::TextColored(pal.warning,
                                    "Press the key you want to use. Esc cancels. Backspace clears.");
                 if (ImGui::Button("Cancel Hotkey Capture")) {
                     if (onCancelVoiceHotkeyCapture) onCancelVoiceHotkeyCapture();
@@ -768,12 +910,14 @@ void SettingsWindow::render() {
             ImGui::Separator();
             if (ImGui::Button("Apply Voice Config")) {
                 if (onApplyVoiceConfig) onApplyVoiceConfig();
+                saveSettings("Voice settings");
             }
             ImGui::SameLine();
             if (ImGui::Button("Refresh Audio")) {
                 if (onRefreshVoiceAudio) onRefreshVoiceAudio();
             }
 
+            static bool ptt_button_held = false;
             if (modem_ && modem_->isConnected()) {
                 if (ImGui::Button("Start Voice")) {
                     if (onVoiceStart) onVoiceStart();
@@ -783,26 +927,32 @@ void SettingsWindow::render() {
                     if (onVoiceStop) onVoiceStop();
                 }
                 ImGui::SameLine();
-                static bool ptt_button_held = false;
-                if (voice_status.ptt || ptt_button_held) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.84f, 0.26f, 0.24f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.89f, 0.32f, 0.30f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.76f, 0.20f, 0.18f, 1.0f));
-                }
+                // The colour is pushed and popped under one cached
+                // condition: ptt_button_held changes in between.
+                const bool ptt_lit = voice_status.ptt || ptt_button_held;
+                if (ptt_lit) ui::PushButtonColor(pal.danger);
                 ImGui::Button("PTT");
                 const bool button_held_now = ImGui::IsItemActive();
+                if (ptt_lit) ui::PopButtonColor();
                 if (button_held_now != ptt_button_held) {
                     ptt_button_held = button_held_now;
                     if (onVoicePtt) onVoicePtt(ptt_button_held);
                 }
-                if (voice_status.ptt || ptt_button_held) {
-                    ImGui::PopStyleColor(3);
-                }
+            } else if (ptt_button_held) {
+                ptt_button_held = false;
+                if (onVoicePtt) onVoicePtt(false);
             }
 
             ImGui::Separator();
             ImGui::Text("Status:");
-            ImGui::Text("Codec: %s", liveVoiceCodecDisplayLabel(voice_status.codec));
+            if (modem_ && modem_->isConnected() && !modem_->hasVoiceMedia()) {
+                ui::WarningText("Voice media socket closed: the modem has no voice port "
+                                "open (built without voice, or the connection dropped). "
+                                "Voice audio cannot flow until it reopens.");
+            } else if (modem_ && modem_->isConnected()) {
+                ImGui::TextColored(pal.success, "Voice media socket: open");
+            }
+            ImGui::Text("Codec: %s", voice_status.codec.c_str());
             ImGui::Text("Voice: %s",
                         voice_status.mode == VoiceMode::Connected ? "CONNECTED" :
                         voice_status.mode == VoiceMode::Broadcast ? "BROADCAST" : "OFF");
@@ -922,22 +1072,33 @@ void SettingsWindow::render() {
                 ? "Auto-accept is on: every offer is accepted."
                 : "Offers from these stations (comma-separated) skip the Incoming File prompt.");
 
-            if (ImGui::Button("Apply File Settings")) {
-                config_.files.download_path = download_path;
-                if (config_.files.download_path.empty()) {
-                    config_.files.download_path = "downloads";
-                }
+            // Creates the folder, hands it to the transfer manager and saves.
+            auto apply_download_path = [&](const std::string& path) {
+                config_.files.download_path = path.empty() ? std::string("downloads") : path;
+                std::strncpy(download_path, config_.files.download_path.c_str(),
+                             sizeof(download_path) - 1);
+                download_path[sizeof(download_path) - 1] = '\0';
+                last_loaded_download_path = config_.files.download_path;
                 std::error_code ec;
                 std::filesystem::create_directories(config_.files.download_path, ec);
-                if (!ec && state_.file_transfer_mgr) {
+                if (ec) {
+                    postStatus("Cannot create " + config_.files.download_path + ": " +
+                                   ec.message() + " (received files keep going to the "
+                                   "previous folder)",
+                               StatusKind::Error);
+                    return;
+                }
+                if (state_.file_transfer_mgr) {
                     state_.file_transfer_mgr->setDownloadPath(config_.files.download_path);
                 }
+                saveSettings("File settings");
+            };
+            if (ImGui::Button("Apply File Settings")) {
+                apply_download_path(download_path);
             }
             ImGui::SameLine();
             if (ImGui::Button("Reset Path")) {
-                config_.files.download_path = "downloads";
-                std::strncpy(download_path, config_.files.download_path.c_str(), sizeof(download_path) - 1);
-                download_path[sizeof(download_path) - 1] = '\0';
+                apply_download_path("downloads");
             }
 
             ImGui::EndTabItem();
@@ -953,19 +1114,31 @@ void SettingsWindow::render() {
             // reloaded from config only when config itself changes (load,
             // Apply), the same pattern as the Files tab's download path.
             static char server[256] = "";
+            static char filter[256] = "";
             static int beacon_interval = 0;
             static std::string aprs_loaded_key;
             {
+                const std::string filter_value = aprs_filter ? *aprs_filter : std::string();
                 const std::string key = config_.aprs.server + '\x1f' +
-                                        std::to_string(config_.aprs.beacon_interval_sec);
+                                        std::to_string(config_.aprs.beacon_interval_sec) +
+                                        '\x1f' + filter_value;
                 if (key != aprs_loaded_key) {
                     std::strncpy(server, config_.aprs.server.c_str(), sizeof(server) - 1);
                     server[sizeof(server) - 1] = '\0';
+                    std::strncpy(filter, filter_value.c_str(), sizeof(filter) - 1);
+                    filter[sizeof(filter) - 1] = '\0';
                     beacon_interval = config_.aprs.beacon_interval_sec;
                     aprs_loaded_key = key;
                 }
             }
             ImGui::InputText("Server", server, sizeof(server));
+            if (aprs_filter) {
+                ImGui::InputTextWithHint("Receive Filter", "e.g. r/40.7/-74.0/100 b/N0CALL*",
+                                         filter, sizeof(filter));
+                ImGui::SetItemTooltip("APRS-IS server-side filter sent at login (port 14580 "
+                                      "sends nothing without one). Empty = the default "
+                                      "range around your position plus your own callsign.");
+            }
 
             // Auto-generated passcode from callsign (APRS-IS standard hash)
             if (!config_.station.callsign.empty()) {
@@ -973,8 +1146,7 @@ void SettingsWindow::render() {
                 ImGui::Text("Passcode: %d (auto-generated from %s)",
                             code, config_.station.callsign.c_str());
             } else {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f),
-                                   "Passcode: set callsign first");
+                ImGui::TextColored(pal.warning, "Passcode: set callsign first");
             }
 
             ImGui::InputInt("Beacon Interval (sec)", &beacon_interval);
@@ -1026,50 +1198,86 @@ void SettingsWindow::render() {
 
             int gps_baud_val = config_.aprs.gps_baud;
             if (ImGui::InputInt("GPS Baud", &gps_baud_val)) {
-                if (gps_baud_val < 1200) gps_baud_val = 1200;
-                if (gps_baud_val > 115200) gps_baud_val = 115200;
-                config_.aprs.gps_baud = gps_baud_val;
+                config_.aprs.gps_baud = std::clamp(gps_baud_val, 1200, 115200);
             }
+
+            // Opens the configured GPS port and says how it went.
+            auto open_gps = [&]() -> bool {
+                if (config_.aprs.gps_port.empty()) {
+                    postStatus("Choose a GPS serial port first", StatusKind::Error);
+                    return false;
+                }
+                if (!onOpenGPSPort) {
+                    postStatus("GPS input is not available in this build", StatusKind::Error);
+                    return false;
+                }
+                if (onCloseGPSPort) onCloseGPSPort();
+                const bool opened = onOpenGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud);
+                if (opened) {
+                    postStatus("GPS port " + config_.aprs.gps_port + " opened at " +
+                                   std::to_string(config_.aprs.gps_baud) + " baud",
+                               StatusKind::Success);
+                } else {
+                    postStatus("Could not open GPS port " + config_.aprs.gps_port +
+                                   " (in use, unplugged or no permission)",
+                               StatusKind::Error);
+                }
+                return opened;
+            };
 
             if (config_.aprs.gps_enabled) {
                 if (!gps_port_.empty()) {
-                    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f),
+                    ImGui::TextColored(pal.success,
                                        "GPS connected: %s @ %d", gps_port_.c_str(), gps_baud_);
                     if (gps_fix_valid_) {
                         ImGui::Text("GPS fix: %.6f, %.6f",
                                     state_.my_lat ? *state_.my_lat : 0.0,
                                     state_.my_lon ? *state_.my_lon : 0.0);
                     } else {
-                        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "GPS fix: waiting...");
+                        ImGui::TextColored(pal.warning, "GPS fix: waiting...");
                     }
                 } else {
-                    ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.2f, 1.0f), "GPS disconnected");
+                    ImGui::TextColored(pal.danger, "GPS disconnected");
                 }
 
                 if (ImGui::Button("Open GPS Port")) {
-                    if (!config_.aprs.gps_port.empty()) {
-                        if (onCloseGPSPort) onCloseGPSPort();
-                        if (onOpenGPSPort) onOpenGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud);
-                    }
+                    (void)open_gps();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Close GPS Port")) {
                     if (onCloseGPSPort) onCloseGPSPort();
+                    postStatus("GPS port closed", StatusKind::Info);
                 }
             }
 
             if (ImGui::Button("Apply APRS Settings")) {
                 config_.aprs.server = server;
                 config_.aprs.passcode.clear();  // Always use auto-generated passcode
-                config_.aprs.beacon_interval_sec = beacon_interval;
+                config_.aprs.beacon_interval_sec = std::clamp(beacon_interval, 60, 86400);
+                beacon_interval = config_.aprs.beacon_interval_sec;
+                if (aprs_filter) {
+                    *aprs_filter = gui::trimCopy(filter);
+                }
 
+                bool gps_ok = true;
                 if (!config_.aprs.gps_enabled || config_.aprs.gps_port.empty()) {
                     if (onCloseGPSPort) onCloseGPSPort();
-                } else if (gps_port_ != config_.aprs.gps_port || gps_baud_ != config_.aprs.gps_baud) {
-                    if (onCloseGPSPort) onCloseGPSPort();
-                    if (onOpenGPSPort) onOpenGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud);
-                } else if (gps_port_.empty()) {
-                    if (onOpenGPSPort) onOpenGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud);
+                } else if (gps_port_ != config_.aprs.gps_port || gps_baud_ != config_.aprs.gps_baud ||
+                           gps_port_.empty()) {
+                    gps_ok = open_gps();
+                }
+
+                const bool saved = saveSettings("APRS settings");
+                if (saved && gps_ok) {
+                    if (onApplyAPRSConfig) {
+                        // App (re)connects or disconnects APRS-IS and posts
+                        // the outcome here.
+                        onApplyAPRSConfig();
+                    } else {
+                        postStatus("APRS settings saved; the APRS-IS connection uses them "
+                                   "after the next restart",
+                                   StatusKind::Warning);
+                    }
                 }
             }
             ImGui::EndTabItem();
@@ -1083,6 +1291,12 @@ void SettingsWindow::render() {
                 char smtp_host[256] = "";
                 int smtp_port = 0;
                 char smtp_user[128] = "";
+                bool smtp_tls = true;
+                char pop3_host[256] = "";
+                int pop3_port = 0;
+                char pop3_user[128] = "";
+                bool pop3_tls = true;
+                char allowed_relays[512] = "";
                 char winlink_host[256] = "";
                 int winlink_port = 0;
                 char winlink_call[32] = "";
@@ -1101,6 +1315,9 @@ void SettingsWindow::render() {
                 const char sep = '\x1f';
                 const std::string key =
                     e.smtp_host + sep + std::to_string(e.smtp_port) + sep + e.smtp_username + sep +
+                    (e.smtp_use_tls ? "1" : "0") + sep +
+                    e.pop3_host + sep + std::to_string(e.pop3_port) + sep + e.pop3_username + sep +
+                    (e.pop3_use_tls ? "1" : "0") + sep + joinCallsignList(e.allowed_relays) + sep +
                     e.winlink_telnet_host + sep + std::to_string(e.winlink_telnet_port) + sep +
                     e.winlink_telnet_callsign + sep + std::to_string(e.hf_store_forward_ttl) + sep +
                     std::to_string(e.hf_store_forward_hop_limit) + sep +
@@ -1117,6 +1334,13 @@ void SettingsWindow::render() {
                     copyField(email_edit.smtp_host, sizeof(email_edit.smtp_host), e.smtp_host);
                     email_edit.smtp_port = e.smtp_port;
                     copyField(email_edit.smtp_user, sizeof(email_edit.smtp_user), e.smtp_username);
+                    email_edit.smtp_tls = e.smtp_use_tls;
+                    copyField(email_edit.pop3_host, sizeof(email_edit.pop3_host), e.pop3_host);
+                    email_edit.pop3_port = e.pop3_port;
+                    copyField(email_edit.pop3_user, sizeof(email_edit.pop3_user), e.pop3_username);
+                    email_edit.pop3_tls = e.pop3_use_tls;
+                    copyField(email_edit.allowed_relays, sizeof(email_edit.allowed_relays),
+                              joinCallsignList(e.allowed_relays));
                     copyField(email_edit.winlink_host, sizeof(email_edit.winlink_host), e.winlink_telnet_host);
                     email_edit.winlink_port = e.winlink_telnet_port;
                     copyField(email_edit.winlink_call, sizeof(email_edit.winlink_call), e.winlink_telnet_callsign);
@@ -1130,50 +1354,76 @@ void SettingsWindow::render() {
                     email_loaded_key = key;
                 }
             }
-            auto& smtp_host = email_edit.smtp_host;
-            int& smtp_port = email_edit.smtp_port;
-            auto& smtp_user = email_edit.smtp_user;
-            auto& winlink_host = email_edit.winlink_host;
-            int& winlink_port = email_edit.winlink_port;
-            auto& winlink_call = email_edit.winlink_call;
-            int& sf_ttl = email_edit.sf_ttl;
-            int& sf_hop_limit = email_edit.sf_hop_limit;
-            int& sf_dedup_window = email_edit.sf_dedup_window;
-            int& pop3_poll_interval_sec = email_edit.pop3_poll_interval_sec;
-            int& pop3_max_messages = email_edit.pop3_max_messages;
-            int& winlink_fetch_interval_sec = email_edit.winlink_fetch_interval_sec;
-            int& winlink_fetch_max_messages = email_edit.winlink_fetch_max_messages;
+            EmailEdit& ed = email_edit;
 
-            ImGui::InputText("SMTP Host", smtp_host, sizeof(smtp_host));
-            ImGui::InputInt("SMTP Port", &smtp_port);
-            ImGui::InputText("SMTP Username", smtp_user, sizeof(smtp_user));
-
+            // Passwords are never shown or reloaded into the field: an empty
+            // field on Apply keeps the stored one.
             static char smtp_pass[128] = "";
-            ImGui::InputText("SMTP Password", smtp_pass, sizeof(smtp_pass), ImGuiInputTextFlags_Password);
+            static char pop3_pass[128] = "";
+            static char winlink_pass[128] = "";
+            auto password_hint = [](const std::string& stored) {
+                return stored.empty() ? "not set" : "stored; leave blank to keep";
+            };
 
+            ImGui::SeparatorText("Outgoing mail (SMTP)");
+            ImGui::InputText("SMTP Host", ed.smtp_host, sizeof(ed.smtp_host));
+            ImGui::InputInt("SMTP Port", &ed.smtp_port);
+            ImGui::InputText("SMTP Username", ed.smtp_user, sizeof(ed.smtp_user));
+            ImGui::InputTextWithHint("SMTP Password", password_hint(config_.email.smtp_password),
+                                     smtp_pass, sizeof(smtp_pass), ImGuiInputTextFlags_Password);
+            ImGui::Checkbox("SMTP TLS", &ed.smtp_tls);
+            ImGui::SetItemTooltip("STARTTLS on 587, implicit TLS on 465.");
+
+            ImGui::SeparatorText("Incoming mail (POP3)");
+            ImGui::InputText("POP3 Host", ed.pop3_host, sizeof(ed.pop3_host));
+            ImGui::InputInt("POP3 Port", &ed.pop3_port);
+            ImGui::InputText("POP3 Username", ed.pop3_user, sizeof(ed.pop3_user));
+            ImGui::InputTextWithHint("POP3 Password", password_hint(config_.email.pop3_password),
+                                     pop3_pass, sizeof(pop3_pass), ImGuiInputTextFlags_Password);
+            ImGui::Checkbox("POP3 TLS", &ed.pop3_tls);
+            ImGui::SetItemTooltip("Usually port 995 with TLS.");
+            if ((!ed.smtp_tls && ed.smtp_host[0]) || (!ed.pop3_tls && ed.pop3_host[0])) {
+                ui::WarningText("TLS is off: the password crosses the internet in clear text.");
+            }
+
+            ImGui::SeparatorText("Gateway for other stations");
             bool gateway_enabled = config_.email.gateway_enabled;
             if (ImGui::Checkbox("Enable Email Gateway Relay", &gateway_enabled)) {
                 config_.email.gateway_enabled = gateway_enabled;
             }
+            ImGui::InputTextWithHint("Allowed Relay Callsigns", "e.g. N0CALL, N0CALL-2",
+                                     ed.allowed_relays, sizeof(ed.allowed_relays));
+            ImGui::SetItemTooltip("Stations allowed to send internet mail through your "
+                                  "account (comma-separated).");
+            if (gui::trimCopy(ed.allowed_relays).empty()) {
+                ImGui::TextDisabled("Empty list: no station may relay through this gateway.");
+            }
 
+            ImGui::SeparatorText("Winlink");
             bool winlink_telnet_enabled = config_.email.winlink_telnet_enabled;
             if (ImGui::Checkbox("Use Winlink Telnet (internet)", &winlink_telnet_enabled)) {
                 config_.email.winlink_telnet_enabled = winlink_telnet_enabled;
             }
 
             if (!winlink_telnet_enabled) ImGui::BeginDisabled();
-            ImGui::InputText("Winlink Host", winlink_host, sizeof(winlink_host));
-            ImGui::InputInt("Winlink Port", &winlink_port);
-            ImGui::InputText("Winlink Callsign", winlink_call, sizeof(winlink_call));
-
-            static char winlink_pass[128] = "";
-            ImGui::InputText("Winlink Password", winlink_pass, sizeof(winlink_pass), ImGuiInputTextFlags_Password);
+            ImGui::InputText("Winlink Host", ed.winlink_host, sizeof(ed.winlink_host));
+            ImGui::InputInt("Winlink Port", &ed.winlink_port);
+            ImGui::InputText("Winlink Callsign", ed.winlink_call, sizeof(ed.winlink_call));
+            ImGui::InputTextWithHint("Winlink Password",
+                                     password_hint(config_.email.winlink_telnet_password),
+                                     winlink_pass, sizeof(winlink_pass), ImGuiInputTextFlags_Password);
+            ImGui::TextWrapped("The password is only used to answer the CMS secure-login "
+                               "challenge (;PQ/;PR); it is never sent to the server. It is stored "
+                               "in the system keychain where one is available.");
 
             bool winlink_tls = config_.email.winlink_telnet_use_tls;
             if (ImGui::Checkbox("Winlink Telnet TLS", &winlink_tls)) {
                 config_.email.winlink_telnet_use_tls = winlink_tls;
             }
-            ImGui::TextDisabled("Default CMS telnet server: server.winlink.org:8772");
+            if (!winlink_tls) {
+                ImGui::TextColored(pal.warning, "Without TLS the session (not the password) is cleartext.");
+            }
+            ImGui::TextDisabled("Default CMS server: cms.winlink.org:8773 (TLS)");
             if (!winlink_telnet_enabled) ImGui::EndDisabled();
 
             bool winlink_compat = config_.email.winlink_compat_mode;
@@ -1181,8 +1431,7 @@ void SettingsWindow::render() {
                 config_.email.winlink_compat_mode = winlink_compat;
             }
 
-            ImGui::Separator();
-            ImGui::Text("Weak-Signal Profile");
+            ImGui::SeparatorText("Weak-Signal Profile");
             bool weak_profile = config_.email.weak_signal_profile_enabled;
             if (ImGui::Checkbox("Enable weak-signal profile", &weak_profile)) {
                 config_.email.weak_signal_profile_enabled = weak_profile;
@@ -1208,25 +1457,112 @@ void SettingsWindow::render() {
                 config_.email.weak_signal_enable_compression = weak_compress;
             }
 
-            ImGui::Separator();
-            ImGui::Text("HF Store-and-Forward");
+            ImGui::SeparatorText("HF Store-and-Forward");
             bool sf_enabled = config_.email.hf_store_forward_enabled;
             if (ImGui::Checkbox("Enable HF mesh forwarding", &sf_enabled)) {
                 config_.email.hf_store_forward_enabled = sf_enabled;
             }
-            ImGui::InputInt("Relay TTL", &sf_ttl);
-            ImGui::InputInt("Relay Hop Limit", &sf_hop_limit);
-            ImGui::InputInt("Relay Dedup Window (sec)", &sf_dedup_window);
+            ImGui::InputInt("Relay TTL", &ed.sf_ttl);
+            ImGui::InputInt("Relay Hop Limit", &ed.sf_hop_limit);
+            ImGui::InputInt("Relay Dedup Window (sec)", &ed.sf_dedup_window);
 
-            ImGui::Separator();
-            ImGui::Text("Inbound Polling");
-            ImGui::InputInt("POP3 Poll Interval (sec)", &pop3_poll_interval_sec);
-            ImGui::InputInt("POP3 Max Messages", &pop3_max_messages);
-            ImGui::InputInt("Winlink Fetch Interval (sec)", &winlink_fetch_interval_sec);
-            ImGui::InputInt("Winlink Max Messages", &winlink_fetch_max_messages);
+            // Learned mesh routes (K16), read-only: a fresh route makes a
+            // relay directed (next hop); otherwise packets are flooded.
+            if (state_.mesh_relay) {
+                const std::vector<RouteEntry> routes = state_.mesh_relay->getRouteTable();
+                char routes_label[64];
+                std::snprintf(routes_label, sizeof(routes_label), "Mesh routes (%zu)###MeshRoutes",
+                              routes.size());
+                if (ImGui::TreeNode(routes_label)) {
+                    if (routes.empty()) {
+                        ImGui::TextDisabled("No routes learned yet (beacons and relayed packets "
+                                            "teach them).");
+                    } else if (ImGui::BeginTable("MeshRouteTable", 5,
+                                                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                                                     ImGuiTableFlags_SizingStretchProp)) {
+                        ImGui::TableSetupColumn("Destination");
+                        ImGui::TableSetupColumn("Next hop");
+                        ImGui::TableSetupColumn("Hops");
+                        ImGui::TableSetupColumn("SNR");
+                        ImGui::TableSetupColumn("Age");
+                        ImGui::TableHeadersRow();
+                        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+                        for (const auto& r : routes) {
+                            ImGui::TableNextRow();
+                            ImGui::TableNextColumn();
+                            ImGui::TextUnformatted(r.destination.c_str());
+                            ImGui::TableNextColumn();
+                            ImGui::TextUnformatted(r.next_hop.c_str());
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%u", static_cast<unsigned>(r.hop_count));
+                            ImGui::TableNextColumn();
+                            ImGui::TextUnformatted(
+                                (r.snr_known ? gui::formatSnr(r.snr_db) : std::string("-")).c_str());
+                            ImGui::TableNextColumn();
+                            const int64_t age = std::max<int64_t>(0, now - r.last_seen);
+                            ImGui::Text("%lld min", static_cast<long long>(age / 60));
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::TreePop();
+                }
+            }
 
-            ImGui::Separator();
-            ImGui::Text("Relay Diagnostics");
+            ImGui::SeparatorText("Inbound Polling");
+            ImGui::InputInt("POP3 Poll Interval (sec)", &ed.pop3_poll_interval_sec);
+            ImGui::InputInt("POP3 Max Messages", &ed.pop3_max_messages);
+            ImGui::InputInt("Winlink Fetch Interval (sec)", &ed.winlink_fetch_interval_sec);
+            ImGui::InputInt("Winlink Max Messages", &ed.winlink_fetch_max_messages);
+
+            if (ImGui::Button("Apply Email Settings")) {
+                auto& e = config_.email;
+                e.smtp_host = gui::trimCopy(ed.smtp_host);
+                e.smtp_port = static_cast<uint16_t>(std::clamp(ed.smtp_port, 1, 65535));
+                e.smtp_username = gui::trimCopy(ed.smtp_user);
+                e.smtp_use_tls = ed.smtp_tls;
+                if (smtp_pass[0] != '\0') {
+                    e.smtp_password = smtp_pass;
+                }
+                e.pop3_host = gui::trimCopy(ed.pop3_host);
+                e.pop3_port = static_cast<uint16_t>(std::clamp(ed.pop3_port, 1, 65535));
+                e.pop3_username = gui::trimCopy(ed.pop3_user);
+                e.pop3_use_tls = ed.pop3_tls;
+                if (pop3_pass[0] != '\0') {
+                    e.pop3_password = pop3_pass;
+                }
+                e.allowed_relays = parseCallsignList(ed.allowed_relays);
+                e.winlink_telnet_host = gui::trimCopy(ed.winlink_host);
+                e.winlink_telnet_port = static_cast<uint16_t>(std::clamp(ed.winlink_port, 1, 65535));
+                e.winlink_telnet_callsign = gui::normalizeCallsign(ed.winlink_call);
+                if (winlink_pass[0] != '\0') {
+                    e.winlink_telnet_password = winlink_pass;
+                }
+                e.pop3_poll_interval_sec = std::clamp(ed.pop3_poll_interval_sec, 30, 3600);
+                e.pop3_max_messages = std::clamp(ed.pop3_max_messages, 1, 500);
+                e.winlink_fetch_interval_sec = std::clamp(ed.winlink_fetch_interval_sec, 30, 3600);
+                e.winlink_fetch_max_messages = std::clamp(ed.winlink_fetch_max_messages, 1, 500);
+                e.hf_store_forward_ttl = std::clamp(ed.sf_ttl, 1, 15);
+                e.hf_store_forward_hop_limit = std::clamp(ed.sf_hop_limit, 1, 20);
+                e.hf_store_forward_dedup_window_sec = std::clamp(ed.sf_dedup_window, 30, 3600);
+                // Do not keep secrets in the edit buffers once stored.
+                std::memset(smtp_pass, 0, sizeof(smtp_pass));
+                std::memset(pop3_pass, 0, sizeof(pop3_pass));
+                std::memset(winlink_pass, 0, sizeof(winlink_pass));
+
+                if (e.gateway_enabled && !email_gateway_active_) {
+                    if (onStartEmailGateway) onStartEmailGateway();
+                } else if (!e.gateway_enabled && email_gateway_active_) {
+                    if (onStopEmailGateway) onStopEmailGateway();
+                }
+                if (saveSettings("Email settings") && e.gateway_enabled &&
+                    !email_gateway_active_) {
+                    postStatus("Email settings saved, but the gateway did not start (check "
+                               "the host/account fields and the Log)",
+                               StatusKind::Error);
+                }
+            }
+
+            ImGui::SeparatorText("Relay Diagnostics");
             auto format_unix = [](int64_t ts) -> std::string {
                 if (ts <= 0) {
                     return "never";
@@ -1243,6 +1579,8 @@ void SettingsWindow::render() {
                 const bool healthy = diag.gateway_health.find("fail") == std::string::npos &&
                                      diag.gateway_health.find("no-gateway") == std::string::npos &&
                                      diag.gateway_health.find("missing") == std::string::npos;
+                ImGui::TextColored(healthy ? pal.success : pal.danger,
+                                   "Gateway Health: %s", diag.gateway_health.c_str());
                 ImGui::Text("Last Result: %s", diag.last_result.c_str());
                 ImGui::Text("Last Mode: %s", diag.last_mode.c_str());
                 ImGui::Text("Last Target: %s",
@@ -1265,44 +1603,15 @@ void SettingsWindow::render() {
                 ImGui::Text("SMTP Fallback Count: %d", diag.smtp_fallback_count);
                 ImGui::Text("Relay Success/Fail: %d / %d",
                             diag.total_success, diag.total_fail);
-                ImGui::TextColored(healthy ? ImVec4(0.2f, 0.8f, 0.2f, 1.0f)
-                                           : ImVec4(0.9f, 0.4f, 0.2f, 1.0f),
-                                   "Gateway Health: %s",
-                                   diag.gateway_health.c_str());
                 if (!diag.last_error.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal.danger);
                     ImGui::TextWrapped("Last Error: %s", diag.last_error.c_str());
+                    ImGui::PopStyleColor();
                 } else {
                     ImGui::TextDisabled("Last Error: none");
                 }
             } else {
                 ImGui::TextDisabled("Relay diagnostics unavailable");
-            }
-
-            if (ImGui::Button("Apply Email Settings")) {
-                config_.email.smtp_host = smtp_host;
-                config_.email.smtp_port = static_cast<uint16_t>(std::clamp(smtp_port, 1, 65535));
-                config_.email.smtp_username = smtp_user;
-                if (std::strlen(smtp_pass) > 0) {
-                    config_.email.smtp_password = smtp_pass;
-                }
-                config_.email.winlink_telnet_host = winlink_host;
-                config_.email.winlink_telnet_port = static_cast<uint16_t>(std::clamp(winlink_port, 1, 65535));
-                config_.email.winlink_telnet_callsign = winlink_call;
-                if (std::strlen(winlink_pass) > 0) {
-                    config_.email.winlink_telnet_password = winlink_pass;
-                }
-                config_.email.pop3_poll_interval_sec = std::clamp(pop3_poll_interval_sec, 30, 3600);
-                config_.email.pop3_max_messages = std::clamp(pop3_max_messages, 1, 500);
-                config_.email.winlink_fetch_interval_sec = std::clamp(winlink_fetch_interval_sec, 30, 3600);
-                config_.email.winlink_fetch_max_messages = std::clamp(winlink_fetch_max_messages, 1, 500);
-                config_.email.hf_store_forward_ttl = std::clamp(sf_ttl, 1, 15);
-                config_.email.hf_store_forward_hop_limit = std::clamp(sf_hop_limit, 1, 20);
-                config_.email.hf_store_forward_dedup_window_sec = std::clamp(sf_dedup_window, 30, 3600);
-                if (config_.email.gateway_enabled && !email_gateway_active_) {
-                    if (onStartEmailGateway) onStartEmailGateway();
-                } else if (!config_.email.gateway_enabled && email_gateway_active_) {
-                    if (onStopEmailGateway) onStopEmailGateway();
-                }
             }
             ImGui::EndTabItem();
         }
@@ -1333,7 +1642,7 @@ void SettingsWindow::render() {
             ImGui::Separator();
             ImGui::Text("Beacon status:");
             if (beacon_enabled) {
-                ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Active");
+                ImGui::TextColored(pal.success, "Enabled");
                 if (last_beacon_sent) {
                     auto now = std::chrono::steady_clock::now();
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - *last_beacon_sent);
@@ -1344,7 +1653,7 @@ void SettingsWindow::render() {
                     }
                 }
             } else {
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Disabled");
+                ImGui::TextDisabled("Disabled");
             }
 
             if (ImGui::Button("Send Beacon Now")) {
@@ -1354,11 +1663,6 @@ void SettingsWindow::render() {
         }
 
         if (ImGui::BeginTabItem("Away Mode")) {
-            bool away_enabled = config_.away.enabled;
-            if (ImGui::Checkbox("Enable Away Mode Config", &away_enabled)) {
-                config_.away.enabled = away_enabled;
-            }
-
             static char away_msg[512] = "";
             std::strncpy(away_msg, config_.away.away_message.c_str(), sizeof(away_msg) - 1);
             if (ImGui::InputTextMultiline("Away Message", away_msg, sizeof(away_msg),
@@ -1392,15 +1696,22 @@ void SettingsWindow::render() {
             ImGui::Separator();
             bool away_active = state_.away_mode_active ? *state_.away_mode_active : false;
             if (away_active) {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "Away Mode: ACTIVE");
+                ImGui::TextColored(pal.warning, "Away Mode: ACTIVE");
+                ImGui::BeginDisabled(!onDisableAwayMode);
                 if (ImGui::Button("Disable Away Mode")) {
-                    if (onDisableAwayMode) onDisableAwayMode();
+                    onDisableAwayMode();
                 }
+                ImGui::EndDisabled();
             } else {
                 ImGui::Text("Away Mode: Inactive");
+                ImGui::BeginDisabled(!onEnableAwayMode);
                 if (ImGui::Button("Enable Away Mode")) {
-                    if (onEnableAwayMode) onEnableAwayMode();
+                    onEnableAwayMode();
                 }
+                ImGui::EndDisabled();
+            }
+            if (!onEnableAwayMode || !onDisableAwayMode) {
+                ImGui::TextDisabled("Away mode control is not available in this build.");
             }
             ImGui::EndTabItem();
         }
@@ -1429,30 +1740,48 @@ void SettingsWindow::render() {
             }
             ImGui::SetItemTooltip("Only report spots with SNR above this threshold");
 
-            int upload_interval = config_.psk_reporter.upload_interval_sec;
-            if (ImGui::SliderInt("Upload Interval (sec)", &upload_interval, 60, 900)) {
-                config_.psk_reporter.upload_interval_sec = upload_interval;
-            }
-            ImGui::SetItemTooltip("How often to batch-upload spots (default 300 = 5 min)");
+            ImGui::TextWrapped("Spots are uploaded about every 5 minutes, the shortest interval "
+                               "pskreporter.info allows; a station is reported at most once per 5 "
+                               "minutes (once an hour while band and mode are unchanged). Spots "
+                               "need a rig-reported dial frequency.");
 
             ImGui::Separator();
             ImGui::Text("Status:");
-
-            if (state_.psk_reporter_mutex) {
-                std::lock_guard<std::mutex> lock(*state_.psk_reporter_mutex);
-                if (config_.psk_reporter.enabled) {
-                    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Active");
-                    ImGui::SameLine();
-                    size_t queue_size = state_.psk_reporter_queue ? state_.psk_reporter_queue->size() : 0;
-                    ImGui::Text("(%zu spots queued)", queue_size);
+            auto clock_text = [](uint64_t ts) -> std::string {
+                if (ts == 0) return "never";
+                std::time_t t = static_cast<std::time_t>(ts);
+                std::tm local_tm = *std::localtime(&t);
+                char buf[32];
+                std::strftime(buf, sizeof(buf), "%H:%M:%S", &local_tm);
+                return buf;
+            };
+            if (!config_.psk_reporter.enabled) {
+                ImGui::TextDisabled("Disabled");
+            } else if (!state_.psk_status || !state_.psk_status->active) {
+                ImGui::TextColored(pal.warning, "Not running: set your callsign (Settings > Station)");
+            } else {
+                const PskReporterStatus& st = *state_.psk_status;
+                if (!st.last_error.empty()) {
+                    ImGui::TextColored(pal.danger, "Error: %s", st.last_error.c_str());
+                } else if (st.upload_in_progress) {
+                    ImGui::TextColored(pal.info, "Uploading...");
                 } else {
-                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Disabled");
+                    ImGui::TextColored(pal.success, "Running");
+                }
+                ImGui::Text("Queued spots: %zu   Sent this session: %llu", st.queued_spots,
+                            static_cast<unsigned long long>(st.spots_sent));
+                ImGui::Text("Last upload: %s", clock_text(st.last_upload_unix).c_str());
+                if (st.next_upload_unix > 0 && st.queued_spots > 0) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(next due %s)", clock_text(st.next_upload_unix).c_str());
                 }
             }
 
+            ImGui::BeginDisabled(!onUploadPSKReporterSpots || !config_.psk_reporter.enabled);
             if (ImGui::Button("Upload Now")) {
-                if (onUploadPSKReporterSpots) onUploadPSKReporterSpots();
+                onUploadPSKReporterSpots();
             }
+            ImGui::EndDisabled();
             ImGui::SameLine();
             ImGui::TextWrapped("Mode: SKYWAVE");
 
@@ -1461,17 +1790,29 @@ void SettingsWindow::render() {
 
         if (ImGui::BeginTabItem("UI")) {
             bool dark_mode = config_.ui.dark_mode;
+            auto apply_style = [&]() {
+                if (onSetupStyle) {
+                    onSetupStyle();
+                } else {
+                    ui::applyModernStyle(config_.ui.dark_mode,
+                                         static_cast<float>(config_.ui.font_size));
+                }
+            };
             if (ImGui::Checkbox("Dark Mode", &dark_mode)) {
                 config_.ui.dark_mode = dark_mode;
-                if (onSetupStyle) onSetupStyle();
+                apply_style();
             }
 
             ImGui::SliderInt("Font Size", &config_.ui.font_size, 10, 24);
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                apply_style();  // on release: re-styling mid-drag would jitter the slider
+            }
 
             bool show_ts = config_.ui.show_timestamps;
             if (ImGui::Checkbox("Show Timestamps", &show_ts)) {
                 config_.ui.show_timestamps = show_ts;
             }
+            ImGui::SetItemTooltip("Time column in the chat and the Log panel.");
 
             bool sound = config_.ui.sound_notifications;
             if (ImGui::Checkbox("Sound Notifications", &sound)) {

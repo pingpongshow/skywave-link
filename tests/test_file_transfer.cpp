@@ -224,12 +224,14 @@ WireFile makeFile() {
     return f;
 }
 
-std::vector<uint8_t> offerMsg(const std::string& id, const std::string& name, const WireFile& f) {
+std::vector<uint8_t> offerMsg(const std::string& id, const std::string& name, const WireFile& f,
+                              uint8_t flags = 0) {
     std::vector<uint8_t> m = idMsg(FileMessageType::FileOffer, id);
     m.push_back(static_cast<uint8_t>(name.size()));
     m.insert(m.end(), name.begin(), name.end());
     putLe(m, static_cast<uint32_t>(f.payload.size()), 4);
     putLe(m, crc32(f.original), 4);
+    m.push_back(flags);
     return m;
 }
 
@@ -500,6 +502,7 @@ TEST(deferred_offers_are_bounded_and_size_checked) {
     for (char ch : std::string("x.bin")) big.push_back(static_cast<uint8_t>(ch));
     putLe(big, static_cast<uint32_t>(MAX_FILE_SIZE * 2), 4);
     putLe(big, 0, 4);
+    big.push_back(0);
     fx.ftm.processIncomingData(fx.c, big);
     ASSERT_EQ(fx.offered_ids.size(), asked);
     pump(fx.c, 100);
@@ -692,6 +695,147 @@ TEST(inactivity_timeout_fails_quiet_transfer) {
     ASSERT_CONTAINS(t.error_message, "No answer");
     pump(fx.a, 100);
     ASSERT_TRUE(sawFrame(fx.ma, idMsg(FileMessageType::FileCancel, id)));
+    PASS();
+}
+
+// K18: files.max_file_size is the limit, on both ends: the sender refuses
+// a larger file with a reason, the receiver refuses a larger offer, and a
+// payload that decompresses past the limit fails.
+TEST(max_file_size_setting_applies_both_ways) {
+    LinkFixture fx;
+    ASSERT_TRUE(fx.ok);
+    const std::string src = fx.writeFile("mid.bin", 20000);
+    fx.fa.setMaxFileSize(10 * 1024);
+    ASSERT_TRUE(fx.fa.sendFile(fx.a, "K1BBB", src).empty());
+    ASSERT_CONTAINS(fx.fa.lastSendError(), "too large");
+
+    // A raised limit lets a file past the old 50 KB constant go.
+    fx.fa.setMaxFileSize(80 * 1024);
+    fx.fb.setMaxFileSize(80 * 1024);
+    ASSERT_EQ(fx.fa.maxFileSize(), size_t(80 * 1024));
+    const std::string large = fx.writeFile("large.bin", 60000);
+    const std::string id = fx.fa.sendFile(fx.a, "K1BBB", large);
+    ASSERT_FALSE(id.empty());
+    for (int i = 0; i < 4000 && fx.done_a.empty(); ++i) fx.step();
+    ASSERT_EQ(fx.done_a.size(), size_t(1));
+    ASSERT_TRUE(fx.done_a[0].second);
+
+    // The receiver's own, smaller limit refuses the offer.
+    fx.fb.setMaxFileSize(8 * 1024);
+    const std::string id2 = fx.fa.sendFile(fx.a, "K1BBB", src);
+    ASSERT_FALSE(id2.empty());
+    for (int i = 0; i < 400 && fx.fa.getTransfer(id2).state == TransferState::Negotiating; ++i) {
+        fx.step();
+    }
+    ASSERT_TRUE(fx.fa.getTransfer(id2).state == TransferState::Failed);
+    PASS();
+}
+
+// K18: a payload within the offer bound that decompresses past the limit.
+TEST(decompressed_size_checked_against_limit) {
+    DeferFixture fx;
+    ASSERT_TRUE(fx.ok);
+    fx.ftm.setAutoAccept(true);
+    fx.ftm.setMaxFileSize(2048);
+    WireFile f;
+    f.original.assign(40000, 'A');  // compresses to almost nothing
+    f.payload = LZHCodec().compress(f.original);
+    ASSERT_LT(f.payload.size(), size_t(2048));
+    fx.ftm.processIncomingData(fx.c, offerMsg("Z1", "zip.bin", f));
+    fx.ftm.processIncomingData(fx.c, chunkMsg("Z1", f));
+    fx.ftm.processIncomingData(fx.c, completeMsg("Z1", f));
+    const auto t = fx.ftm.getTransfer("Z1");
+    ASSERT_TRUE(t.state == TransferState::Failed);
+    ASSERT_CONTAINS(t.error_message, "limit");
+    PASS();
+}
+
+// The file and payload CRCs are the standard CRC-32 for every byte value
+// (the old hand-typed table had a wrong entry for 0xF5, so a peer using a
+// standard CRC-32 failed any file containing that byte).
+TEST(file_crc_is_standard_crc32) {
+    namespace fs = std::filesystem;
+    DeferFixture fx;
+    ASSERT_TRUE(fx.ok);
+    fx.ftm.setAutoAccept(true);
+    const fs::path dir = fs::temp_directory_path() /
+                         ("skylink_ft_crc_" + std::to_string(std::random_device{}()));
+    fx.ftm.setDownloadPath(dir.string());
+    WireFile f;
+    for (int rep = 0; rep < 4; ++rep) {
+        for (int b = 0; b < 256; ++b) f.original.push_back(static_cast<uint8_t>(b));
+    }
+    f.payload = LZHCodec().compress(f.original);
+    ASSERT_EQ(crc32({'1', '2', '3', '4', '5', '6', '7', '8', '9'}), 0xCBF43926u);  // reference check value
+    fx.ftm.processIncomingData(fx.c, offerMsg("C1", "all.bin", f));
+    fx.ftm.processIncomingData(fx.c, chunkMsg("C1", f));
+    fx.ftm.processIncomingData(fx.c, completeMsg("C1", f));
+    const auto t = fx.ftm.getTransfer("C1");
+    ASSERT_TRUE(t.state == TransferState::Completed);
+    ASSERT_EQ(readFile((dir / "all.bin").string()),
+              std::string(f.original.begin(), f.original.end()));
+    fs::remove_all(dir);
+    PASS();
+}
+
+TEST(bbs_upload_policy_rules) {
+    BbsUploadPolicy p;
+    p.directory = "bbs";
+    p.allowed_uploaders = {"K1AAA"};
+    p.max_upload_size = 1000;
+    ASSERT_CONTAINS(bbsUploadRefusal(p, "K1AAA", 10), "does not accept");
+    p.allow_uploads = true;
+    ASSERT_TRUE(bbsUploadRefusal(p, " k1aaa ", 10).empty());
+    ASSERT_CONTAINS(bbsUploadRefusal(p, "K1BBB", 10), "not allowed");
+    ASSERT_CONTAINS(bbsUploadRefusal(p, "K1AAA", 5000), "too large");
+    p.allowed_uploaders.clear();  // an empty list admits nobody
+    ASSERT_FALSE(bbsUploadRefusal(p, "K1AAA", 10).empty());
+    PASS();
+}
+
+// K21: a remote BBS upload lands in the BBS folder without a prompt when
+// the policy allows the sender, and is refused otherwise.
+TEST(bbs_upload_through_file_transfer) {
+    namespace fs = std::filesystem;
+    LinkFixture fx;
+    ASSERT_TRUE(fx.ok);
+    fx.fb.setAutoAccept(false);
+    int prompts = 0;
+    fx.fb.onFileOffer([&prompts](const std::string&, const std::string&, const std::string&, size_t) {
+        ++prompts;
+        return FileOfferDecision::Reject;
+    });
+    BbsUploadPolicy policy;
+    policy.allow_uploads = true;
+    policy.directory = (fx.dir / "bbs").string();
+    policy.allowed_uploaders = {"K1AAA"};  // B's link partner
+    policy.max_upload_size = 50 * 1024;
+    fx.fb.setBbsUploadPolicy(policy);
+
+    const std::string src = fx.writeFile("upload.bin", 3000);
+    const std::string id = fx.fa.sendFile(fx.a, "K1BBB", src, FileOfferKind::BbsUpload);
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(fx.fa.getTransfer(id).bbs_upload);
+    for (int i = 0; i < 2000 && fx.done_a.empty(); ++i) fx.step();
+    ASSERT_EQ(fx.done_a.size(), size_t(1));
+    ASSERT_TRUE(fx.done_a[0].second);
+    ASSERT_EQ(prompts, 0);
+    ASSERT_TRUE(fx.fb.getTransfer(id).bbs_upload);
+    ASSERT_EQ(readFile((fx.dir / "bbs" / "upload.bin").string()), readFile(src));
+    ASSERT_FALSE(fs::exists(fx.dir / "in" / "upload.bin"));
+
+    // Not on the list: refused, nothing written, no prompt either.
+    policy.allowed_uploaders = {"K1CCC"};
+    fx.fb.setBbsUploadPolicy(policy);
+    const std::string id2 = fx.fa.sendFile(fx.a, "K1BBB", fx.writeFile("no.bin", 500),
+                                           FileOfferKind::BbsUpload);
+    for (int i = 0; i < 400 && fx.fa.getTransfer(id2).state == TransferState::Negotiating; ++i) {
+        fx.step();
+    }
+    ASSERT_TRUE(fx.fa.getTransfer(id2).state == TransferState::Failed);
+    ASSERT_CONTAINS(fx.fb.getTransfer(id2).error_message, "not allowed");
+    ASSERT_FALSE(fs::exists(fx.dir / "bbs" / "no.bin"));
+    ASSERT_EQ(prompts, 0);
     PASS();
 }
 #endif

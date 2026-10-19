@@ -6,6 +6,119 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Security (code review, 2026-10-19)
+
+- **Email relay allowlist fails closed and is persisted.** `[email]
+  allowed_relays` was never saved or loaded, so the list was always empty
+  and every station could send internet email through the operator's
+  account. It is now saved, editable in Settings -> Email, and an empty
+  list admits nobody
+- **Passwords in the system keychain.** SMTP, POP3 and Winlink passwords
+  are kept in the macOS keychain where available (the config file only
+  notes that); otherwise the config file is written owner-only. Saves are
+  atomic
+- **Winlink never sends the account password.** The CMS client answers the
+  B2F secure-login challenge (`;PQ` -> `;PR`) and logs in with the fixed
+  `CMSTelnet` token; TLS (`cms.winlink.org:8773`) is the default
+
+### Fixed (code review, 2026-10-19)
+
+- **Chat framing.** Chat lines carry their own type byte (`0xC0 | UTF-8
+  text`, `0xFD` fragments): text starting with certain UTF-8 lead bytes
+  used to be dispatched as mail/ping/weather/control frames. Malformed
+  binary frames are dropped instead of shown as text. Chat that could not
+  be sent keeps the input and says why
+- **Private mail goes only to its recipient.** Mail is sent over the link
+  only when the linked station is the addressee; otherwise it waits in the
+  outbox (or goes by mesh relay). "Mail sent" is no longer reported for
+  mail the peer refused
+- **PSK Reporter uploads real IPFIX** (RFC 7011, pskreporter.info spec):
+  receiver and sender templates, enterprise number 30351, correct sequence
+  numbers and export time, uploads at most every 5 minutes, per-station
+  dedup, datagrams kept under the MTU, a bounded queue. The old home-made
+  format was dropped by the server while the UI said "Active"; Settings now
+  shows queued/sent spots, the last upload and the last error
+- **Winlink CMS speaks B2F** (FC EM proposals with `F>` checksum, FS
+  answers, LZHUF-compressed SOH/STX/EOT blocks, FF/FQ) with the Winlink
+  message format (Mid/Date/Type/From/To/Subject/Mbo/Body/File) and
+  Winlink LZHUF (CRC16 + length header). Inbound mail is acknowledged only
+  after it is stored. Outgoing gateway mail gets a stable Winlink message
+  id per outbox item, so a retry cannot deliver it twice; the B2F envelope
+  is type Private
+- Beacon/CQ bodies match the modem (BEACON: call + SNR-floor byte, `0xFF`
+  unknown; CQ: call only) and frame types 30/31 are known; a beacon's "SNR"
+  is shown only when the modem measured it (unknown SNR shows as `-`
+  everywhere, and is stored as NULL rather than 0 dB)
+- **NMEA**: one parser with mandatory checksum that accepts standard
+  GGA/RMC sentences (trailing empty fields); a stale fix times out
+- **Mesh relay** uses fresh learned routes for directed relaying (flood
+  otherwise), learns routes with measured SNR only, prunes stale routes and
+  retries failed relay sends. The route table is shown in Settings ->
+  Email (Mesh routes)
+- **Store maintenance**: undelivered mail expires after
+  `store.message_expiry_days`, the pending cap and `auto_cleanup` apply,
+  old history is trimmed and the database is compacted; the weather cache
+  is persisted
+- PTT: the PTT server listens on 4532 (the modem's default) and the app
+  points the modem at it (`PTTMETHOD TCP`, `PTTPORT`); KEY/UNKEY drive the
+  TX badge. Hamlib dry run refuses control instead of pretending
+- Voice uplink audio is queued in whole records and never sleeps on the
+  GUI thread; refused frames are counted and reported (rate-limited); the
+  voice socket is reopened when it closes
+- Gateway mail no longer tears down the operator's QSO and gateway calls
+  are capped with backoff; queued internet email is sent right away when
+  the gateway runs; the Messages window reports success only when the
+  email was really queued
+- QSY, sniffer, ping, weather and position actions report failures
+  instead of claiming success; the channel sniffer returns the rig to its
+  frequency; weather requests that are refused get an error answer
+- Files: `files.max_file_size` is honoured on both ends; transfers can be
+  cancelled from the Files window and show as cancelled, not failed
+- Settings are saved on Apply / Save (failures reported), not only on a
+  clean exit; APRS settings apply without a restart
+- Heard tables show the band, bandwidth and SNR actually recorded (or `-`)
+
+### Added (code review, 2026-10-19)
+
+- **Weather alerts** (type `0x05`, US active alerts from api.weather.gov):
+  Weather -> Forecast -> Alerts, for a state code, grid square, "lat,lon"
+  or place name
+- **APRS-IS**: server-side filter (`[aprs] filter`, default a range around
+  the station plus its own call), inbound APRS messages shown and acked,
+  auto-beacon setting saved
+- **Away mode**: Settings buttons work; the linked station can send
+  internet email with `EMAIL:<address>:<subject>:<body>` when the away
+  options allow it, and always gets a reply
+- **BBS uploads**: a linked station may upload into this station's BBS
+  folder when `bbs.allow_uploads` is on and it is in
+  `bbs.allowed_uploaders` (within `max_upload_size`); the BBS window has
+  "Upload to remote BBS"; completed uploads are announced and the list
+  refreshed. The BBS welcome message is sent at session start
+- Settings -> Modem: MODE, MAXMODE and CWID controls; voice codec
+  (AUTO/700C/1300/2400/3200) is sent to the modem
+- Incoming chat/mail notification sound (system alert sound, never blocking;
+  `ui.sound_notifications`); chat timestamps toggle (`ui.show_timestamps`);
+  operator name used as the email From display name
+- Status line in every tool window showing the result of the last action
+  started there
+- Main panel CQ repeat selector (x1-x10)
+- Test hook actions `wx_alerts`, `wx_cancel`, `away_on`, `away_off`,
+  `save_config`, `email`, `psk_upload`, `tune`, `qsy`, `bbs_send`
+
+### Removed (code review, 2026-10-19)
+
+- Unused modules `ChannelScanner`, `WebServer`, `MessageRouter`,
+  `voice_message` and `ImagePreviewCache` (image decoding for the map
+  remains), and other unreferenced APIs (`ModemClient` compression, HARQ,
+  auto-mode, `receiveData`)
+- Never-rendered `ChatWindow`, `BeaconPanel` and `PingPanel`
+- Typing indicators (airtime on HF for little value) and the app-level SNR
+  exchange: the modem's own report (RSNR) is used. Test hook `snr` removed
+- `away.enabled` (away mode is the runtime toggle), `psk_reporter.upload_interval_sec`
+  (the spec fixes the cadence), `ui.notification_sound`
+- Builds without SQLite: SQLite is now required (CMake stops without it)
+  instead of silently dropping all data
+
 ### Fixed (2026-10-19)
 
 - **Start-up hang.** The voice microphone and speaker were opened during

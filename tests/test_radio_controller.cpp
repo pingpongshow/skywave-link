@@ -1,8 +1,19 @@
-// RadioController dry-run tests
+// RadioController tests: dry run (model 0), Hamlib's dummy rig, the PTT
+// server and backend resolution.
 
 #include "test_macros.hpp"
 #include "skywave_link/radio_controller.hpp"
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc23-extensions"
+#endif
+#include <hamlib/rig.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -113,19 +124,70 @@ socket_handle_t connect_local(uint16_t port) {
     return fd;
 }
 
-} // namespace
+// Hamlib's in-memory dummy rig: a real backend that needs no hardware.
+constexpr int kDummyRigModel = 1;  // RIG_MODEL_DUMMY
 
-TEST(radio_controller_dry_run_frequency_and_ptt) {
-    skylink::RadioController radio;
+skylink::RadioConfig rigConfig(int model, uint16_t ptt_port = 0) {
     skylink::RadioConfig cfg;
     cfg.enabled = true;
-    cfg.hamlib_model = 0;
-    cfg.ptt_server_enabled = false;
+    cfg.hamlib_model = model;
+    cfg.ptt_server_enabled = ptt_port != 0;
+    cfg.ptt_server_bind = "127.0.0.1";
+    cfg.ptt_server_port = ptt_port;
+    return cfg;
+}
 
-    radio.applyConfig(cfg);
+} // namespace
+
+// K12: model 0 controls nothing, so nothing may report success.
+TEST(radio_controller_dry_run_refuses_control) {
+    skylink::RadioController radio;
+    radio.applyConfig(rigConfig(0));
     ASSERT_TRUE(radio.connect());
-    ASSERT_TRUE(radio.isConnected());
     ASSERT_TRUE(radio.isDryRun());
+    ASSERT_TRUE(radio.getStatus().dry_run);
+
+    ASSERT_FALSE(radio.setFrequency(14105000));
+    ASSERT_CONTAINS(radio.getStatus().last_error, "model 0");
+    ASSERT_FALSE(radio.getFrequency().has_value());
+    ASSERT_FALSE(radio.setMode("USB"));
+    ASSERT_FALSE(radio.getMode().has_value());
+    ASSERT_FALSE(radio.setPtt(true));
+    ASSERT_FALSE(radio.getPtt());
+    ASSERT_TRUE(radio.setPtt(false));  // unkeying nothing is not an error
+    PASS();
+}
+
+// K12 + K5: in dry run the PTT server answers KEY with an error, but still
+// reports that the modem is keying.
+TEST(radio_controller_dry_run_ptt_server_reports_error) {
+    skylink::RadioController radio;
+    const auto cfg = rigConfig(0, 46334);
+    radio.applyConfig(cfg);
+    std::atomic<int> keyed{-1};
+    radio.onPttRequest([&keyed](bool k) { keyed = k ? 1 : 0; });
+    ASSERT_TRUE(radio.connect());
+    ASSERT_TRUE(radio.startPttServer());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    socket_handle_t fd = connect_local(cfg.ptt_server_port);
+    ASSERT_TRUE(fd != kInvalidSocket);
+    ASSERT_TRUE(send_line(fd, "KEY\n"));
+    const std::string reply = recv_line(fd);
+    ASSERT_CONTAINS(reply, "ERROR");
+    ASSERT_EQ(keyed.load(), 1);
+    ASSERT_TRUE(send_line(fd, "UNKEY\n"));
+    ASSERT_EQ(recv_line(fd), std::string("OK"));
+    ASSERT_EQ(keyed.load(), 0);
+    close_socket(fd);
+    radio.stopPttServer();
+    PASS();
+}
+
+TEST(radio_controller_dummy_rig_frequency_and_ptt) {
+    skylink::RadioController radio;
+    radio.applyConfig(rigConfig(kDummyRigModel));
+    ASSERT_TRUE(radio.connect());
+    ASSERT_FALSE(radio.isDryRun());
 
     ASSERT_TRUE(radio.setFrequency(14105000));
     const auto freq = radio.getFrequency();
@@ -146,14 +208,11 @@ TEST(radio_controller_dry_run_frequency_and_ptt) {
 
 TEST(radio_controller_ptt_server_roundtrip) {
     skylink::RadioController radio;
-    skylink::RadioConfig cfg;
-    cfg.enabled = true;
-    cfg.hamlib_model = 0;
-    cfg.ptt_server_enabled = true;
-    cfg.ptt_server_bind = "127.0.0.1";
-    cfg.ptt_server_port = 46331;
-
+    const auto cfg = rigConfig(kDummyRigModel, 46331);
     radio.applyConfig(cfg);
+    std::atomic<int> requests{0};
+    std::atomic<int> keyed{-1};
+    radio.onPttRequest([&](bool k) { ++requests; keyed = k ? 1 : 0; });
     ASSERT_TRUE(radio.connect());
     ASSERT_TRUE(radio.startPttServer());
 
@@ -166,11 +225,14 @@ TEST(radio_controller_ptt_server_roundtrip) {
 
     ASSERT_TRUE(send_line(fd, "KEY\n"));
     ASSERT_EQ(recv_line(fd), std::string("OK"));
+    ASSERT_EQ(keyed.load(), 1);
     ASSERT_TRUE(send_line(fd, "STATUS\n"));
     ASSERT_EQ(recv_line(fd), std::string("PTT:ON"));
 
     ASSERT_TRUE(send_line(fd, "UNKEY\n"));
     ASSERT_EQ(recv_line(fd), std::string("OK"));
+    ASSERT_EQ(keyed.load(), 0);
+    ASSERT_EQ(requests.load(), 2);
     ASSERT_TRUE(send_line(fd, "STATUS\n"));
     ASSERT_EQ(recv_line(fd), std::string("PTT:OFF"));
 
@@ -179,22 +241,12 @@ TEST(radio_controller_ptt_server_roundtrip) {
     PASS();
 }
 
-namespace {
-skylink::RadioConfig pttServerConfig(uint16_t port) {
-    skylink::RadioConfig cfg;
-    cfg.enabled = true;
-    cfg.hamlib_model = 0;
-    cfg.ptt_server_enabled = true;
-    cfg.ptt_server_bind = "127.0.0.1";
-    cfg.ptt_server_port = port;
-    return cfg;
-}
-} // namespace
-
 TEST(radio_controller_ptt_client_drop_unkeys) {
     skylink::RadioController radio;
-    const auto cfg = pttServerConfig(46332);
+    const auto cfg = rigConfig(kDummyRigModel, 46332);
     radio.applyConfig(cfg);
+    std::atomic<int> keyed{-1};
+    radio.onPttRequest([&keyed](bool k) { keyed = k ? 1 : 0; });
     ASSERT_TRUE(radio.connect());
     ASSERT_TRUE(radio.startPttServer());
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -209,7 +261,7 @@ TEST(radio_controller_ptt_client_drop_unkeys) {
     bool unkeyed = false;
     for (int i = 0; i < 50 && !unkeyed; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        unkeyed = !radio.getPtt();
+        unkeyed = !radio.getPtt() && keyed.load() == 0;
     }
     ASSERT_TRUE(unkeyed);
     radio.stopPttServer();
@@ -218,7 +270,7 @@ TEST(radio_controller_ptt_client_drop_unkeys) {
 
 TEST(radio_controller_ptt_stop_with_idle_keyed_client) {
     skylink::RadioController radio;
-    const auto cfg = pttServerConfig(46333);
+    const auto cfg = rigConfig(kDummyRigModel, 46333);
     radio.applyConfig(cfg);
     ASSERT_TRUE(radio.connect());
     ASSERT_TRUE(radio.startPttServer());
@@ -239,6 +291,49 @@ TEST(radio_controller_ptt_stop_with_idle_keyed_client) {
     ASSERT_FALSE(radio.getPtt());
     ASSERT_FALSE(radio.getStatus().ptt_server_running);
     close_socket(fd);
+    PASS();
+}
+
+// K6: the PTT server defaults to the modem's PTTPORT default.
+TEST(radio_controller_default_ptt_port_matches_modem) {
+    ASSERT_EQ(skylink::kDefaultPttServerPort, (uint16_t)4532);
+    skylink::RadioConfig defaults;
+    ASSERT_EQ(defaults.ptt_server_port, (uint16_t)4532);
+    skylink::RadioController radio;
+    radio.applyConfig(rigConfig(0, 0));
+    ASSERT_EQ(radio.getStatus().ptt_port, (uint16_t)4532);
+    PASS();
+}
+
+// K13: the Kenwood TCP backend uses a Kenwood model, not the FlexRadio one.
+TEST(resolve_radio_config_backends) {
+    skylink::RadioConfig src;
+    src.backend = "Kenwood TCP";
+    src.kenwood_host = " 192.0.2.10 ";
+    src.kenwood_port = 60000;
+    src.hamlib_model = 0;
+    auto cfg = skylink::resolveRadioConfig(src);
+    ASSERT_TRUE(cfg.enabled);
+    ASSERT_EQ(cfg.backend, std::string("kenwood_tcp"));
+    ASSERT_EQ(cfg.hamlib_model, (int)RIG_MODEL_TS890S);
+    ASSERT_TRUE(cfg.hamlib_model != (int)RIG_MODEL_F6K);
+    ASSERT_EQ(cfg.device, std::string("192.0.2.10:60000"));
+
+    src.hamlib_model = RIG_MODEL_TS990S;  // a Kenwood model the user chose
+    ASSERT_EQ(skylink::resolveRadioConfig(src).hamlib_model, (int)RIG_MODEL_TS990S);
+    src.hamlib_model = kDummyRigModel;    // not a Kenwood model
+    ASSERT_EQ(skylink::resolveRadioConfig(src).hamlib_model, (int)RIG_MODEL_TS890S);
+
+    src.backend = "hamlib";
+    src.hamlib_model = 1234;
+    cfg = skylink::resolveRadioConfig(src);
+    ASSERT_TRUE(cfg.enabled);
+    ASSERT_EQ(cfg.hamlib_model, 1234);
+
+    src.backend = "none";
+    cfg = skylink::resolveRadioConfig(src);
+    ASSERT_FALSE(cfg.enabled);
+    ASSERT_EQ(cfg.hamlib_model, 0);
     PASS();
 }
 

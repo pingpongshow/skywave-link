@@ -669,4 +669,115 @@ TEST(nested_relay_payload_dropped) {
     PASS();
 }
 
+// K16: routes are used. A station that knows a fresh route sends (and
+// relays) directed through its next hop; only that station forwards; with
+// no route the packet floods.
+TEST(directed_relay_along_learned_route) {
+    MeshRelay b, c, e;
+    b.setMyCallsign("K1BBB");
+    c.setMyCallsign("K1CCC");
+    e.setMyCallsign("K1EEE");
+    for (MeshRelay* r : {&b, &c, &e}) r->setEnabled(true);
+
+    // B hears a packet from K1DDD relayed by C: route to D via C, 2 hops.
+    RelayHeader hdr;
+    hdr.ttl = 3;
+    hdr.hop_count = 1;
+    hdr.source = "K1DDD";
+    hdr.destination = "*";
+    hdr.message_id = "learn_1";
+    hdr.path = {"K1CCC"};
+    std::vector<uint8_t> out;
+    b.processRelayPacket(buildPacket(hdr, {0x42}), out, 6.0f);
+    auto route = b.getRoute("K1DDD");
+    ASSERT_TRUE(route.has_value());
+    ASSERT_EQ(route->next_hop, std::string("K1CCC"));
+    ASSERT_EQ(route->hop_count, uint8_t(2));
+    ASSERT_TRUE(route->snr_known);
+    auto neighbour = b.getRoute("K1CCC");
+    ASSERT_TRUE(neighbour.has_value());
+    ASSERT_EQ(neighbour->hop_count, uint8_t(1));
+
+    // B sends to D: directed through C.
+    auto packet = b.createRelayPacket("K1DDD", {0x01, 0x02});
+    RelayHeader sent;
+    size_t hs = 0;
+    ASSERT_TRUE(MeshRelay::deserializeHeader(packet.data(), packet.size(), sent, hs));
+    ASSERT_EQ(sent.next_hop, std::string("K1CCC"));
+    ASSERT_EQ(b.getStats().packets_directed, uint64_t(1));
+
+    // E hears it too but is not the next hop: no flood.
+    ASSERT_TRUE(e.processRelayPacket(packet, out) == RelayResult::Dropped);
+    ASSERT_EQ(e.getStats().packets_not_next_hop, uint64_t(1));
+    ASSERT_EQ(e.relayQueueSize(), size_t(0));
+
+    // C forwards it; C hears D directly, so it directs the last hop to D.
+    c.processBeaconRoute("K1DDD");
+    ASSERT_TRUE(c.processRelayPacket(packet, out) == RelayResult::Relayed);
+    RelayQueueEntry entry;
+    ASSERT_TRUE(c.getNextRelay(entry));
+    ASSERT_EQ(entry.header.next_hop, std::string("K1DDD"));
+    ASSERT_EQ(entry.header.path.size(), size_t(1));
+
+    // No route: flooded.
+    auto flood = b.createRelayPacket("K1ZZZ", {0x03});
+    ASSERT_TRUE(MeshRelay::deserializeHeader(flood.data(), flood.size(), sent, hs));
+    ASSERT_TRUE(sent.next_hop.empty());
+    PASS();
+}
+
+TEST(stale_routes_unused_and_pruned) {
+    MeshRelay relay;
+    relay.setMyCallsign("K1AAA");
+    relay.setEnabled(true);
+    relay.setRouteMaxAgeSec(600);
+    RouteEntry old_route;
+    old_route.destination = "K1DDD";
+    old_route.next_hop = "K1CCC";
+    old_route.hop_count = 2;
+    old_route.last_seen = 1000;  // long ago
+    relay.addRoute(old_route);
+    ASSERT_FALSE(relay.getRoute("K1DDD").has_value());
+    auto packet = relay.createRelayPacket("K1DDD", {0x01});
+    RelayHeader hdr;
+    size_t hs = 0;
+    ASSERT_TRUE(MeshRelay::deserializeHeader(packet.data(), packet.size(), hdr, hs));
+    ASSERT_TRUE(hdr.next_hop.empty());
+    ASSERT_EQ(relay.getRouteTable().size(), size_t(1));
+    relay.pruneStaleRoutes();
+    ASSERT_EQ(relay.getRouteTable().size(), size_t(0));
+    PASS();
+}
+
+TEST(route_snr_only_when_measured) {
+    MeshRelay relay;
+    relay.setMyCallsign("K1AAA");
+    relay.processBeaconRoute("K1BBB");  // no measurement
+    auto r = relay.getRoute("K1BBB");
+    ASSERT_TRUE(r.has_value());
+    ASSERT_FALSE(r->snr_known);
+    relay.processBeaconRoute("K1BBB", -3.0f);  // a measured one replaces it
+    r = relay.getRoute("K1BBB");
+    ASSERT_TRUE(r->snr_known);
+    ASSERT_NEAR(r->snr_db, -3.0f, 0.01f);
+    PASS();
+}
+
+TEST(header_next_hop_roundtrip) {
+    RelayHeader hdr;
+    hdr.source = "K1AAA";
+    hdr.destination = "K1DDD";
+    hdr.message_id = "m1";
+    hdr.next_hop = "K1CCC";
+    hdr.path = {"K1BBB"};
+    auto bytes = MeshRelay::serializeHeader(hdr);
+    RelayHeader back;
+    size_t hs = 0;
+    ASSERT_TRUE(MeshRelay::deserializeHeader(bytes.data(), bytes.size(), back, hs));
+    ASSERT_EQ(back.next_hop, std::string("K1CCC"));
+    ASSERT_EQ(back.path.size(), size_t(1));
+    ASSERT_EQ(hs, bytes.size());
+    PASS();
+}
+
 TEST_MAIN()

@@ -1,5 +1,6 @@
 // FrequencyManager tests
 #include "test_macros.hpp"
+#include <chrono>
 #include "skywave_link/freq_manager.hpp"
 
 TEST(freq_default_bands) {
@@ -62,6 +63,9 @@ TEST(freq_frequency_to_slot) {
     ASSERT_EQ(fm.frequencyToSlot("40m", 7055000), 0);
     // 7054000 = slot -2
     ASSERT_EQ(fm.frequencyToSlot("40m", 7054000), -2);
+    // Nearest slot, not truncation toward the calling frequency.
+    ASSERT_EQ(fm.frequencyToSlot("40m", 7054700), -1);
+    ASSERT_EQ(fm.frequencyToSlot("40m", 7055300), 1);
     PASS();
 }
 
@@ -201,6 +205,112 @@ TEST(freq_propagation_window_and_band_score) {
     const double score_40m_night = fm.scoreBandForPropagation("40m", night);
     const double score_10m_night = fm.scoreBandForPropagation("10m", night);
     ASSERT_GT(score_40m_night, score_10m_night);
+    PASS();
+}
+
+// K11: best slot uses real data. With nothing known it says so (and picks
+// the nearest slot); a fresh clear reading wins; busy slots are avoided;
+// stale readings count as unknown; the least recently busy slot wins ties.
+TEST(freq_best_slot_uses_scan_data) {
+    skylink::FrequencyManager fm;
+    const int64_t t = 1700000000;
+    auto c = fm.chooseBestSlot("40m", t);
+    ASSERT_EQ(c.slot, 1);
+    ASSERT_FALSE(c.known_clear);
+    ASSERT_CONTAINS(c.reason, "sniffer");
+
+    fm.updateSlotStatus("40m", 1, skylink::SlotStatus::InUse, "K1BBB", t);
+    fm.updateSlotStatus("40m", -1, skylink::SlotStatus::InUse, "", t);
+    fm.updateSlotStatus("40m", 4, skylink::SlotStatus::Available, "", t);
+    c = fm.chooseBestSlot("40m", t + 60);
+    ASSERT_EQ(c.slot, 4);
+    ASSERT_TRUE(c.known_clear);
+    ASSERT_EQ(fm.findBestSlot("40m") != 0, true);
+
+    // The clear reading goes stale: unknown slots never seen busy win over
+    // ones that were busy, nearest first.
+    c = fm.chooseBestSlot("40m", t + skylink::FrequencyManager::kSlotFreshSec + 61);
+    ASSERT_FALSE(c.known_clear);
+    ASSERT_EQ(c.slot, 2);
+
+    // Everything busy: the least recently busy one, flagged.
+    for (const auto& s : fm.getSlots("40m")) {
+        if (s.slot_number != 0) {
+            fm.updateSlotStatus("40m", s.slot_number, skylink::SlotStatus::InUse, "", t + 100);
+        }
+    }
+    fm.updateSlotStatus("40m", -5, skylink::SlotStatus::InUse, "", t + 50);
+    c = fm.chooseBestSlot("40m", t + 120);
+    ASSERT_TRUE(c.all_busy);
+    ASSERT_EQ(c.slot, -5);
+    ASSERT_TRUE(c.slot != 0);
+    PASS();
+}
+
+TEST(freq_note_activity_marks_slot) {
+    skylink::FrequencyManager fm;
+    const int64_t t = 1700000000;
+    ASSERT_TRUE(fm.noteActivity(7056500 + 40, "K1BBB", t));  // slot +3, a little off
+    auto s = fm.getSlot("40m", 3);
+    ASSERT_TRUE(s.has_value());
+    ASSERT_TRUE(s->status == skylink::SlotStatus::InUse);
+    ASSERT_EQ(s->occupant, std::string("K1BBB"));
+    ASSERT_EQ(s->last_busy, t);
+    ASSERT_FALSE(fm.noteActivity(7056250, "K1BBB", t));  // between slots
+    ASSERT_FALSE(fm.noteActivity(9000000, "K1BBB", t));  // no band
+    PASS();
+}
+
+// K28 / A10: the one slot scanner. Busy is sampled over the whole dwell
+// (after settling), every slot is visited, and the scan ends by returning
+// to the start frequency.
+TEST(freq_slot_scan_samples_whole_dwell_and_returns) {
+    using namespace std::chrono;
+    skylink::FrequencyManager fm;
+    const auto slots = fm.getSlots("30m");
+    ASSERT_TRUE(slots.size() >= 3);
+    auto now = steady_clock::time_point{} + hours(1);
+    const int64_t unix_now = 1700000000;
+    auto step = fm.beginSlotScan("30m", 10136000, now, milliseconds(1000), milliseconds(400));
+    ASSERT_TRUE(step.action == skylink::SlotScanStep::Action::Tune);
+    ASSERT_EQ(step.frequency_hz, slots[0].frequency_hz);
+    ASSERT_TRUE(fm.isScanningSlots());
+    ASSERT_EQ(fm.scanningSlot(), slots[0].slot_number);
+
+    size_t tunes = 1;
+    bool done = false;
+    for (int i = 0; i < 1000 && !done; ++i) {
+        now += milliseconds(100);
+        const size_t idx = tunes - 1;
+        // Slot index 1 is busy only briefly in the middle of its dwell; the
+        // busy flag right after tuning (inherited from the previous slot)
+        // must be ignored for index 2.
+        const auto in_slot = (i % 10) * 100;
+        bool busy = (idx == 1 && in_slot == 600) || (idx == 2 && in_slot == 0);
+        step = fm.updateSlotScan(busy, now, unix_now);
+        if (step.action == skylink::SlotScanStep::Action::Tune) {
+            ++tunes;
+            ASSERT_EQ(step.frequency_hz, slots[tunes - 1].frequency_hz);
+        } else if (step.action == skylink::SlotScanStep::Action::Done) {
+            done = true;
+            ASSERT_EQ(step.frequency_hz, (uint64_t)10136000);
+        }
+    }
+    ASSERT_TRUE(done);
+    ASSERT_EQ(tunes, slots.size());
+    ASSERT_FALSE(fm.isScanningSlots());
+    auto after = fm.getSlots("30m");
+    ASSERT_TRUE(after[0].status == skylink::SlotStatus::Available);
+    ASSERT_TRUE(after[1].status == skylink::SlotStatus::InUse);
+    ASSERT_TRUE(after[2].status == skylink::SlotStatus::Available);
+
+    // Abort hands back the start frequency.
+    fm.beginSlotScan("30m", 10140000, now);
+    auto back = fm.abortSlotScan();
+    ASSERT_TRUE(back.has_value());
+    ASSERT_EQ(*back, (uint64_t)10140000);
+    ASSERT_FALSE(fm.abortSlotScan().has_value());
+    ASSERT_TRUE(fm.beginSlotScan("99m", 1, now).action == skylink::SlotScanStep::Action::None);
     PASS();
 }
 

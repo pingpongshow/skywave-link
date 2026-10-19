@@ -389,7 +389,7 @@ TEST(async_commands_resolve_in_order) {
         };
     };
     const auto start = std::chrono::steady_clock::now();
-    ASSERT_TRUE(c.sendCommandAsync("MYCALL N0CALL", record("mycall")));
+    ASSERT_TRUE(c.sendCommandAsync("MYCALL K1AAA", record("mycall")));
     ASSERT_TRUE(c.sendCommandAsync("ABORT", record("abort")));
     ASSERT_TRUE(c.sendCommandAsync("CQ", record("cq"), 200));
     const auto sent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -406,9 +406,9 @@ TEST(async_commands_resolve_in_order) {
 
     // In non-blocking mode the high-level commands return at once.
     c.setNonBlockingCommands(true);
-    m.reply("CONNECT", 300, "CONNECT N1CALL");
+    m.reply("CONNECT", 300, "CONNECT K1BBB");
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_TRUE(c.connectToStation("n1call"));
+    ASSERT_TRUE(c.connectToStation("k1bbb"));
     ASSERT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(100));
     ASSERT_EQ(c.pendingAsyncCommands(), size_t(1));
     pump(c, 450);
@@ -597,6 +597,247 @@ TEST(send_data_refused_without_session) {
     ssize_t n;
     while ((n = recv(m.data, buf, sizeof(buf), 0)) > 0) rx.append(buf, static_cast<size_t>(n));
     ASSERT_EQ(rx, frame(std::string("\x01\x02")));  // only the in-session message
+    PASS();
+}
+
+// K10: a blocking query that times out must not leave its late `ERROR:` to
+// be taken as the answer of the next (async) command, and a pending async
+// command must not steal a blocking query's reply.
+TEST(blocking_query_and_async_commands_share_ordering) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    c.setNonBlockingCommands(true);
+
+    // STATUS answers late with an error; the query gives up first.
+    m.reply("STATUS", 250, "ERROR:STATE");
+    ASSERT_FALSE(c.refreshStatus(100));
+    std::vector<std::string> log;
+    ASSERT_TRUE(c.sendCommandAsync("LISTEN ON", [&](bool ok, const std::string& r) {
+        log.push_back(std::string(ok ? "ok:" : "fail:") + r);
+    }));
+    pump(c, 500);
+    ASSERT_EQ(log.size(), size_t(1));
+    ASSERT_EQ(log[0], std::string("ok:LISTEN"));  // not the late STATUS error
+    ASSERT_EQ(c.pendingAsyncCommands(), size_t(0));
+
+    // An async command still pending when a blocking query goes out: each
+    // gets its own reply.
+    m.reply("CQ", 100, "CQ");
+    m.reply("VERSION", 0, "VERSION TEST-2");
+    log.clear();
+    ASSERT_TRUE(c.sendCommandAsync("CQ", [&](bool ok, const std::string& r) {
+        log.push_back(std::string(ok ? "ok:" : "fail:") + r);
+    }));
+    ASSERT_EQ(c.getVersion(), std::string("TEST-2"));
+    pump(c, 50);
+    ASSERT_EQ(log.size(), size_t(1));
+    ASSERT_EQ(log[0], std::string("ok:CQ"));
+    PASS();
+}
+
+// K5: the PTT state the owner reports survives STATUS refreshes.
+TEST(ptt_active_reported_by_owner) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    ASSERT_FALSE(c.getStatus().ptt_active);
+    std::thread keyer([&c]() { c.setPttActive(true); });  // the PTT server's thread
+    keyer.join();
+    ASSERT_TRUE(c.getStatus().ptt_active);
+    m.reply("STATUS", 0, "STATUS STATE=IDLE CALL=K1AAA REMOTE=- FAMILY=WIDE MODE=AUTO(M8)");
+    ASSERT_TRUE(c.refreshStatus());
+    ASSERT_TRUE(c.getStatus().ptt_active);
+    c.setPttActive(false);
+    ASSERT_FALSE(c.getStatus().ptt_active);
+    PASS();
+}
+
+// K6: the modem is told to key through this app's PTT server.
+TEST(use_ptt_server_sends_method_then_port) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    m.reply("PTTMETHOD", 0, "PTTMETHOD TCP");
+    m.reply("PTTPORT", 0, "PTTPORT 127.0.0.1:4532");
+    int done = 0;
+    bool ok = false;
+    ASSERT_TRUE(c.usePttServer("127.0.0.1", 4532, [&](bool o, const std::string&) {
+        ++done;
+        ok = o;
+    }));
+    pump(c, 200);
+    ASSERT_EQ(done, 1);
+    ASSERT_TRUE(ok);
+    auto cmds = m.commands();
+    ASSERT_EQ(cmds.size(), size_t(2));
+    ASSERT_EQ(cmds[0], std::string("PTTMETHOD TCP"));
+    ASSERT_EQ(cmds[1], std::string("PTTPORT 127.0.0.1:4532"));
+    ASSERT_FALSE(c.usePttServer("127.0.0.1", 0));
+    PASS();
+}
+
+// K8: voice uplink never blocks the caller and never leaves a partial
+// record on the socket: what the modem reads is a run of whole records with
+// consecutive sequence numbers, one per accepted call.
+TEST(voice_uplink_queues_whole_records_without_blocking) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    pump(c, 20);
+
+    std::vector<int16_t> pcm(320, 1234);
+    size_t accepted = 0;
+    bool refused = false;
+    long long worst_us = 0;
+    for (int i = 0; i < 20000 && !refused; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = c.sendVoicePcm(pcm.data(), pcm.size());
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        worst_us = std::max(worst_us, static_cast<long long>(us));
+        if (ok) ++accepted; else refused = true;
+    }
+    ASSERT_TRUE(refused);                    // the backlog bound was reached
+    ASSERT_TRUE(worst_us < 20000);           // no call slept
+    ASSERT_TRUE(c.pendingVoiceBytes() <= ModemClient::kMaxVoiceBacklogBytes);
+
+    // Drain: the modem side reads while the client flushes from poll().
+    std::vector<uint8_t> rx;
+    const size_t want = accepted * (16 + 640);
+    int fl = fcntl(m.voice, F_GETFL, 0);
+    fcntl(m.voice, F_SETFL, fl | O_NONBLOCK);
+    for (int i = 0; i < 4000 && rx.size() < want; ++i) {
+        uint8_t b[65536];
+        ssize_t n;
+        while ((n = recv(m.voice, b, sizeof(b), 0)) > 0) rx.insert(rx.end(), b, b + n);
+        c.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(rx.size(), want);
+    for (size_t r = 0; r < accepted; ++r) {
+        const uint8_t* rec = rx.data() + r * (16 + 640);
+        ASSERT_EQ(rec[0], uint8_t(1));
+        ASSERT_EQ(rec[1], uint8_t(1));
+        ASSERT_EQ((size_t(rec[2]) << 8) | rec[3], size_t(640));
+        const uint32_t seq = uint32_t(rec[4]) << 24 | uint32_t(rec[5]) << 16 |
+                             uint32_t(rec[6]) << 8 | rec[7];
+        ASSERT_EQ(seq, uint32_t(r));
+    }
+    ASSERT_EQ(c.pendingVoiceBytes(), size_t(0));
+    PASS();
+}
+
+// K7: a voice socket the modem closes is reopened by poll().
+TEST(voice_socket_reopened_after_close) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    c.setVoiceReconnectInterval(std::chrono::milliseconds(50));
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    pump(c, 20);
+    ASSERT_TRUE(c.voiceMediaState() == VoiceMediaState::Connected);
+    close(m.voice);
+    m.voice = -1;
+    pump(c, 30);
+    ASSERT_FALSE(c.hasVoiceMedia());
+    ASSERT_TRUE(c.voiceMediaState() == VoiceMediaState::Reconnecting);
+    pump(c, 100);  // the reopen starts in the background
+    m.voice = accept(m.lvoice, nullptr, nullptr);
+    ASSERT_TRUE(m.voice >= 0);
+    pump(c, 100);
+    ASSERT_TRUE(c.hasVoiceMedia());
+    std::vector<int16_t> pcm(160, 7);
+    ASSERT_TRUE(c.sendVoicePcm(pcm.data(), pcm.size()));
+    c.disconnect();
+    ASSERT_TRUE(c.voiceMediaState() == VoiceMediaState::Disconnected);
+    PASS();
+}
+
+// K9: voice events and the STATUS TURN=/VOICE= fields update the snapshot
+// at once, without waiting for the next VOICESTATUS poll.
+TEST(voice_events_and_status_turn_fields) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    int callbacks = 0;
+    c.onVoiceStatus([&](const VoiceStatus&) { ++callbacks; });
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    m.reply("VOICESTATUS", 0,
+            "VOICESTATUS MODE=CONNECTED CODEC=AUTO(2400) STATE=OPEN PTT=OFF GRANTED=OFF "
+            "TXQ=0 RXQ=0 TRANSPORT=M9");
+    ASSERT_TRUE(c.queryVoiceStatus().has_value());
+    m.event("EVT:VOICE CODEC 1300");
+    pump(c, 60);
+    ASSERT_EQ(c.getVoiceStatus().codec, std::string("AUTO(1300)"));
+    m.event("EVT:VOICE BCAST 3F2A");
+    pump(c, 60);
+    ASSERT_TRUE(c.getVoiceStatus().broadcast_rx);
+    ASSERT_EQ(c.getVoiceStatus().broadcast_tag, std::string("3F2A"));
+    m.event("EVT:VOICE BCAST END");
+    pump(c, 60);
+    ASSERT_FALSE(c.getVoiceStatus().broadcast_rx);
+    ASSERT_TRUE(c.getVoiceStatus().broadcast_tag.empty());
+    m.event("EVT:VOICE CLOSED");
+    pump(c, 60);
+    ASSERT_TRUE(c.getVoiceStatus().mode == VoiceMode::Connected);  // a setting, not state
+    ASSERT_TRUE(c.getVoiceStatus().state == VoiceState::Idle);
+
+    m.reply("STATUS", 0,
+            "STATUS STATE=CONNECTED CALL=K1AAA REMOTE=K1BBB FAMILY=WIDE MODE=AUTO(M8) "
+            "NET=1200.0 SNR=3.0 RSNR=- CFO=0.0 RETRY=0.0 BUSY=0 LISTEN=1 COMPRESS=1 "
+            "CRYPTO=0 EPOCH=0 RESUME=1 MASK=0 VOICE=talking TXBUF=0 FOK=1 FFAIL=0 TURN=ISS");
+    ASSERT_TRUE(c.refreshStatus());
+    ModemStatus st = c.getStatus();
+    ASSERT_EQ(st.turn, std::string("ISS"));
+    ASSERT_EQ(st.voice_summary, std::string("talking"));
+    ASSERT_TRUE(st.voice.state == VoiceState::TxActive);
+    m.reply("STATUS", 0, "STATUS STATE=CONNECTED VOICE=bcastrx TURN=-");
+    ASSERT_TRUE(c.refreshStatus());
+    st = c.getStatus();
+    ASSERT_EQ(st.turn, std::string("-"));
+    ASSERT_TRUE(st.voice.broadcast_rx);
+    ASSERT_TRUE(st.voice.state == VoiceState::Idle);
+    ASSERT_TRUE(callbacks >= 5);
+    PASS();
+}
+
+// K23 / K25: VOICECODEC values are validated; MAXMODE and CWID answers are
+// kept in the status snapshot.
+TEST(voice_codec_and_mode_settings) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    ASSERT_EQ(normalizeVoiceCodec("700c"), std::string("700C"));
+    ASSERT_EQ(normalizeVoiceCodec(" auto "), std::string("AUTO"));
+    ASSERT_TRUE(normalizeVoiceCodec("1600").empty());
+    ASSERT_FALSE(c.setVoiceCodec("1600"));
+    m.reply("VOICECODEC", 0, "VOICECODEC 3200");
+    ASSERT_TRUE(c.setVoiceCodec("3200"));
+    m.reply("MAXMODE", 0, "MAXMODE M10");
+    m.reply("CWID", 0, "CWID ON");
+    c.requestModeSettings();
+    pump(c, 100);
+    ModemStatus st = c.getStatus();
+    ASSERT_EQ(st.max_mode, std::string("M10"));
+    ASSERT_TRUE(st.cw_id_known);
+    ASSERT_TRUE(st.cw_id);
+    auto cmds = m.commands();
+    ASSERT_EQ(cmds[0], std::string("VOICECODEC 3200"));
+    ASSERT_EQ(cmds[1], std::string("MAXMODE"));
+    ASSERT_EQ(cmds[2], std::string("CWID"));
     PASS();
 }
 

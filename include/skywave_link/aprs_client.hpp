@@ -60,6 +60,8 @@ enum class APRSConnectProgress { None, InProgress, Connected, Failed };
 
 // Callback types
 using PositionCallback = std::function<void(const APRSPosition& pos)>;
+// An APRS message addressed to this station (acks/rejects are consumed;
+// a numbered message has already been acknowledged when this runs).
 using MessageCallback = std::function<void(const std::string& from, const std::string& message)>;
 using APRSStateCallback = std::function<void(APRSState state)>;
 
@@ -102,16 +104,18 @@ public:
     // Polling (call from main loop)
     void poll();
 
-    // Position reporting
+    // Position reporting. 0,0 (or an invalid coordinate) means "no fix":
+    // nothing is beaconed and the default filter has no range part. While
+    // connected with the default filter, a position change that alters the
+    // filter text sends `#filter`.
     void setMyPosition(double lat, double lon, double alt_m = 0.0);
-    void setMyCourse(double speed_kmh, double course_deg);
+    bool hasMyPosition() const { return has_position_; }
     void setMyComment(const std::string& comment);
     void setMySymbol(APRSSymbol symbol);
     void setMySymbol(char table, char symbol);
 
     // Beaconing
     void setBeaconInterval(int seconds);
-    int getBeaconInterval() const { return beacon_interval_; }
     bool sendPositionNow();
     void enableBeaconing(bool enabled);
     bool isBeaconingEnabled() const { return beacon_enabled_; }
@@ -120,12 +124,22 @@ public:
     bool sendPositionFor(const std::string& callsign, double lat, double lon,
                          const std::string& grid = "", const std::string& comment = "");
 
-    // Queries
-    void requestPosition(const std::string& callsign);
-    void sendMessage(const std::string& to_callsign, const std::string& message);
+    // Queries: a directed `?APRSP` query (APRS 1.01 ch. 15), sent as a
+    // message to `callsign`; its position comes back as a normal report.
+    bool requestPosition(const std::string& callsign);
+    // A numbered APRS message ("{n" suffix, so the recipient acks it).
+    bool sendMessage(const std::string& to_callsign, const std::string& message);
 
-    // Filter configuration
-    void setFilter(const std::string& filter);  // e.g., "r/lat/lon/range"
+    // Server-side filter. Without one, port 14580 sends nothing at all.
+    // `filter` empty: defaultFilter() for this station. Applies to the next
+    // login; while connected it is also sent at once as `#filter`.
+    void setFilter(const std::string& filter);
+    void setFilterRangeKm(int km);
+    // The filter in effect for the current position / settings.
+    std::string effectiveFilter() const;
+    // `r/<lat>/<lon>/<km> b/<CALL>`, or `b/<CALL>` without a position.
+    static std::string defaultFilter(const std::string& callsign, bool has_position,
+                                     double lat, double lon, int range_km);
 
     // Callbacks
     void onPositionReceived(PositionCallback cb) { position_callback_ = std::move(cb); }
@@ -134,6 +148,24 @@ public:
 
     // APRS passcode calculation (for registration)
     static int32_t calculatePasscode(const std::string& callsign);
+    // The configured passcode when set, else the one computed for the
+    // callsign (the single place both settings and login derive it);
+    // "-1" (receive-only) without a callsign.
+    static std::string effectivePasscode(const std::string& configured,
+                                         const std::string& callsign);
+    // The text of an APRS message line addressed to `my_callsign`
+    // (`FROM>PATH::ADDRESSEE:text{id`): from, text and message id ("" when
+    // unnumbered). Nullopt for anything else, including acks/rejects.
+    struct ParsedMessage {
+        std::string from;
+        std::string text;
+        std::string id;
+    };
+    static std::optional<ParsedMessage> parseMessageFor(const std::string& line,
+                                                        const std::string& my_callsign);
+    // Position report parser (uncompressed `!`, `=`, `/`, `@` formats);
+    // nullopt for anything that is not one.
+    static std::optional<APRSPosition> parsePositionReport(const std::string& line);
 
     // Format helpers
     static std::string formatLatitude(double lat);   // DDMM.hhN
@@ -163,6 +195,13 @@ private:
     std::string my_callsign_;
     APRSPosition my_position_;
 
+    bool has_position_ = false;
+    std::string filter_;          // explicit filter; empty = default
+    int filter_range_km_ = 100;
+    std::string sent_filter_;     // filter the server has (login or #filter)
+    int message_seq_ = 0;
+    void refreshServerFilter();
+
     // Beacon configuration
     int beacon_interval_ = 900;  // 15 minutes default
     bool beacon_enabled_ = false;
@@ -190,10 +229,10 @@ private:
     // Sends the login line and checks the server's answer (2 s). Returns
     // 1 when logged in, 0 when refused/invalid, -1 when the server closed.
     static int loginOnSocket(socket_t sock, const std::string& callsign,
-                             const std::string& passcode, std::string* error);
+                             const std::string& passcode, const std::string& filter,
+                             std::string* error);
     bool sendPacket(const std::string& packet);
     void processLine(const std::string& line);
-    APRSPosition parsePosition(const std::string& packet);
     void checkBeaconTimer();
 };
 

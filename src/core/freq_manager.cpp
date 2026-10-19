@@ -2,9 +2,7 @@
 
 #include "skywave_link/freq_manager.hpp"
 #include "skywave_link/radio_controller.hpp"
-#include "skywave_link/modem_client.hpp"
 #include <iostream>
-#include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <chrono>
@@ -179,9 +177,12 @@ int FrequencyManager::frequencyToSlot(const std::string& band, uint64_t freq_hz)
     }
 
     const auto& config = it->second;
-    int64_t offset = static_cast<int64_t>(freq_hz) - static_cast<int64_t>(config.calling_freq_hz);
-    int slot = static_cast<int>(offset / static_cast<int64_t>(config.slot_spacing_hz));
-    int half_slots = config.num_slots / 2;
+    const double offset = static_cast<double>(static_cast<int64_t>(freq_hz) -
+                                              static_cast<int64_t>(config.calling_freq_hz));
+    // Nearest slot (truncation put 7.0549 MHz, just below 40 m calling, on 0
+    // but 7.0551 on 0 too, and -749 Hz on -1 only by luck).
+    const int slot = static_cast<int>(std::lround(offset / static_cast<double>(config.slot_spacing_hz)));
+    const int half_slots = config.num_slots / 2;
     return std::clamp(slot, -half_slots, half_slots);
 }
 
@@ -216,49 +217,105 @@ std::optional<WorkingSlot> FrequencyManager::getSlot(const std::string& band, in
     return std::nullopt;
 }
 
+namespace {
+int64_t unixNow() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
+WorkingSlot* FrequencyManager::findSlot(const std::string& band, int slot) {
+    auto it = slots_.find(band);
+    if (it == slots_.end()) return nullptr;
+    for (auto& s : it->second) {
+        if (s.slot_number == slot) return &s;
+    }
+    return nullptr;
+}
+
 void FrequencyManager::updateSlotStatus(const std::string& band, int slot, SlotStatus status,
                                          const std::string& occupant) {
-    auto it = slots_.find(band);
-    if (it == slots_.end()) {
-        return;
-    }
-
-    for (auto& s : it->second) {
-        if (s.slot_number == slot) {
-            s.status = status;
-            s.occupant = occupant;
-            s.last_checked = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            break;
-        }
-    }
+    updateSlotStatus(band, slot, status, occupant, unixNow());
 }
 
-int FrequencyManager::findAvailableSlot(const std::string& band) const {
-    auto it = slots_.find(band);
-    if (it == slots_.end()) {
-        return 1;  // Default to slot 1
-    }
-
-    // Prefer slots away from the calling frequency
-    // Check positive slots first, then negative
-    for (int distance = 1; distance <= 6; ++distance) {
-        for (const auto& s : it->second) {
-            if (std::abs(s.slot_number) == distance &&
-                s.status == SlotStatus::Available) {
-                return s.slot_number;
-            }
-        }
-    }
-
-    // If no available slots found, return slot 1 (assume it's available)
-    return 1;
+void FrequencyManager::updateSlotStatus(const std::string& band, int slot, SlotStatus status,
+                                         const std::string& occupant, int64_t now_unix) {
+    WorkingSlot* s = findSlot(band, slot);
+    if (!s) return;
+    s->status = status;
+    s->occupant = occupant;
+    s->last_checked = now_unix;
+    if (status == SlotStatus::InUse) s->last_busy = now_unix;
 }
 
-int FrequencyManager::findBestSlot(const std::string& band) const {
-    // For now, same as findAvailableSlot
-    // Could be enhanced to consider propagation, QRM, etc.
-    return findAvailableSlot(band);
+bool FrequencyManager::noteActivity(uint64_t freq_hz, const std::string& occupant,
+                                    int64_t now_unix) {
+    const auto band = frequencyToBand(freq_hz);
+    if (!band) return false;
+    const auto& cfg = bands_.at(*band);
+    const int slot = frequencyToSlot(*band, freq_hz);
+    const uint64_t slot_freq = getSlotFrequency(*band, slot);
+    const uint64_t diff = slot_freq > freq_hz ? slot_freq - freq_hz : freq_hz - slot_freq;
+    if (slot_freq == 0 || diff * 2 >= cfg.slot_spacing_hz) return false;
+    updateSlotStatus(*band, slot, SlotStatus::InUse, occupant, now_unix);
+    return true;
+}
+
+BestSlotChoice FrequencyManager::chooseBestSlot(const std::string& band) const {
+    return chooseBestSlot(band, unixNow());
+}
+
+BestSlotChoice FrequencyManager::chooseBestSlot(const std::string& band, int64_t now_unix) const {
+    BestSlotChoice choice;
+    auto it = slots_.find(band);
+    if (it == slots_.end()) {
+        choice.reason = "Unknown band " + band;
+        return choice;
+    }
+
+    // Rank: 0 known clear, 1 unknown (or stale), 2 busy recently.
+    struct Candidate {
+        int rank;
+        int64_t last_busy;
+        int slot;
+    };
+    std::vector<Candidate> candidates;
+    for (const auto& s : it->second) {
+        if (s.slot_number == 0) continue;  // the calling frequency is not a working slot
+        const bool fresh = s.last_checked > 0 && now_unix - s.last_checked <= kSlotFreshSec;
+        int rank = 1;
+        if (fresh && (s.status == SlotStatus::Available || s.status == SlotStatus::MySlot)) {
+            rank = 0;
+        } else if (fresh && s.status == SlotStatus::InUse) {
+            rank = 2;
+        }
+        candidates.push_back({rank, s.last_busy, s.slot_number});
+    }
+    if (candidates.empty()) {
+        choice.reason = "Band " + band + " has no working slots";
+        return choice;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.rank != b.rank) return a.rank < b.rank;
+        if (a.last_busy != b.last_busy) return a.last_busy < b.last_busy;  // never busy first
+        if (std::abs(a.slot) != std::abs(b.slot)) return std::abs(a.slot) < std::abs(b.slot);
+        return a.slot > b.slot;  // +n before -n
+    });
+    const Candidate& best = candidates.front();
+    choice.slot = best.slot;
+    choice.known_clear = (best.rank == 0);
+    choice.all_busy = (best.rank == 2);
+    const std::string label = (best.slot > 0 ? "+" : "") + std::to_string(best.slot);
+    if (best.rank == 0) {
+        choice.reason = "Slot " + label + " was clear when last checked";
+    } else if (best.rank == 1) {
+        choice.reason = "No recent data for slot " + label +
+                        " - run the channel sniffer to check the band";
+    } else {
+        choice.reason = "Every slot was busy recently; slot " + label +
+                        " was busy least recently";
+    }
+    return choice;
 }
 
 bool FrequencyManager::gridSquareToLatLon(const std::string& grid, double& lat, double& lon) {
@@ -471,110 +528,81 @@ std::optional<std::pair<std::string, int>> FrequencyManager::decodeSlotId(const 
     }
 }
 
-void FrequencyManager::startSlotScan(const std::string& band) {
-    scanning_ = true;
-    scanning_band_ = band;
-
-    // Reset all slots to Unknown
+SlotScanStep FrequencyManager::beginSlotScan(const std::string& band,
+                                             uint64_t return_frequency_hz,
+                                             std::chrono::steady_clock::time_point now,
+                                             std::chrono::milliseconds dwell,
+                                             std::chrono::milliseconds settle) {
+    SlotScanStep step;
     auto it = slots_.find(band);
-    if (it != slots_.end()) {
-        for (auto& s : it->second) {
-            s.status = SlotStatus::Unknown;
-            s.occupant.clear();
-        }
+    if (it == slots_.end() || it->second.empty()) {
+        scan_ = ScanState{};
+        return step;
     }
-
+    scan_ = ScanState{};
+    scan_.active = true;
+    scan_.band = band;
+    scan_.index = 0;
+    scan_.return_frequency_hz = return_frequency_hz;
+    scan_.dwell = std::max(dwell, std::chrono::milliseconds(1));
+    scan_.settle = std::clamp(settle, std::chrono::milliseconds(0), scan_.dwell);
+    scan_.slot_started = now;
+    step.action = SlotScanStep::Action::Tune;
+    step.slot = it->second[0].slot_number;
+    step.frequency_hz = it->second[0].frequency_hz;
+    return step;
 }
 
-void FrequencyManager::stopSlotScan() {
-    scanning_ = false;
-    scanning_band_.clear();
+SlotScanStep FrequencyManager::updateSlotScan(bool busy_now,
+                                              std::chrono::steady_clock::time_point now,
+                                              int64_t now_unix) {
+    SlotScanStep step;
+    if (!scan_.active) return step;
+    auto it = slots_.find(scan_.band);
+    if (it == slots_.end() || scan_.index >= it->second.size()) {
+        scan_ = ScanState{};
+        return step;
+    }
+    const auto elapsed = now - scan_.slot_started;
+    if (elapsed >= scan_.settle) {
+        ++scan_.samples;
+        scan_.busy = scan_.busy || busy_now;
+    }
+    if (elapsed < scan_.dwell) return step;  // keep listening
+
+    WorkingSlot& slot = it->second[scan_.index];
+    if (scan_.samples > 0) {
+        updateSlotStatus(scan_.band, slot.slot_number,
+                         scan_.busy ? SlotStatus::InUse : SlotStatus::Available, "", now_unix);
+    }
+    ++scan_.index;
+    scan_.samples = 0;
+    scan_.busy = false;
+    scan_.slot_started = now;
+    if (scan_.index >= it->second.size()) {
+        step.action = SlotScanStep::Action::Done;
+        step.frequency_hz = scan_.return_frequency_hz;
+        scan_ = ScanState{};
+        return step;
+    }
+    step.action = SlotScanStep::Action::Tune;
+    step.slot = it->second[scan_.index].slot_number;
+    step.frequency_hz = it->second[scan_.index].frequency_hz;
+    return step;
 }
 
-bool FrequencyManager::saveConfig(const std::string& path) const {
-    std::ofstream file(path);
-    if (!file) {
-        return false;
-    }
-
-    file << "# Skywave Link Frequency Configuration\n\n";
-
-    for (const auto& [name, config] : bands_) {
-        file << "[band." << name << "]\n";
-        file << "enabled = " << (config.enabled ? "true" : "false") << "\n";
-        file << "calling_freq_hz = " << config.calling_freq_hz << "\n";
-        file << "\n";
-    }
-
-    return true;
+std::optional<uint64_t> FrequencyManager::abortSlotScan() {
+    if (!scan_.active) return std::nullopt;
+    const uint64_t back = scan_.return_frequency_hz;
+    scan_ = ScanState{};
+    return back;
 }
 
-bool FrequencyManager::loadConfig(const std::string& path) {
-    std::ifstream file(path);
-    if (!file) {
-        return false;
-    }
-
-    // Simple config parsing
-    std::string line;
-    std::string current_band;
-
-    while (std::getline(file, line)) {
-        // Skip comments and empty lines
-        if (line.empty() || line[0] == '#') continue;
-
-        // Check for section header
-        if (line[0] == '[') {
-            size_t end = line.find(']');
-            if (end != std::string::npos) {
-                std::string section = line.substr(1, end - 1);
-                if (section.rfind("band.", 0) == 0) {
-                    current_band = section.substr(5);
-                }
-            }
-            continue;
-        }
-
-        // Parse key = value
-        size_t eq = line.find('=');
-        if (eq != std::string::npos && !current_band.empty()) {
-            std::string key = line.substr(0, eq);
-            std::string value = line.substr(eq + 1);
-
-            // Trim whitespace
-            key.erase(0, key.find_first_not_of(" \t"));
-            key.erase(key.find_last_not_of(" \t") + 1);
-            value.erase(0, value.find_first_not_of(" \t"));
-            value.erase(value.find_last_not_of(" \t") + 1);
-
-            auto it = bands_.find(current_band);
-            if (it != bands_.end()) {
-                if (key == "enabled") {
-                    it->second.enabled = (value == "true");
-                } else if (key == "calling_freq_hz") {
-                    try {
-                        it->second.calling_freq_hz = std::stoull(value);
-                    } catch (const std::exception& ex) {
-                        std::cerr << "[FreqManager] Invalid calling_freq_hz for band "
-                                  << current_band << ": '" << value << "' (" << ex.what() << ")\n";
-                    }
-                }
-            }
-        }
-    }
-
-    // Regenerate slot frequencies from updated band configs
-    for (const auto& [name, config] : bands_) {
-        auto sit = slots_.find(name);
-        if (sit != slots_.end()) {
-            for (auto& slot : sit->second) {
-                slot.frequency_hz = config.calling_freq_hz +
-                    (slot.slot_number * config.slot_spacing_hz);
-            }
-        }
-    }
-
-    return true;
+int FrequencyManager::scanningSlot() const {
+    if (!scan_.active) return 0;
+    auto it = slots_.find(scan_.band);
+    if (it == slots_.end() || scan_.index >= it->second.size()) return 0;
+    return it->second[scan_.index].slot_number;
 }
 
 } // namespace skylink

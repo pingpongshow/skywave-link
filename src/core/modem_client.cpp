@@ -262,7 +262,48 @@ std::optional<NoiseFloorReading> parseNoiseFloorResponse(
     return reading;
 }
 
+// STATUS `VOICE=off|open|talking|bcastrx` folded into the voice snapshot.
+void applyVoiceSummary(const std::string& summary, VoiceStatus* v) {
+    auto closeVoice = [v]() {
+        v->state = VoiceState::Idle;
+        v->open = v->ready = v->active = v->local = false;
+        v->ptt = v->granted = false;
+    };
+    if (summary == "off") {
+        closeVoice();
+        v->broadcast_rx = false;
+        v->broadcast_tag.clear();
+    } else if (summary == "bcastrx") {
+        closeVoice();
+        v->broadcast_rx = true;
+    } else if (summary == "open") {
+        if (!v->open || v->state == VoiceState::TxActive || v->state == VoiceState::Idle) {
+            if (v->state == VoiceState::Idle || v->state == VoiceState::TxActive) {
+                v->state = VoiceState::Ready;
+            }
+            v->open = true;
+            v->ready = (v->state == VoiceState::Ready);
+            v->active = (v->state == VoiceState::RxActive);
+            v->local = false;
+        }
+    } else if (summary == "talking") {
+        v->state = VoiceState::TxActive;
+        v->open = v->active = v->local = true;
+        v->ready = false;
+    }
+}
+
 } // namespace
+
+std::string normalizeVoiceCodec(const std::string& codec) {
+    const std::string upper = upperCopy(trimCopy(codec));
+    if (upper == "AUTO" || upper == "700C" || upper == "1300" || upper == "2400" ||
+        upper == "3200") {
+        return upper;
+    }
+    if (upper == "700") return "700C";
+    return {};
+}
 
 
 bool ModemClient::sockets_initialized_ = false;
@@ -450,6 +491,15 @@ struct ModemClient::ConnectJob {
     socket_t voice = INVALID_SOCK;
 };
 
+// Background reopen of the voice socket: the TCP connect runs on a helper
+// thread (an unreachable host must never stall poll()).
+struct ModemClient::VoiceJob {
+    std::mutex mu;
+    bool done = false;
+    bool cancelled = false;
+    socket_t sock = INVALID_SOCK;
+};
+
 bool ModemClient::beginConnect(const std::string& host,
                                uint16_t cmd_port,
                                uint16_t data_port,
@@ -570,13 +620,28 @@ void ModemClient::resetSessionState() {
     }
     voice_tx_sequence_ = 0;
     voice_tx_sample_counter_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(voice_tx_mutex_);
+        voice_tx_pending_.clear();
+    }
+    voice_retry_at_ = std::chrono::steady_clock::now() + voice_reconnect_interval_;
 }
 
 void ModemClient::disconnect() {
     cancelConnect();
+    if (voice_job_) {
+        std::lock_guard<std::mutex> lock(voice_job_->mu);
+        voice_job_->cancelled = true;
+        closeSocket(voice_job_->sock);
+    }
+    voice_job_.reset();
     closeSocket(cmd_socket_);
     closeSocket(data_socket_);
     closeSocket(voice_socket_);
+    {
+        std::lock_guard<std::mutex> lock(voice_tx_mutex_);
+        voice_tx_pending_.clear();
+    }
 
     {
         std::lock_guard<std::mutex> lock(status_mutex_);
@@ -617,6 +682,66 @@ bool ModemClient::hasVoiceMedia() const {
     return voice_socket_ != INVALID_SOCK;
 }
 
+VoiceMediaState ModemClient::voiceMediaState() const {
+    if (!isConnected()) return VoiceMediaState::Disconnected;
+    return voice_socket_ != INVALID_SOCK ? VoiceMediaState::Connected
+                                         : VoiceMediaState::Reconnecting;
+}
+
+void ModemClient::dropVoiceSocket(const char* why) {
+    if (voice_socket_ == INVALID_SOCK) return;
+    std::cerr << "[ModemClient] voice socket " << why << "; reopening in "
+              << voice_reconnect_interval_.count() << " ms\n";
+    closeSocket(voice_socket_);
+    voice_buffer_.clear();
+    {
+        std::lock_guard<std::mutex> lock(voice_tx_mutex_);
+        voice_tx_pending_.clear();
+    }
+    voice_retry_at_ = std::chrono::steady_clock::now() + voice_reconnect_interval_;
+}
+
+void ModemClient::maybeReopenVoice() {
+    if (voice_socket_ != INVALID_SOCK || !isConnected()) return;
+    if (voice_job_) {
+        std::shared_ptr<VoiceJob> job = voice_job_;
+        std::lock_guard<std::mutex> lock(job->mu);
+        if (!job->done) return;
+        voice_job_.reset();
+        if (job->sock != INVALID_SOCK) {
+            voice_socket_ = job->sock;
+            job->sock = INVALID_SOCK;
+            voice_buffer_.clear();
+            std::cerr << "[ModemClient] voice port " << voice_port_ << " reopened\n";
+        } else {
+            voice_retry_at_ = std::chrono::steady_clock::now() + voice_reconnect_interval_;
+        }
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < voice_retry_at_) return;
+    voice_retry_at_ = now + voice_reconnect_interval_;
+    auto job = std::make_shared<VoiceJob>();
+    const std::string host = host_;
+    const uint16_t port = voice_port_;
+    try {
+        std::thread([job, host, port]() {
+            socket_t sock = INVALID_SOCK;
+            if (!connectSocket(sock, host, port)) sock = INVALID_SOCK;
+            std::lock_guard<std::mutex> lock(job->mu);
+            if (job->cancelled) {
+                closeSocket(sock);
+            } else {
+                job->sock = sock;
+            }
+            job->done = true;
+        }).detach();
+    } catch (const std::exception&) {
+        return;
+    }
+    voice_job_ = job;
+}
+
 void ModemClient::poll() {
     if (!isConnected()) return;
 
@@ -640,7 +765,16 @@ void ModemClient::poll() {
         } guard(in_data_read_);
         readDataSocket();
     }
+    if (isConnected() && voice_socket_ != INVALID_SOCK) {
+        bool ok;
+        {
+            std::lock_guard<std::mutex> lock(voice_tx_mutex_);
+            ok = flushVoiceLocked();
+        }
+        if (!ok) dropVoiceSocket("send error");
+    }
     if (isConnected() && voice_socket_ != INVALID_SOCK) readVoiceSocket();
+    if (isConnected()) maybeReopenVoice();
 }
 
 void ModemClient::readCommandSocket() {
@@ -840,8 +974,7 @@ void ModemClient::readVoiceSocket() {
     int n = recv(voice_socket_, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
     if (n == SOCKET_ERROR) {
         if (WSAGetLastError() != WSAEWOULDBLOCK) {
-            std::cerr << "[ModemClient] Voice socket error\n";
-            closeSocket(voice_socket_);
+            dropVoiceSocket("error");
         }
         return;
     }
@@ -849,8 +982,7 @@ void ModemClient::readVoiceSocket() {
     ssize_t n = recv(voice_socket_, buffer, sizeof(buffer), 0);
     if (n < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            std::cerr << "[ModemClient] Voice socket error\n";
-            closeSocket(voice_socket_);
+            dropVoiceSocket("error");
         }
         return;
     }
@@ -858,9 +990,7 @@ void ModemClient::readVoiceSocket() {
 
     if (n == 0) {
         // Only the media path is gone; the session continues.
-        std::cerr << "[ModemClient] Voice socket closed by remote\n";
-        closeSocket(voice_socket_);
-        voice_buffer_.clear();
+        dropVoiceSocket("closed by the modem");
         return;
     }
 
@@ -905,8 +1035,8 @@ void ModemClient::applyStatusLine(const std::string& fields) {
         snapshot = status_;
     }
 
-    float snr_before = snapshot.snr_db;
     std::string state_name;
+    std::string voice_summary;
 
     for (const auto& [key, value] : splitFields(fields)) {
         if (key == "STATE") {
@@ -956,6 +1086,16 @@ void ModemClient::applyStatusLine(const std::string& fields) {
             snapshot.frames_ok = static_cast<uint64_t>(parseIntOr(value, 0));
         } else if (key == "FFAIL") {
             snapshot.frames_failed = static_cast<uint64_t>(parseIntOr(value, 0));
+        } else if (key == "TURN") {
+            const std::string turn = upperCopy(value);
+            snapshot.turn = (turn == "ISS" || turn == "IRS") ? turn : std::string("-");
+        } else if (key == "VOICE") {
+            std::string summary = value;
+            for (char& ch : summary) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            snapshot.voice_summary = summary;
+            voice_summary = summary;
         }
     }
 
@@ -976,10 +1116,20 @@ void ModemClient::applyStatusLine(const std::string& fields) {
     }
     onLinkStateChanged(previous, snapshot.link_state);
 
-    // EVT:SNR reports changes while connected; STATUS keeps the value
-    // current otherwise (and after a missed event).
-    if (snr_callback_ && snapshot.snr_db != snr_before) {
-        snr_callback_(snapshot.snr_db);
+    // VOICE= is a summary only; it repairs a missed EVT:VOICE transition.
+    if (!voice_summary.empty()) {
+        VoiceStatus voice;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            voice = status_.voice;
+            const VoiceStatus before = voice;
+            applyVoiceSummary(voice_summary, &voice);
+            changed = voice.state != before.state || voice.open != before.open ||
+                      voice.broadcast_rx != before.broadcast_rx;
+            status_.voice = voice;
+        }
+        if (changed && voice_callback_) voice_callback_(voice);
     }
 }
 
@@ -1010,9 +1160,6 @@ void ModemClient::dispatchMonitorFrame(MonitorFrame frame,
             if (auto b = parseSkywaveBeacon(parsed->body)) {
                 frame.src_callsign = b->callsign;
                 frame.dst_callsign = "*";
-                if (frame.family.empty() || frame.family == "?") {
-                    frame.family = skywaveFamilyName(b->family);
-                }
             }
             break;
         default:
@@ -1028,7 +1175,7 @@ void ModemClient::dispatchMonitorFrame(MonitorFrame frame,
 }
 
 // `MON:<src>:<dst|*>:<frame_type>:<family>:<Mx>:<hex_payload>`
-// The hex payload is the raw link frame, capped at 64 bytes by the modem.
+// The hex payload is the whole raw link frame (envelope + body + CRC).
 void ModemClient::handleMonitorLine(const std::string& body) {
     auto line = parseSkywaveMonitorLine(body);
     if (!line) return;
@@ -1130,7 +1277,6 @@ void ModemClient::handleEventLine(const std::string& body) {
                     status_.remote_snr_valid ? parseFloatOr(remote, 0.0f) : 0.0f;
             }
         }
-        if (snr_callback_) snr_callback_(snr);
     } else if (name == "BUSY") {
         std::lock_guard<std::mutex> lock(status_mutex_);
         status_.busy_detected = parseBoolToken(args);
@@ -1162,20 +1308,51 @@ void ModemClient::handleEventLine(const std::string& body) {
             std::lock_guard<std::mutex> lock(status_mutex_);
             snapshot = status_.voice;
         }
-        snapshot.last_event = upperCopy(args);
-        if (snapshot.last_event == "OPEN") {
+        const std::string upper_args = upperCopy(args);
+        std::istringstream tokens(upper_args);
+        std::string first, second;
+        tokens >> first >> second;
+        snapshot.last_event = upper_args;
+        if (first == "CODEC") {
+            // `EVT:VOICE CODEC <700C|1300|2400|3200>`: the codec stepped
+            // mid-talkspurt. Keep the AUTO(...) form when AUTO chose it.
+            if (!second.empty()) {
+                snapshot.codec = startsWith(snapshot.codec, "AUTO")
+                                     ? "AUTO(" + second + ")"
+                                     : second;
+            }
+        } else if (first == "BCAST") {
+            // `EVT:VOICE BCAST <tag>` / `EVT:VOICE BCAST END`.
+            if (second == "END" || second.empty()) {
+                snapshot.broadcast_rx = false;
+                snapshot.broadcast_tag.clear();
+            } else {
+                snapshot.broadcast_rx = true;
+                snapshot.broadcast_tag = second;
+            }
+        } else if (snapshot.last_event == "OPEN") {
             snapshot.open = true;
             snapshot.ready = true;
             snapshot.state = VoiceState::Ready;
         } else if (snapshot.last_event == "CLOSED") {
-            snapshot = VoiceStatus{};
-            snapshot.last_event = "CLOSED";
+            // The voice service closed; the configured mode, the codec and
+            // a broadcast still playing out are not part of it.
+            VoiceStatus closed;
+            closed.mode = snapshot.mode;
+            closed.broadcast = snapshot.broadcast;
+            closed.codec = snapshot.codec;
+            closed.broadcast_rx = snapshot.broadcast_rx;
+            closed.broadcast_tag = snapshot.broadcast_tag;
+            closed.last_event = "CLOSED";
+            snapshot = closed;
         } else if (snapshot.last_event == "TALKING") {
             snapshot.state = VoiceState::TxActive;
             snapshot.active = true;
+            snapshot.local = true;
         } else if (snapshot.last_event == "STOPPED") {
             snapshot.state = snapshot.open ? VoiceState::Ready : VoiceState::Idle;
             snapshot.active = false;
+            snapshot.local = false;
         }
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
@@ -1242,6 +1419,7 @@ void ModemClient::processCommandResponse(const std::string& line) {
                 snapshot.unit_sec = std::atof(value.c_str());
             }
         }
+        if (!snapshot.broadcast_rx) snapshot.broadcast_tag.clear();
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.voice = snapshot;
@@ -1251,6 +1429,13 @@ void ModemClient::processCommandResponse(const std::string& line) {
 
     if (startsWith(line, "STATUS ")) {
         applyStatusLine(line.substr(7));
+    } else if (startsWith(line, "MAXMODE ")) {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.max_mode = upperCopy(trimCopy(line.substr(8)));
+    } else if (startsWith(line, "CWID ")) {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.cw_id_known = true;
+        status_.cw_id = parseBoolToken(line.substr(5));
     } else if (startsWith(line, "BUFFER ")) {
         std::lock_guard<std::mutex> lock(status_mutex_);
         status_.tx_buffer_bytes = static_cast<size_t>(parseIntOr(trimCopy(line.substr(7)), 0));
@@ -1304,11 +1489,8 @@ void ModemClient::onLinkStateChanged(LinkState previous, LinkState next) {
 }
 
 bool ModemClient::sendCommand(const std::string& cmd) {
-    if (!nonblocking_commands_) {
-        return writeCommandLine(cmd);
-    }
-    // Fire-and-forget, but still tracked so its reply (or `ERROR:`) is not
-    // mistaken for the answer to a later non-blocking command.
+    // Fire-and-forget, but always tracked so its reply (or `ERROR:`) is not
+    // mistaken for the answer to a later command.
     if (!writeCommandLine(cmd)) return false;
     trackAsyncCommand(cmd, {}, 3000, /*silent=*/true);
     return true;
@@ -1389,8 +1571,11 @@ void ModemClient::trackAsyncCommand(const std::string& cmd, CommandResultCallbac
 }
 
 // The modem answers control commands in order, so a reply belongs to the
-// oldest pending async command with that verb; older ones got no reply.
-// `ERROR:` carries no verb and is taken as the oldest command's answer.
+// oldest pending command with that verb; older ones got no reply. `ERROR:`
+// carries no verb and is taken as the oldest command's answer. Every command
+// is tracked (sendCommand, sendCommandAsync and the blocking queries alike),
+// so that ordering holds. A timed-out command stays queued for
+// kLateReplyGrace and silently absorbs its late reply.
 bool ModemClient::takeAsyncReply(const std::string& line) {
     if (async_commands_.empty()) return false;
     size_t match = async_commands_.size();
@@ -1412,9 +1597,11 @@ bool ModemClient::takeAsyncReply(const std::string& line) {
     async_commands_.erase(async_commands_.begin(), async_commands_.begin() + match + 1);
 
     for (auto& p : skipped) {
+        if (p.expired) continue;  // already reported
         if (!p.silent) std::cerr << "[ModemClient] '" << p.cmd << "' -> no reply\n";
         if (p.cb) p.cb(false, "");
     }
+    if (answered.expired) return true;  // a late reply, absorbed
     const bool ok = !startsWith(line, "ERROR:");
     if (!ok && !answered.silent) {
         std::cerr << "[ModemClient] '" << answered.cmd << "' -> " << line << "\n";
@@ -1425,20 +1612,43 @@ bool ModemClient::takeAsyncReply(const std::string& line) {
 
 void ModemClient::expireAsyncCommands() {
     const auto now = std::chrono::steady_clock::now();
-    while (!async_commands_.empty() && async_commands_.front().deadline <= now) {
-        PendingCommand expired = std::move(async_commands_.front());
-        async_commands_.pop_front();
-        if (!expired.silent) {
-            std::cerr << "[ModemClient] '" << expired.cmd << "' -> no reply (timeout)\n";
-        }
-        if (expired.cb) expired.cb(false, "");
+    std::vector<PendingCommand> timed_out;
+    for (auto& p : async_commands_) {
+        if (p.expired || p.deadline > now) continue;
+        p.expired = true;
+        p.discard_at = now + kLateReplyGrace;
+        PendingCommand report;
+        report.cmd = p.cmd;
+        report.silent = p.silent;
+        report.cb = std::move(p.cb);
+        p.cb = {};
+        timed_out.push_back(std::move(report));
     }
+    async_commands_.erase(
+        std::remove_if(async_commands_.begin(), async_commands_.end(),
+                       [now](const PendingCommand& p) {
+                           return p.expired && p.discard_at <= now;
+                       }),
+        async_commands_.end());
+    // Callbacks last: they may send (and so queue) new commands.
+    for (auto& p : timed_out) {
+        if (!p.silent) {
+            std::cerr << "[ModemClient] '" << p.cmd << "' -> no reply (timeout)\n";
+        }
+        if (p.cb) p.cb(false, "");
+    }
+}
+
+size_t ModemClient::pendingAsyncCommands() const {
+    return static_cast<size_t>(std::count_if(async_commands_.begin(), async_commands_.end(),
+                                             [](const PendingCommand& p) { return !p.expired; }));
 }
 
 void ModemClient::failAsyncCommands(const char* reason) {
     std::deque<PendingCommand> failed;
     failed.swap(async_commands_);
     for (auto& p : failed) {
+        if (p.expired) continue;
         if (reason && *reason && !p.silent) {
             std::cerr << "[ModemClient] '" << p.cmd << "' -> " << reason << "\n";
         }
@@ -1446,38 +1656,39 @@ void ModemClient::failAsyncCommands(const char* reason) {
     }
 }
 
-// Responses carry no id, so correlation is by position plus verb: stale
-// answers (to fire-and-forget commands or an earlier command that timed out)
-// are dropped before sending, and any line that arrives while waiting is
-// accepted only if it echoes this command's verb or is an ERROR:.
+// A blocking query: tracked like every other command (so a pending async
+// command cannot steal its answer, or it theirs), then the socket is pumped
+// until the reply arrives or `timeout_ms` passes.
 std::optional<std::string> ModemClient::sendCommandForResponse(const std::string& cmd,
                                                                int timeout_ms) {
-    const std::string trimmed = trimCopy(cmd);
-    const std::string verb = upperCopy(trimmed.substr(0, trimmed.find(' ')));
-
-    clearResponseQueue();
     if (!writeCommandLine(cmd)) {
         return std::nullopt;
     }
+    struct Result {
+        bool done = false;
+        std::string line;
+    };
+    auto result = std::make_shared<Result>();
+    trackAsyncCommand(cmd, [result](bool, const std::string& response) {
+        result->done = true;
+        result->line = response;
+    }, std::max(timeout_ms, 1), /*silent=*/true);
 
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (true) {
-        const auto now = std::chrono::steady_clock::now();
-        const int remaining = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
-        if (remaining <= 0) {
-            return std::nullopt;
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(timeout_ms, 1));
+    while (!result->done && isConnected()) {
+        poll();
+        if (result->done) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            expireAsyncCommands();
+            break;
         }
-        auto response = getResponse(remaining);
-        if (!response) {
-            return std::nullopt;
-        }
-        if (responseMatchesVerb(*response, verb)) {
-            return response;
-        }
-        // Late answer to some other command: discard and keep waiting.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    if (!result->done || result->line.empty()) {
+        return std::nullopt;
+    }
+    return result->line;
 }
 
 bool ModemClient::responseMatchesVerb(const std::string& response, const std::string& verb) {
@@ -1575,20 +1786,6 @@ bool ModemClient::abort() {
     return sendCommandOk("ABORT");
 }
 
-bool ModemClient::setCompression(bool enabled) {
-    // Skywave negotiates zstd through the capability bitmap at connect time
-    // (PROTOCOL.md); there is no runtime toggle on the control port. The
-    // negotiated result is reported by STATUS as COMPRESS.
-    static bool warned = false;
-    if (!warned) {
-        std::cerr << "[ModemClient] compression is negotiated per session by "
-                     "the modem; STATUS reports the result\n";
-        warned = true;
-    }
-    (void)enabled;
-    return true;
-}
-
 bool ModemClient::setListenMode(bool enabled) {
     return sendCommandOk(std::string("LISTEN ") + (enabled ? "ON" : "OFF"));
 }
@@ -1615,8 +1812,29 @@ bool ModemClient::sendCq(CommandResultCallback cb) {
     return sendCommandOk("CQ", 500, std::move(cb));
 }
 
-bool ModemClient::setCwId(bool enabled) {
-    return sendCommandOk(std::string("CWID ") + (enabled ? "ON" : "OFF"));
+bool ModemClient::setCwId(bool enabled, CommandResultCallback cb) {
+    return sendCommandOk(std::string("CWID ") + (enabled ? "ON" : "OFF"), 500, std::move(cb));
+}
+
+bool ModemClient::usePttServer(const std::string& host, uint16_t port, CommandResultCallback cb) {
+    const std::string h = trimCopy(host);
+    if (!isConnected() || port == 0 || h.empty() ||
+        h.find_first_of(" \t\r\n") != std::string::npos) {
+        if (cb) cb(false, isConnected() ? "ERROR:BADARG" : "");
+        return false;
+    }
+    // An IPv6 literal needs brackets to carry a port.
+    const std::string endpoint =
+        (h.find(':') != std::string::npos && h.front() != '[')
+            ? "[" + h + "]:" + std::to_string(port)
+            : h + ":" + std::to_string(port);
+    sendCommandChain({"PTTMETHOD TCP", "PTTPORT " + endpoint}, std::move(cb));
+    return true;
+}
+
+void ModemClient::setPttActive(bool active) {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    status_.ptt_active = active;
 }
 
 // --- waveform / ladder control ---------------------------------------------
@@ -1644,30 +1862,22 @@ bool ModemClient::setFamily(const std::string& family, CommandResultCallback cb)
     return true;
 }
 
-bool ModemClient::setMode(const std::string& mode) {
-    return sendCommandOk("MODE " + upperCopy(trimCopy(mode)));
+bool ModemClient::setMode(const std::string& mode, CommandResultCallback cb) {
+    return sendCommandOk("MODE " + upperCopy(trimCopy(mode)), 500, std::move(cb));
 }
 
-bool ModemClient::setMaxMode(const std::string& mode) {
-    return sendCommandOk("MAXMODE " + upperCopy(trimCopy(mode)));
+bool ModemClient::setMaxMode(const std::string& mode, CommandResultCallback cb) {
+    return sendCommandOk("MAXMODE " + upperCopy(trimCopy(mode)), 500, std::move(cb));
 }
 
 bool ModemClient::setCpMode(const std::string& cp) {
     return sendCommandOk("CPMODE " + upperCopy(trimCopy(cp)));
 }
 
-bool ModemClient::setHarq(const std::string& harq) {
-    return sendCommandOk("HARQ " + upperCopy(trimCopy(harq)));
-}
-
-bool ModemClient::setAutoMode(bool enabled) {
-    if (enabled) {
-        return setMode("AUTO");
-    }
-    // Pinning without a target means "hold what the ladder reached".
-    ModemStatus snapshot = getStatus();
-    const int index = snapshot.mode_index > 0 ? snapshot.mode_index : 4;
-    return setMode("M" + std::to_string(index));
+void ModemClient::requestModeSettings() {
+    // Answers are folded into status_ by processCommandResponse().
+    sendCommand("MAXMODE");
+    sendCommand("CWID");
 }
 
 bool ModemClient::sendData(const std::vector<uint8_t>& message) {
@@ -1788,11 +1998,6 @@ bool ModemClient::sendText(const std::string& text) {
     return sendData(data);
 }
 
-std::optional<std::vector<uint8_t>> ModemClient::receiveData() {
-    // Data is delivered via callback, not polling
-    return std::nullopt;
-}
-
 int64_t ModemClient::millisSinceLastDataSend() const {
     int64_t last_ms = last_data_send_ms_.load(std::memory_order_relaxed);
     if (last_ms <= 0) {
@@ -1817,11 +2022,6 @@ std::string ModemClient::getVersion() {
         return "";
     }
     return *response;
-}
-
-size_t ModemClient::getBufferSize() {
-    std::lock_guard<std::mutex> lock(status_mutex_);
-    return status_.tx_buffer_bytes;
 }
 
 bool ModemClient::refreshStatus(int timeout_ms) {
@@ -1877,8 +2077,13 @@ bool ModemClient::reportDialFrequency(double hz, CommandResultCallback cb) {
 
 // --- voice -----------------------------------------------------------------
 
-bool ModemClient::setVoiceCodec(const std::string& codec) {
-    return sendCommandOk("VOICECODEC " + upperCopy(trimCopy(codec)));
+bool ModemClient::setVoiceCodec(const std::string& codec, CommandResultCallback cb) {
+    const std::string normalized = normalizeVoiceCodec(codec);
+    if (normalized.empty()) {
+        if (cb) cb(false, "ERROR:BADARG");
+        return false;
+    }
+    return sendCommandOk("VOICECODEC " + normalized, 500, std::move(cb));
 }
 
 bool ModemClient::setVoiceMode(VoiceMode mode) {
@@ -1906,64 +2111,85 @@ std::optional<VoiceStatus> ModemClient::queryVoiceStatus() {
 }
 
 bool ModemClient::sendVoicePcm(const int16_t* samples, size_t sample_count) {
-    if (!isConnected() || voice_socket_ == INVALID_SOCK || !samples || sample_count == 0) {
+    if (!isConnected() || voice_socket_ == INVALID_SOCK || !samples || sample_count == 0 ||
+        sample_count * sizeof(int16_t) > 0xFFFFu) {
         return false;
     }
 
-    const uint16_t payload_len =
-        static_cast<uint16_t>(std::min(sample_count * sizeof(int16_t),
-                                       static_cast<size_t>(0xFFFF)));
-    std::vector<uint8_t> frame(kVoiceMediaHeaderLen + payload_len);
-    frame[0] = kVoiceMediaVersion;
-    frame[1] = kVoiceMediaUplinkPcm;
-    storeU16Be(frame.data() + 2, payload_len);
-    storeU32Be(frame.data() + 4, voice_tx_sequence_++);
-    storeU64Be(frame.data() + 8, voice_tx_sample_counter_);
-    std::memcpy(frame.data() + kVoiceMediaHeaderLen, samples, payload_len);
-    voice_tx_sample_counter_ += static_cast<uint64_t>(payload_len / sizeof(int16_t));
+    const size_t payload_len = sample_count * sizeof(int16_t);
+    bool ok = true;
+    {
+        std::lock_guard<std::mutex> lock(voice_tx_mutex_);
+        if (voice_tx_pending_.size() + kVoiceMediaHeaderLen + payload_len > kMaxVoiceBacklogBytes) {
+            return false;  // dropped whole: the stream stays record-aligned
+        }
+        const size_t at = voice_tx_pending_.size();
+        voice_tx_pending_.resize(at + kVoiceMediaHeaderLen + payload_len);
+        uint8_t* rec = voice_tx_pending_.data() + at;
+        rec[0] = kVoiceMediaVersion;
+        rec[1] = kVoiceMediaUplinkPcm;
+        storeU16Be(rec + 2, static_cast<uint16_t>(payload_len));
+        storeU32Be(rec + 4, voice_tx_sequence_++);
+        storeU64Be(rec + 8, voice_tx_sample_counter_);
+        // PCM16LE on the wire.
+        for (size_t i = 0; i < sample_count; ++i) {
+            const uint16_t v = static_cast<uint16_t>(samples[i]);
+            rec[kVoiceMediaHeaderLen + i * 2] = static_cast<uint8_t>(v & 0xFFu);
+            rec[kVoiceMediaHeaderLen + i * 2 + 1] = static_cast<uint8_t>(v >> 8);
+        }
+        voice_tx_sample_counter_ += sample_count;
+        ok = flushVoiceLocked();
+    }
+    if (!ok) {
+        dropVoiceSocket("send error");
+        return false;
+    }
+    return true;
+}
 
+size_t ModemClient::pendingVoiceBytes() const {
+    std::lock_guard<std::mutex> lock(voice_tx_mutex_);
+    return voice_tx_pending_.size();
+}
+
+// Writes what the voice socket takes without blocking; whatever is left
+// (a record's tail included) goes first next time, so records stay whole
+// on the wire. False only on a hard socket error.
+bool ModemClient::flushVoiceLocked() {
     size_t total_sent = 0;
-    int would_block_retries = 0;
-    constexpr int kMaxWouldBlockRetries = 200;
-    while (total_sent < frame.size()) {
+    bool ok = true;
+    while (total_sent < voice_tx_pending_.size() && voice_socket_ != INVALID_SOCK) {
 #ifdef _WIN32
         int sent = send(voice_socket_,
-                        reinterpret_cast<const char*>(frame.data() + total_sent),
-                        static_cast<int>(frame.size() - total_sent),
-                        0);
+                        reinterpret_cast<const char*>(voice_tx_pending_.data() + total_sent),
+                        static_cast<int>(voice_tx_pending_.size() - total_sent), 0);
         if (sent > 0) {
             total_sent += static_cast<size_t>(sent);
-            would_block_retries = 0;
             continue;
         }
-        const int err = WSAGetLastError();
-        if (sent < 0 && err == WSAEWOULDBLOCK) {
-            if (++would_block_retries > kMaxWouldBlockRetries) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
+        if (sent < 0 && WSAGetLastError() == WSAEWOULDBLOCK) break;
+        ok = false;
         break;
 #else
-        ssize_t sent = send(voice_socket_, frame.data() + total_sent, frame.size() - total_sent, 0);
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        ssize_t sent = send(voice_socket_, voice_tx_pending_.data() + total_sent,
+                            voice_tx_pending_.size() - total_sent, flags);
         if (sent > 0) {
             total_sent += static_cast<size_t>(sent);
-            would_block_retries = 0;
             continue;
         }
-        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (++would_block_retries > kMaxWouldBlockRetries) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        ok = false;
         break;
 #endif
     }
-
-    return total_sent == frame.size();
+    voice_tx_pending_.erase(voice_tx_pending_.begin(),
+                            voice_tx_pending_.begin() + static_cast<std::ptrdiff_t>(total_sent));
+    return ok;
 }
 
 std::vector<int16_t> ModemClient::receiveVoicePcm(size_t max_samples) {

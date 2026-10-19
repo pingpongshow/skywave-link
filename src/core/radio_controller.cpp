@@ -44,7 +44,10 @@ using socket_handle_t = int;
 constexpr socket_handle_t kInvalidSocket = -1;
 #endif
 
-constexpr uint16_t kDefaultPttPort = 4533;
+constexpr uint16_t kDefaultPttPort = kDefaultPttServerPort;
+
+constexpr const char* kDryRunError =
+    "no Hamlib rig model selected (model 0): the radio is not controlled";
 
 void closeSocket(socket_handle_t fd) {
 #ifdef _WIN32
@@ -221,7 +224,45 @@ std::string rigError(int rc) {
     return text;
 }
 
+std::string trimLower(const std::string& value) {
+    std::string out = trimCopy(value);
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
 } // namespace
+
+RadioConfig resolveRadioConfig(const RadioConfig& source) {
+    RadioConfig cfg = source;
+    const std::string backend = trimLower(source.backend);
+    if (backend == "hamlib") {
+        cfg.backend = "hamlib";
+        cfg.enabled = true;
+        return cfg;
+    }
+    if (backend == "kenwood_tcp" || backend == "kenwood tcp") {
+        cfg.backend = "kenwood_tcp";
+        cfg.enabled = true;
+        // Hamlib opens host:port as a network port. The model must be a
+        // Kenwood one (the FlexRadio 6000 model used before is not a
+        // Kenwood rig and speaks a different dialect).
+        cfg.hamlib_model = (source.hamlib_model > 0 &&
+                            RIG_BACKEND_NUM(source.hamlib_model) == RIG_KENWOOD)
+                               ? source.hamlib_model
+                               : static_cast<int>(RIG_MODEL_TS890S);
+        const std::string host = trimCopy(source.kenwood_host);
+        cfg.device = host.empty() ? std::string()
+                                  : host + ":" + std::to_string(source.kenwood_port);
+        cfg.baud = 0;
+        return cfg;
+    }
+    cfg.backend = "none";
+    cfg.enabled = false;
+    cfg.hamlib_model = 0;
+    cfg.device.clear();
+    return cfg;
+}
 
 RadioController::RadioController() = default;
 
@@ -246,17 +287,6 @@ bool RadioController::connect() {
 void RadioController::disconnect() {
     std::lock_guard<std::mutex> lock(mutex_);
     disconnectLocked();
-}
-
-bool RadioController::reconnect() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    disconnectLocked();
-    return connectLocked();
-}
-
-bool RadioController::isConfigured() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return config_.enabled;
 }
 
 bool RadioController::isConnected() const {
@@ -303,6 +333,20 @@ bool RadioController::startPttServer() {
     std::lock_guard<std::mutex> lifecycle(ptt_lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     return startPttServerLocked();
+}
+
+void RadioController::onPttRequest(std::function<void(bool keyed)> cb) {
+    std::lock_guard<std::mutex> lock(ptt_callback_mutex_);
+    ptt_request_callback_ = std::move(cb);
+}
+
+void RadioController::notifyPttRequest(bool keyed) {
+    std::function<void(bool)> cb;
+    {
+        std::lock_guard<std::mutex> lock(ptt_callback_mutex_);
+        cb = ptt_request_callback_;
+    }
+    if (cb) cb(keyed);
 }
 
 void RadioController::stopPttServer() {
@@ -352,13 +396,18 @@ bool RadioController::connectLocked() {
     }
 
     if (config_.hamlib_model <= 0) {
+        // "Connected" to nothing: kept so the status shows the dry run, but
+        // every control request below fails with kDryRunError.
         dry_run_ = true;
         connected_ = true;
         ptt_on_ = false;
-        last_error_.clear();
+        last_error_ = kDryRunError;
         return true;
     }
 
+    // Hamlib traces every call at its default level; keep errors only.
+    static std::once_flag hamlib_debug_once;
+    std::call_once(hamlib_debug_once, []() { rig_set_debug(RIG_DEBUG_ERR); });
     rig_load_all_backends();
     rig_handle_t rig = rig_init(config_.hamlib_model);
     if (!rig) {
@@ -427,8 +476,8 @@ bool RadioController::setFrequencyLocked(uint64_t hz) {
     }
 
     if (dry_run_) {
-        frequency_hz_ = hz;
-        return true;
+        setErrorLocked(kDryRunError);
+        return false;
     }
 
     rig_handle_t rig = static_cast<rig_handle_t>(rig_);
@@ -449,7 +498,8 @@ std::optional<uint64_t> RadioController::getFrequencyLocked() {
     }
 
     if (dry_run_) {
-        return frequency_hz_;
+        setErrorLocked(kDryRunError);
+        return std::nullopt;
     }
 
     rig_handle_t rig = static_cast<rig_handle_t>(rig_);
@@ -477,8 +527,8 @@ bool RadioController::setModeLocked(const std::string& mode_name) {
     }
 
     if (dry_run_) {
-        mode_ = normalized;
-        return true;
+        setErrorLocked(kDryRunError);
+        return false;
     }
 
     rmode_t mode = RIG_MODE_NONE;
@@ -505,7 +555,8 @@ std::optional<std::string> RadioController::getModeLocked() {
     }
 
     if (dry_run_) {
-        return mode_;
+        setErrorLocked(kDryRunError);
+        return std::nullopt;
     }
 
     rig_handle_t rig = static_cast<rig_handle_t>(rig_);
@@ -529,8 +580,10 @@ bool RadioController::setPttLocked(bool enabled) {
     }
 
     if (dry_run_) {
-        ptt_on_ = enabled;
-        return true;
+        // Never claim a key-up that did not happen; unkeying nothing is fine.
+        ptt_on_ = false;
+        setErrorLocked(kDryRunError);
+        return !enabled;
     }
 
     rig_handle_t rig = static_cast<rig_handle_t>(rig_);
@@ -551,7 +604,7 @@ bool RadioController::getPttLocked() {
     }
 
     if (dry_run_) {
-        return ptt_on_;
+        return false;
     }
 
     rig_handle_t rig = static_cast<rig_handle_t>(rig_);
@@ -718,15 +771,18 @@ void RadioController::pttClientLoop(int client_fd) {
         } else if (command == "STATUS") {
             response = getPtt() ? "PTT:ON\n" : "PTT:OFF\n";
         } else if (command == "KEY" || command == "SETPTT ON") {
+            // The modem is about to transmit whether or not the rig keys.
+            keyed_by_this_client = true;
+            notifyPttRequest(true);
             if (setPtt(true)) {
-                keyed_by_this_client = true;
                 response = "OK\n";
             } else {
                 response = "ERROR " + getStatus().last_error + "\n";
             }
         } else if (command == "UNKEY" || command == "SETPTT OFF") {
+            keyed_by_this_client = false;
+            notifyPttRequest(false);
             if (setPtt(false)) {
-                keyed_by_this_client = false;
                 response = "OK\n";
             } else {
                 response = "ERROR " + getStatus().last_error + "\n";
@@ -744,6 +800,7 @@ void RadioController::pttClientLoop(int client_fd) {
     // must never leave the transmitter stuck on.
     if (keyed_by_this_client) {
         setPtt(false);
+        notifyPttRequest(false);
     }
 
     {

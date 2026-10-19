@@ -103,12 +103,19 @@ int main(int argc, char** argv) {
               << (modem.queryVoiceStatus() ? "supported" : "unsupported")
               << "\n";
 
+    modem.requestModeSettings();  // MAXMODE / CWID, answered during the wait below
+
     std::cout << "listening for 5 s of notifications...\n";
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         modem.poll();
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+
+    const ModemStatus after = modem.getStatus();
+    std::cout << "       maxmode=" << (after.max_mode.empty() ? "?" : after.max_mode)
+              << " cwid=" << (after.cw_id_known ? (after.cw_id ? "on" : "off") : "?")
+              << " turn=" << after.turn << " voice=" << after.voice_summary << "\n";
 
     modem.disconnect();
     std::cout << (failures == 0 ? "PROBE OK\n" : "PROBE FAILED\n");

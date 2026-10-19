@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -14,10 +15,24 @@
 
 namespace skylink {
 
+// The modem's default PTT TCP port (INTERFACES.md "PTT": `PTTPORT
+// host[:port]`, default port 4532).
+inline constexpr uint16_t kDefaultPttServerPort = 4532;
+
+// What the controller should do for `source` (the user's radio settings):
+// backend "hamlib" uses the configured Hamlib model and device; backend
+// "kenwood_tcp" drives a Kenwood rig over its LAN port with a Kenwood Hamlib
+// model (the configured one when it is a Kenwood model, else the TS-890S)
+// and `device = host:port`; anything else disables radio control.
+RadioConfig resolveRadioConfig(const RadioConfig& source);
+
 class RadioController {
 public:
     struct Status {
         bool configured = false;
+        // No Hamlib model selected (model 0): nothing is controlled. Every
+        // frequency/mode/PTT request fails with last_error saying so, and
+        // the PTT server answers KEY with an error.
         bool dry_run = false;
         bool connected = false;
         bool ptt = false;
@@ -40,9 +55,7 @@ public:
     void applyConfig(const RadioConfig& config);
     bool connect();
     void disconnect();
-    bool reconnect();
 
-    bool isConfigured() const;
     bool isConnected() const;
     bool isDryRun() const;
 
@@ -57,6 +70,12 @@ public:
 
     bool startPttServer();
     void stopPttServer();
+
+    // Called (from the PTT server's client thread) whenever the modem asks
+    // to key (true) or unkey (false), and with false when a client that
+    // keyed disconnects. Reports the modem's keying intent even when the
+    // rig itself could not be keyed. Set before startPttServer().
+    void onPttRequest(std::function<void(bool keyed)> cb);
 
     Status getStatus() const;
 
@@ -96,6 +115,9 @@ private:
     std::vector<int> ptt_client_fds_;  // open client sockets (for shutdown on stop)
     std::mutex ptt_clients_mutex_;     // guards ptt_client_threads_ / ptt_client_fds_
     std::mutex ptt_lifecycle_mutex_;   // serializes start/stop; taken before mutex_
+    std::mutex ptt_callback_mutex_;
+    std::function<void(bool)> ptt_request_callback_;
+    void notifyPttRequest(bool keyed);
 
     mutable std::mutex mutex_;
 };

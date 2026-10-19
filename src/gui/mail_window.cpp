@@ -1,4 +1,6 @@
 #include "skywave_link/mail_window.hpp"
+#include "skywave_link/gui_util.hpp"
+#include "skywave_link/modern_style.hpp"
 #include "imgui.h"
 #include <cstring>
 #include <ctime>
@@ -55,6 +57,7 @@ MailWindow::MailWindow(SharedAppState& state)
 void MailWindow::render() {
     ImGui::Text("Radio Mail");
     ImGui::Separator();
+    ui::StatusLine(status_);
 
     // Compose section
     if (ImGui::CollapsingHeader("Compose Mail", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -139,19 +142,44 @@ void MailWindow::render() {
                        escapeTemplateField(state_.mail_body_input);
             }
 
-            if (!subject.empty()) {
-                if (std::strlen(state_.mail_to_input) > 0) {
-                    if (onSendMail) {
-                        onSendMail(state_.mail_to_input, subject, body);
-                    }
+            const std::string to = gui::trimCopy(state_.mail_to_input);
+            const bool body_empty = gui::trimCopy(state_.mail_body_input).empty();
+            if (template_mode == 0 && body_empty && gui::trimCopy(subject).empty()) {
+                postStatus("Nothing to send: write a subject or a message", StatusKind::Error);
+            } else {
+                if (gui::trimCopy(subject).empty()) {
+                    subject = "(no subject)";
+                }
+                const bool can_send = to.empty() ? static_cast<bool>(onSendBroadcastMail)
+                                                 : static_cast<bool>(onSendMail);
+                if (!can_send) {
+                    postStatus("Mail sending is not available", StatusKind::Error);
                 } else {
-                    if (onSendBroadcastMail) {
+                    // App appends the mail to the outbox when it is sent or
+                    // queued and logs which; nothing appended = refused.
+                    const size_t outbox_before = state_.mail_outbox ? state_.mail_outbox->size() : 0;
+                    const size_t log_mark = state_.chatHistorySize();
+                    if (to.empty()) {
                         onSendBroadcastMail(subject, body);
+                    } else {
+                        onSendMail(to, subject, body);
+                    }
+                    const size_t outbox_after = state_.mail_outbox ? state_.mail_outbox->size() : 0;
+                    const std::string logged = state_.systemMessageSince(log_mark);
+                    if (outbox_after > outbox_before) {
+                        postStatus(logged.empty() ? std::string("Mail queued") : logged,
+                                   StatusKind::Success);
+                        state_.mail_to_input[0] = '\0';
+                        state_.mail_subject_input[0] = '\0';
+                        state_.mail_body_input[0] = '\0';
+                    } else {
+                        // Keep the draft so it can be fixed and resent.
+                        postStatus(logged.empty() ? std::string("Mail not sent (is the modem "
+                                                                "connected?)")
+                                                  : logged,
+                                   StatusKind::Error);
                     }
                 }
-                state_.mail_to_input[0] = '\0';
-                state_.mail_subject_input[0] = '\0';
-                state_.mail_body_input[0] = '\0';
             }
         }
     }
@@ -163,7 +191,7 @@ void MailWindow::render() {
         if (ImGui::BeginTabItem("Inbox")) {
             if (ImGui::BeginChild("MailInbox", ImVec2(-1, -1), true)) {
                 if (state_.mail_inbox->empty()) {
-                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No mail received");
+                    ImGui::TextDisabled("No mail received");
                 } else {
                     int delete_inbox_index = -1;
                     for (size_t i = 0; i < state_.mail_inbox->size(); ++i) {
@@ -195,7 +223,7 @@ void MailWindow::render() {
                             ImGui::Indent();
                             const std::string& body = mail.display_body.empty() ? mail.body : mail.display_body;
                             if (!mail.via.empty()) {
-                                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                ImGui::TextColored(ui::palette().warning,
                                                    "Relayed by %s; sender %s is not verified",
                                                    mail.via.c_str(), mail.from.c_str());
                             }
@@ -239,7 +267,7 @@ void MailWindow::render() {
         if (ImGui::BeginTabItem("Sent")) {
             if (ImGui::BeginChild("MailOutbox", ImVec2(-1, -1), true)) {
                 if (state_.mail_outbox->empty()) {
-                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No mail sent");
+                    ImGui::TextDisabled("No mail sent");
                 } else {
                     int delete_outbox_index = -1;
                     for (size_t i = 0; i < state_.mail_outbox->size(); ++i) {

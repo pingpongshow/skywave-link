@@ -27,7 +27,18 @@ struct EmailGatewayOutgoing {
     std::string to;
     std::string subject;
     std::string body;
+    // From display name for this message; empty: input.smtp.from_name.
+    std::string from_name = {};
+    // Winlink message id (12 chars [A-Z0-9]) derived from the stored
+    // message, so a retry of the same outbox item reuses it and the CMS
+    // rejects the duplicate. Empty: the client picks a random one.
+    std::string winlink_message_id = {};
 };
+
+// Stable Winlink message id for an outbox item: 12 characters [A-Z0-9]
+// derived from `seed` (e.g. the stored message id and row id). The same
+// seed always gives the same id.
+std::string stableWinlinkMessageId(const std::string& seed);
 
 struct EmailGatewayJobInput {
     bool poll_pop3 = false;
@@ -72,6 +83,10 @@ struct EmailGatewayJobOutput {
 // is stored durably; only then are the server copies deleted (POP3 QUIT /
 // Winlink kill). Fetch failures are delivered too (return value ignored).
 using EmailInboundSink = std::function<bool(const EmailGatewayJobOutput& partial)>;
+
+// The Winlink delivery request for one outgoing message.
+WinlinkTelnetRequest winlinkRequestFor(const EmailGatewayJobInput& input,
+                                       const EmailGatewayOutgoing& msg);
 
 // Runs the network part of one gateway poll synchronously. Without a sink
 // the fetch results are part of the returned output and deletions are

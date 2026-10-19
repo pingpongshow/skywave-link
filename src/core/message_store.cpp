@@ -8,12 +8,11 @@
 #include <chrono>
 #include <ctime>
 #include <cmath>
+#include <limits>
 #include <mutex>
 #include <algorithm>
 
-#ifdef SKYWAVE_LINK_HAS_SQLITE
 #include <sqlite3.h>
-#endif
 
 namespace skylink {
 
@@ -161,7 +160,6 @@ MessageStore::~MessageStore() {
 }
 
 bool MessageStore::open(const std::string& db_path) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (db_) {
         sqlite3_close_v2(static_cast<sqlite3*>(db_));
@@ -190,25 +188,17 @@ bool MessageStore::open(const std::string& db_path) {
     }
 
     return true;
-#else
-    (void)db_path;
-    std::cerr << "[MessageStore] SQLite support not compiled in\n";
-    return false;
-#endif
 }
 
 void MessageStore::close() {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (db_) {
         sqlite3_close_v2(static_cast<sqlite3*>(db_));
         db_ = nullptr;
     }
-#endif
 }
 
 bool MessageStore::createTables() {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     const char* sql = R"(
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -350,13 +340,9 @@ bool MessageStore::createTables() {
         }
     }
     return true;
-#else
-    return false;
-#endif
 }
 
 bool MessageStore::executeQuery(const std::string& sql) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     if (!db_) return false;
 
     char* err_msg = nullptr;
@@ -367,14 +353,9 @@ bool MessageStore::executeQuery(const std::string& sql) {
         return false;
     }
     return true;
-#else
-    (void)sql;
-    return false;
-#endif
 }
 
 int64_t MessageStore::createMessage(const Message& msg) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return -1;
 
@@ -412,8 +393,15 @@ int64_t MessageStore::createMessage(const Message& msg) {
         sqlite3_bind_blob(stmt, 8, attachments_blob.data(),
                           static_cast<int>(attachments_blob.size()), SQLITE_TRANSIENT);
     }
-    sqlite3_bind_int64(stmt, 9, msg.created_at > 0 ? msg.created_at : now);
-    sqlite3_bind_int64(stmt, 10, msg.expires_at);
+    const int64_t created_at = msg.created_at > 0 ? msg.created_at : now;
+    int64_t expires_at = msg.expires_at;
+    if (expires_at == 0 && default_expiry_days_ > 0 &&
+        (msg.status == MessageStatus::Pending || msg.status == MessageStatus::Sent ||
+         msg.status == MessageStatus::Draft)) {
+        expires_at = created_at + static_cast<int64_t>(default_expiry_days_) * 86400;
+    }
+    sqlite3_bind_int64(stmt, 9, created_at);
+    sqlite3_bind_int64(stmt, 10, expires_at);
     sqlite3_bind_int(stmt, 11, msg.retry_count);
     sqlite3_bind_int(stmt, 12, msg.priority);
 
@@ -428,14 +416,9 @@ int64_t MessageStore::createMessage(const Message& msg) {
 
     sqlite3_finalize(stmt);
     return id;
-#else
-    (void)msg;
-    return -1;
-#endif
 }
 
 std::optional<Message> MessageStore::getMessage(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return std::nullopt;
 
@@ -459,14 +442,9 @@ std::optional<Message> MessageStore::getMessage(int64_t id) {
     Message msg = rowToMessage(stmt);
     sqlite3_finalize(stmt);
     return msg;
-#else
-    (void)id;
-    return std::nullopt;
-#endif
 }
 
 std::optional<Message> MessageStore::getMessageById(const std::string& message_id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return std::nullopt;
 
@@ -490,14 +468,9 @@ std::optional<Message> MessageStore::getMessageById(const std::string& message_i
     Message msg = rowToMessage(stmt);
     sqlite3_finalize(stmt);
     return msg;
-#else
-    (void)message_id;
-    return std::nullopt;
-#endif
 }
 
 bool MessageStore::updateMessage(const Message& msg) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_ || msg.id == 0) return false;
 
@@ -543,14 +516,9 @@ bool MessageStore::updateMessage(const Message& msg) {
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE && sqlite3_changes(static_cast<sqlite3*>(db_)) > 0;
-#else
-    (void)msg;
-    return false;
-#endif
 }
 
 bool MessageStore::deleteMessage(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
@@ -565,14 +533,9 @@ bool MessageStore::deleteMessage(int64_t id) {
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE && sqlite3_changes(static_cast<sqlite3*>(db_)) > 0;
-#else
-    (void)id;
-    return false;
-#endif
 }
 
 std::vector<Message> MessageStore::getMessages(const MessageFilter& filter) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return {};
 
@@ -635,10 +598,6 @@ std::vector<Message> MessageStore::getMessages(const MessageFilter& filter) {
 
     sqlite3_finalize(stmt);
     return messages;
-#else
-    (void)filter;
-    return {};
-#endif
 }
 
 std::vector<Message> MessageStore::getPendingMessages(const std::string& dest_callsign) {
@@ -663,7 +622,6 @@ std::vector<Message> MessageStore::getOutboxMessages(const std::string& my_calls
 }
 
 int MessageStore::countPendingMessages() {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return 0;
 
@@ -683,13 +641,9 @@ int MessageStore::countPendingMessages() {
 
     sqlite3_finalize(stmt);
     return count;
-#else
-    return 0;
-#endif
 }
 
 bool MessageStore::queueInternetRelay(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_ || id <= 0) return false;
     const char* sql =
@@ -705,14 +659,9 @@ bool MessageStore::queueInternetRelay(int64_t id) {
     const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
     return ok;
-#else
-    (void)id;
-    return false;
-#endif
 }
 
 bool MessageStore::markRelayedAndDequeue(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_ || id <= 0) return false;
     auto* db = static_cast<sqlite3*>(db_);
@@ -743,14 +692,9 @@ bool MessageStore::markRelayedAndDequeue(int64_t id) {
     }
     sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", nullptr, nullptr, nullptr);
     return ok;
-#else
-    (void)id;
-    return false;
-#endif
 }
 
 std::vector<Message> MessageStore::loadInternetRelayQueue() {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return {};
     const char* sql =
@@ -768,13 +712,9 @@ std::vector<Message> MessageStore::loadInternetRelayQueue() {
     }
     sqlite3_finalize(stmt);
     return messages;
-#else
-    return {};
-#endif
 }
 
 bool MessageStore::markAsSent(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
@@ -799,14 +739,9 @@ bool MessageStore::markAsSent(int64_t id) {
     bool changed = (rc == SQLITE_DONE && sqlite3_changes(static_cast<sqlite3*>(db_)) > 0);
     sqlite3_finalize(stmt);
     return changed;
-#else
-    (void)id;
-    return false;
-#endif
 }
 
 bool MessageStore::markAsDelivered(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
@@ -828,14 +763,9 @@ bool MessageStore::markAsDelivered(int64_t id) {
     bool changed = (rc == SQLITE_DONE && sqlite3_changes(static_cast<sqlite3*>(db_)) > 0);
     sqlite3_finalize(stmt);
     return changed;
-#else
-    (void)id;
-    return false;
-#endif
 }
 
 bool MessageStore::markAsFailed(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
@@ -853,14 +783,9 @@ bool MessageStore::markAsFailed(int64_t id) {
     bool changed = (rc == SQLITE_DONE && sqlite3_changes(static_cast<sqlite3*>(db_)) > 0);
     sqlite3_finalize(stmt);
     return changed;
-#else
-    (void)id;
-    return false;
-#endif
 }
 
 bool MessageStore::incrementRetry(int64_t id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return false;
 
@@ -877,65 +802,102 @@ bool MessageStore::incrementRetry(int64_t id) {
     bool changed = (rc == SQLITE_DONE && sqlite3_changes(static_cast<sqlite3*>(db_)) > 0);
     sqlite3_finalize(stmt);
     return changed;
-#else
-    (void)id;
-    return false;
-#endif
 }
 
-int MessageStore::deleteExpiredMessages() {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
+void MessageStore::setDefaultExpiryDays(int days) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return 0;
-
-    int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
-    const char* sql = "DELETE FROM messages WHERE expires_at > 0 AND expires_at < ?";
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        return 0;
-    }
-
-    sqlite3_bind_int64(stmt, 1, now);
-    rc = sqlite3_step(stmt);
-    int deleted = sqlite3_changes(static_cast<sqlite3*>(db_));
-    sqlite3_finalize(stmt);
-    return deleted;
-#else
-    return 0;
-#endif
+    default_expiry_days_ = std::max(0, days);
 }
 
-int MessageStore::deleteOldMessages(int64_t before_timestamp) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_) return 0;
-
-    const char* sql = "DELETE FROM messages WHERE created_at < ?";
+// Runs `sql` with up to two int64 parameters; returns the rows changed
+// (-1 on error). Caller holds mutex_.
+int MessageStore::execCount(const char* sql, int64_t a, int64_t b) {
+    if (!db_) return -1;
     sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        return 0;
+    if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "[MessageStore] maintenance SQL error: "
+                  << sqlite3_errmsg(static_cast<sqlite3*>(db_)) << "\n";
+        return -1;
+    }
+    const int params = sqlite3_bind_parameter_count(stmt);
+    if (params >= 1) sqlite3_bind_int64(stmt, 1, a);
+    if (params >= 2) sqlite3_bind_int64(stmt, 2, b);
+    const int rc = sqlite3_step(stmt);
+    const int changed = (rc == SQLITE_DONE) ? sqlite3_changes(static_cast<sqlite3*>(db_)) : -1;
+    sqlite3_finalize(stmt);
+    return changed;
+}
+
+MaintenanceReport MessageStore::runMaintenance(const MaintenancePolicy& policy, int64_t now) {
+    MaintenanceReport report;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) return report;
+    if (now <= 0) {
+        now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    const int pending = static_cast<int>(MessageStatus::Pending);
+    const int sent = static_cast<int>(MessageStatus::Sent);
+    const int expired = static_cast<int>(MessageStatus::Expired);
+    const int failed = static_cast<int>(MessageStatus::Failed);
+    const std::string not_queued =
+        " AND id NOT IN (SELECT message_store_id FROM internet_relay_queue)";
+
+    // 1. Undelivered outgoing mail past its expiry.
+    if (policy.message_expiry_days > 0) {
+        const std::string sql =
+            "UPDATE messages SET status = " + std::to_string(expired) +
+            " WHERE status IN (" + std::to_string(pending) + "," + std::to_string(sent) + ")"
+            " AND ((expires_at > 0 AND expires_at < ?1) OR"
+            " ((expires_at IS NULL OR expires_at = 0) AND created_at < ?2))" + not_queued;
+        const int n = execCount(sql.c_str(), now,
+                                now - static_cast<int64_t>(policy.message_expiry_days) * 86400);
+        report.expired = std::max(0, n);
     }
 
-    sqlite3_bind_int64(stmt, 1, before_timestamp);
-    rc = sqlite3_step(stmt);
-    int deleted = sqlite3_changes(static_cast<sqlite3*>(db_));
-    sqlite3_finalize(stmt);
-    return deleted;
-#else
-    (void)before_timestamp;
-    return 0;
-#endif
+    // 2. Pending mail beyond the cap: the oldest go.
+    if (policy.max_pending_messages > 0) {
+        const std::string sql =
+            "UPDATE messages SET status = " + std::to_string(expired) +
+            " WHERE id IN (SELECT id FROM messages WHERE status = " + std::to_string(pending) +
+            not_queued + " ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?1)";
+        const int n = execCount(sql.c_str(), policy.max_pending_messages);
+        report.trimmed = std::max(0, n);
+    }
+
+    // 3. Clean-up: expired/failed mail older than the expiry window, and
+    //    history older than history_days. Received and delivered mail stays.
+    if (policy.auto_cleanup) {
+        const int64_t mail_cutoff =
+            now - static_cast<int64_t>(std::max(1, policy.message_expiry_days)) * 86400;
+        const std::string del =
+            "DELETE FROM messages WHERE status IN (" + std::to_string(expired) + "," +
+            std::to_string(failed) + ") AND created_at < ?1" + not_queued;
+        report.deleted_messages = std::max(0, execCount(del.c_str(), mail_cutoff));
+
+        const int64_t hist_cutoff =
+            now - static_cast<int64_t>(std::max(1, policy.history_days)) * 86400;
+        int hist = 0;
+        hist += std::max(0, execCount("DELETE FROM beacon_history WHERE timestamp < ?1", hist_cutoff));
+        hist += std::max(0, execCount("DELETE FROM ping_history WHERE timestamp < ?1", hist_cutoff));
+        hist += std::max(0, execCount("DELETE FROM weather_cache WHERE timestamp < ?1", hist_cutoff));
+        hist += std::max(0, execCount("DELETE FROM positions WHERE timestamp < ?1", hist_cutoff));
+        // Read states only for mail that no longer exists.
+        hist += std::max(0, execCount(
+            "DELETE FROM mail_read_state WHERE updated_at < ?1 AND message_id NOT IN "
+            "(SELECT message_id FROM messages WHERE message_id IS NOT NULL)", hist_cutoff));
+        report.deleted_history = hist;
+
+        if (report.deleted_messages + report.deleted_history >= 500) {
+            report.vacuumed = executeQuery("VACUUM");
+        }
+    }
+    return report;
 }
 
 void MessageStore::vacuum() {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     executeQuery("VACUUM");
-#endif
 }
 
 std::string MessageStore::generateMessageId(const std::string& callsign) {
@@ -959,7 +921,6 @@ std::string MessageStore::generateMessageId(const std::string& callsign) {
 }
 
 Message MessageStore::rowToMessage(void* stmt_ptr) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     sqlite3_stmt* stmt = static_cast<sqlite3_stmt*>(stmt_ptr);
     Message msg;
 
@@ -1006,16 +967,11 @@ Message MessageStore::rowToMessage(void* stmt_ptr) {
     msg.priority = sqlite3_column_int(stmt, 14);
 
     return msg;
-#else
-    (void)stmt_ptr;
-    return Message{};
-#endif
 }
 
 // --- Beacon history ---
 
 int64_t MessageStore::saveBeacon(const BeaconRecord& beacon) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return -1;
 
@@ -1032,10 +988,14 @@ int64_t MessageStore::saveBeacon(const BeaconRecord& beacon) {
     int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    double snr_val = std::isfinite(beacon.snr_db) ? beacon.snr_db : 0.0;
     sqlite3_bind_text(stmt, 1, beacon.callsign.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, beacon.grid_square.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 3, snr_val);
+    // Unmeasured SNR (NaN) is stored as NULL, never as a fake 0 dB.
+    if (std::isfinite(beacon.snr_db)) {
+        sqlite3_bind_double(stmt, 3, beacon.snr_db);
+    } else {
+        sqlite3_bind_null(stmt, 3);
+    }
     sqlite3_bind_text(stmt, 4, beacon.message.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 5, beacon.has_pending ? 1 : 0);
     sqlite3_bind_int(stmt, 6, beacon.email_gateway ? 1 : 0);
@@ -1052,15 +1012,10 @@ int64_t MessageStore::saveBeacon(const BeaconRecord& beacon) {
     }
     sqlite3_finalize(stmt);
     return id;
-#else
-    (void)beacon;
-    return -1;
-#endif
 }
 
 std::vector<BeaconRecord> MessageStore::loadRecentBeacons(int limit) {
     if (limit <= 0) limit = 1;
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return {};
 
@@ -1082,7 +1037,9 @@ std::vector<BeaconRecord> MessageStore::loadRecentBeacons(int limit) {
         if (cs) b.callsign = cs;
         const char* gs = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
         if (gs) b.grid_square = gs;
-        b.snr_db = static_cast<float>(sqlite3_column_double(stmt, 3));
+        b.snr_db = sqlite3_column_type(stmt, 3) == SQLITE_NULL
+                       ? std::numeric_limits<float>::quiet_NaN()
+                       : static_cast<float>(sqlite3_column_double(stmt, 3));
         const char* msg = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
         if (msg) b.message = msg;
         b.has_pending = sqlite3_column_int(stmt, 5) != 0;
@@ -1095,14 +1052,9 @@ std::vector<BeaconRecord> MessageStore::loadRecentBeacons(int limit) {
 
     sqlite3_finalize(stmt);
     return results;
-#else
-    (void)limit;
-    return {};
-#endif
 }
 
 int MessageStore::cleanupOldBeacons(int64_t max_age_sec) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return 0;
 
@@ -1119,16 +1071,11 @@ int MessageStore::cleanupOldBeacons(int64_t max_age_sec) {
     int deleted = sqlite3_changes(static_cast<sqlite3*>(db_));
     sqlite3_finalize(stmt);
     return deleted;
-#else
-    (void)max_age_sec;
-    return 0;
-#endif
 }
 
 // --- Ping history ---
 
 int64_t MessageStore::savePingResult(const PingRecord& ping) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return -1;
 
@@ -1144,9 +1091,12 @@ int64_t MessageStore::savePingResult(const PingRecord& ping) {
     int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    double snr_val = std::isfinite(ping.snr_db) ? ping.snr_db : 0.0;
     sqlite3_bind_text(stmt, 1, ping.callsign.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 2, snr_val);
+    if (std::isfinite(ping.snr_db)) {
+        sqlite3_bind_double(stmt, 2, ping.snr_db);
+    } else {
+        sqlite3_bind_null(stmt, 2);
+    }
     sqlite3_bind_text(stmt, 3, ping.grid_square.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 4, ping.band.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 5, ping.online ? 1 : 0);
@@ -1162,15 +1112,10 @@ int64_t MessageStore::savePingResult(const PingRecord& ping) {
     }
     sqlite3_finalize(stmt);
     return id;
-#else
-    (void)ping;
-    return -1;
-#endif
 }
 
 std::vector<PingRecord> MessageStore::loadRecentPings(int limit) {
     if (limit <= 0) limit = 1;
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return {};
 
@@ -1189,7 +1134,9 @@ std::vector<PingRecord> MessageStore::loadRecentPings(int limit) {
         p.id = sqlite3_column_int64(stmt, 0);
         const char* cs = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         if (cs) p.callsign = cs;
-        p.snr_db = static_cast<float>(sqlite3_column_double(stmt, 2));
+        p.snr_db = sqlite3_column_type(stmt, 2) == SQLITE_NULL
+                       ? std::numeric_limits<float>::quiet_NaN()
+                       : static_cast<float>(sqlite3_column_double(stmt, 2));
         const char* gs = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
         if (gs) p.grid_square = gs;
         const char* band = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
@@ -1201,14 +1148,9 @@ std::vector<PingRecord> MessageStore::loadRecentPings(int limit) {
 
     sqlite3_finalize(stmt);
     return results;
-#else
-    (void)limit;
-    return {};
-#endif
 }
 
 int MessageStore::cleanupOldPings(int64_t max_age_sec) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return 0;
 
@@ -1225,14 +1167,9 @@ int MessageStore::cleanupOldPings(int64_t max_age_sec) {
     int deleted = sqlite3_changes(static_cast<sqlite3*>(db_));
     sqlite3_finalize(stmt);
     return deleted;
-#else
-    (void)max_age_sec;
-    return 0;
-#endif
 }
 
 bool MessageStore::setMailReadState(const std::string& message_id, bool read) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_ || message_id.empty()) return false;
 
@@ -1257,15 +1194,9 @@ bool MessageStore::setMailReadState(const std::string& message_id, bool read) {
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE;
-#else
-    (void)message_id;
-    (void)read;
-    return false;
-#endif
 }
 
 std::optional<bool> MessageStore::getMailReadState(const std::string& message_id) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_ || message_id.empty()) return std::nullopt;
 
@@ -1284,14 +1215,9 @@ std::optional<bool> MessageStore::getMailReadState(const std::string& message_id
     const bool is_read = sqlite3_column_int(stmt, 0) != 0;
     sqlite3_finalize(stmt);
     return is_read;
-#else
-    (void)message_id;
-    return std::nullopt;
-#endif
 }
 
 std::map<std::string, bool> MessageStore::loadMailReadStates(int limit) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     std::map<std::string, bool> states;
     if (!db_) return states;
@@ -1311,19 +1237,27 @@ std::map<std::string, bool> MessageStore::loadMailReadStates(int limit) {
 
     sqlite3_finalize(stmt);
     return states;
-#else
-    (void)limit;
-    return {};
-#endif
 }
 
 // --- Weather cache ---
 
 int64_t MessageStore::saveWeatherReport(const std::string& type, const std::string& location,
                                          const std::string& report, int64_t timestamp) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return -1;
+
+    // One cached report per (type, location): the newer one replaces it.
+    {
+        sqlite3_stmt* del = nullptr;
+        if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_),
+                               "DELETE FROM weather_cache WHERE type = ? AND location = ?",
+                               -1, &del, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(del, 1, type.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(del, 2, location.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(del);
+            sqlite3_finalize(del);
+        }
+    }
 
     const char* sql = R"(
         INSERT INTO weather_cache (type, location, report, timestamp)
@@ -1352,15 +1286,10 @@ int64_t MessageStore::saveWeatherReport(const std::string& type, const std::stri
     }
     sqlite3_finalize(stmt);
     return id;
-#else
-    (void)type; (void)location; (void)report; (void)timestamp;
-    return -1;
-#endif
 }
 
 std::vector<MessageStore::WeatherCacheEntry> MessageStore::loadWeatherReports(int limit) {
     if (limit <= 0) limit = 1;
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return {};
 
@@ -1389,14 +1318,9 @@ std::vector<MessageStore::WeatherCacheEntry> MessageStore::loadWeatherReports(in
 
     sqlite3_finalize(stmt);
     return results;
-#else
-    (void)limit;
-    return {};
-#endif
 }
 
 int MessageStore::cleanupOldWeather(int64_t max_age_sec) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return 0;
 
@@ -1413,14 +1337,9 @@ int MessageStore::cleanupOldWeather(int64_t max_age_sec) {
     int deleted = sqlite3_changes(static_cast<sqlite3*>(db_));
     sqlite3_finalize(stmt);
     return deleted;
-#else
-    (void)max_age_sec;
-    return 0;
-#endif
 }
 
 int MessageStore::cleanupOldMailReadStates(int64_t max_age_sec) {
-#ifdef SKYWAVE_LINK_HAS_SQLITE
     std::lock_guard<std::mutex> lock(mutex_);
     if (!db_) return 0;
 
@@ -1437,10 +1356,6 @@ int MessageStore::cleanupOldMailReadStates(int64_t max_age_sec) {
     int deleted = sqlite3_changes(static_cast<sqlite3*>(db_));
     sqlite3_finalize(stmt);
     return deleted;
-#else
-    (void)max_age_sec;
-    return 0;
-#endif
 }
 
 } // namespace skylink

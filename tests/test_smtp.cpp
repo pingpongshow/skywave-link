@@ -23,6 +23,7 @@ struct FakeSmtp {
     uint16_t port = 0;
     std::thread th;
     std::vector<std::string> commands;
+    std::vector<std::string> data_lines;
 
     bool start(bool silent) {
         listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -60,6 +61,7 @@ struct FakeSmtp {
                 buf.clear();
                 if (in_data) {
                     if (cmd == ".") { in_data = false; say("250 queued\r\n"); }
+                    else data_lines.push_back(cmd);
                     continue;
                 }
                 commands.push_back(cmd);
@@ -173,6 +175,36 @@ TEST(smtp_stalled_server_times_out) {
     ASSERT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 10);
     PASS();
 }
+// K20: station.name is the From display name; the envelope sender stays
+// the bare address.
+TEST(smtp_from_display_name) {
+    FakeSmtp srv;
+    ASSERT_TRUE(srv.start(false));
+    auto req = localRequest(srv.port, false);
+    req.from_name = "Test \"Op\" Station";
+    std::string err;
+    ASSERT_TRUE(sendSMTPDelivery(req, &err));
+    srv.finish();
+    ASSERT_TRUE(srv.sawPrefix("MAIL FROM:<a@example.com>"));
+    bool saw = false;
+    for (const auto& l : srv.data_lines) {
+        if (l == "From: \"Test \\\"Op\\\" Station\" <a@example.com>") saw = true;
+    }
+    ASSERT_TRUE(saw);
+    PASS();
+}
 #endif
+
+TEST(smtp_header_encoding) {
+    ASSERT_EQ(formatFromHeader("", "a@example.com"), std::string("a@example.com"));
+    ASSERT_EQ(formatFromHeader("  Op Name ", "a@example.com"),
+              std::string("\"Op Name\" <a@example.com>"));
+    // Non-ASCII: an RFC 2047 encoded word ("Jos\xC3\xA9" = "José").
+    ASSERT_EQ(formatFromHeader("Jos\xC3\xA9", "a@example.com"),
+              std::string("=?UTF-8?B?Sm9zw6k=?= <a@example.com>"));
+    ASSERT_EQ(encodeHeaderText("plain"), std::string("plain"));
+    ASSERT_EQ(encodeHeaderText("a\r\nBcc: x"), std::string("aBcc: x"));
+    PASS();
+}
 
 TEST_MAIN()

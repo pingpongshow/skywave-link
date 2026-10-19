@@ -8,6 +8,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -168,7 +169,8 @@ bool APRSClient::connect(const std::string& server, uint16_t port) {
 }
 
 int APRSClient::loginOnSocket(socket_t sock, const std::string& callsign,
-                              const std::string& passcode_in, std::string* error) {
+                              const std::string& passcode_in, const std::string& filter_in,
+                              std::string* error) {
     std::string passcode = passcode_in;
     while (!passcode.empty() && std::isspace(static_cast<unsigned char>(passcode.back()))) passcode.pop_back();
     while (!passcode.empty() && std::isspace(static_cast<unsigned char>(passcode.front()))) passcode.erase(0, 1);
@@ -186,10 +188,13 @@ int APRSClient::loginOnSocket(socket_t sock, const std::string& callsign,
         return 0;
     }
 
-    // Build login string: user CALLSIGN pass PASSCODE vers SOFTWARE VERSION filter FILTER
+    // Login: user CALLSIGN pass PASSCODE vers SOFTWARE VERSION filter FILTER.
+    // The filter is what makes port 14580 send anything back at all.
+    const std::string filter = sanitizeText(filter_in);
     std::stringstream ss;
-    ss << "user " << callsign << " pass " << passcode
-       << " vers Skywave-Link 1.0.0\r\n";
+    ss << "user " << callsign << " pass " << passcode << " vers Skywave-Link " SKYWAVE_LINK_VERSION;
+    if (!filter.empty()) ss << " filter " << filter;
+    ss << "\r\n";
     const std::string login = ss.str();
 #ifdef _WIN32
     const bool sent = send(sock, login.c_str(), static_cast<int>(login.size()), 0) ==
@@ -232,7 +237,10 @@ int APRSClient::loginOnSocket(socket_t sock, const std::string& callsign,
 
 bool APRSClient::authenticate(const std::string& callsign, const std::string& passcode) {
     if (socket_ == INVALID_SOCK) return false;
-    const int rc = loginOnSocket(socket_, callsign, passcode, &last_connect_error_);
+    const std::string filter = defaultFilter(callsign, has_position_, my_position_.latitude,
+                                             my_position_.longitude, filter_range_km_);
+    const std::string effective = filter_.empty() ? filter : filter_;
+    const int rc = loginOnSocket(socket_, callsign, passcode, effective, &last_connect_error_);
     if (rc < 0) {
         disconnect();  // server closed the connection
         return false;
@@ -241,6 +249,7 @@ bool APRSClient::authenticate(const std::string& callsign, const std::string& pa
         return false;
     }
     my_callsign_ = callsign;
+    sent_filter_ = effective;
     state_ = APRSState::Connected;
     if (state_callback_) state_callback_(state_);
     return true;
@@ -255,6 +264,7 @@ struct APRSClient::ConnectJob {
     bool ok = false;
     socket_t sock = INVALID_SOCK;
     std::string callsign;
+    std::string filter;
     std::string error;
 };
 
@@ -270,13 +280,16 @@ bool APRSClient::beginConnect(const std::string& server, uint16_t port,
 
     auto job = std::make_shared<ConnectJob>();
     job->callsign = callsign;
+    my_callsign_ = callsign;
+    job->filter = effectiveFilter();
     connect_job_ = job;
     try {
-        std::thread([job, server, port, callsign, passcode]() {
+        const std::string filter = job->filter;
+        std::thread([job, server, port, callsign, passcode, filter]() {
             socket_t sock = INVALID_SOCK;
             std::string error;
             bool ok = openSocket(server, port, kConnectTimeoutMs, &sock, &error);
-            if (ok && loginOnSocket(sock, callsign, passcode, &error) != 1) {
+            if (ok && loginOnSocket(sock, callsign, passcode, filter, &error) != 1) {
                 ok = false;
                 closeSocket(sock);
             }
@@ -312,6 +325,7 @@ APRSConnectProgress APRSClient::pollConnect() {
             socket_ = job->sock;
             job->sock = INVALID_SOCK;
             my_callsign_ = job->callsign;
+            sent_filter_ = job->filter;
         }
     }
     if (socket_ == INVALID_SOCK) {
@@ -322,6 +336,8 @@ APRSConnectProgress APRSClient::pollConnect() {
     }
     state_ = APRSState::Connected;
     if (state_callback_) state_callback_(state_);
+    // The position (or filter settings) may have changed during the login.
+    refreshServerFilter();
     if (send_position_on_connect_) {
         send_position_on_connect_ = false;
         queued_position_sent_ = sendPositionNow();
@@ -417,11 +433,48 @@ void APRSClient::setMyPosition(double lat, double lon, double alt_m) {
     my_position_.latitude = lat;
     my_position_.longitude = lon;
     my_position_.altitude_m = alt_m;
+    has_position_ = isValidCoordinate(lat, lon) && !(lat == 0.0 && lon == 0.0);
+    refreshServerFilter();
 }
 
-void APRSClient::setMyCourse(double speed_kmh, double course_deg) {
-    my_position_.speed_kmh = speed_kmh;
-    my_position_.course_deg = course_deg;
+std::string APRSClient::defaultFilter(const std::string& callsign, bool has_position,
+                                      double lat, double lon, int range_km) {
+    std::string out;
+    if (has_position && isValidCoordinate(lat, lon)) {
+        // One decimal (~11 km): fine enough for a range filter and stable
+        // enough that GPS jitter does not resend it.
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "r/%.1f/%.1f/%d", lat, lon,
+                      std::clamp(range_km, 1, 5000));
+        out = buf;
+    }
+    std::string call = sanitizeText(callsign);
+    for (char& c : call) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (isValidCallsign(call)) {
+        if (!out.empty()) out += " ";
+        out += "b/" + call;
+    }
+    return out;
+}
+
+std::string APRSClient::effectiveFilter() const {
+    if (!filter_.empty()) return filter_;
+    return defaultFilter(my_callsign_, has_position_, my_position_.latitude,
+                         my_position_.longitude, filter_range_km_);
+}
+
+void APRSClient::refreshServerFilter() {
+    if (!isConnected()) return;
+    const std::string want = effectiveFilter();
+    if (want.empty() || want == sent_filter_) return;
+    if (sendPacket("#filter " + sanitizeText(want) + "\r\n")) {
+        sent_filter_ = want;
+    }
+}
+
+void APRSClient::setFilterRangeKm(int km) {
+    filter_range_km_ = std::clamp(km, 1, 5000);
+    refreshServerFilter();
 }
 
 void APRSClient::setMyComment(const std::string& comment) {
@@ -443,7 +496,8 @@ void APRSClient::setBeaconInterval(int seconds) {
 
 bool APRSClient::sendPositionNow() {
     if (!isConnected()) return false;
-    if (!isValidCoordinate(my_position_.latitude, my_position_.longitude)) return false;
+    // No fix (0,0 or invalid): never beacon a made-up position.
+    if (!has_position_) return false;
 
     std::string packet = my_callsign_ + ">APRS,TCPIP*:" +
                          formatPosition(my_position_) + "\r\n";
@@ -494,30 +548,45 @@ void APRSClient::enableBeaconing(bool enabled) {
     }
 }
 
-void APRSClient::requestPosition(const std::string& callsign) {
-    if (!isConnected()) return;
-    if (!isValidCallsign(callsign)) return;
-
-    std::string packet = my_callsign_ + ">APRS,TCPIP*:?" + callsign + "\r\n";
-    sendPacket(packet);
+bool APRSClient::requestPosition(const std::string& callsign) {
+    if (!isConnected() || !isValidCallsign(callsign)) return false;
+    // Directed station query: a message whose text is "?APRSP".
+    std::stringstream ss;
+    ss << my_callsign_ << ">APRS,TCPIP*::" << std::setw(9) << std::left << callsign
+       << ":?APRSP\r\n";
+    return sendPacket(ss.str());
 }
 
-void APRSClient::sendMessage(const std::string& to_callsign, const std::string& message) {
-    if (!isConnected()) return;
-    if (!isValidCallsign(to_callsign)) return;
-
-    // Format: FROMCALL>APRS::TOCALL   :message{seq
+bool APRSClient::sendMessage(const std::string& to_callsign, const std::string& message) {
+    if (!isConnected() || !isValidCallsign(to_callsign)) return false;
+    // Format: FROMCALL>APRS,TCPIP*::TOCALL   :text{n   (text max 67 chars,
+    // no '|', '~' or '{').
+    std::string text = sanitizeText(message);
+    text.erase(std::remove_if(text.begin(), text.end(),
+                              [](char c) { return c == '|' || c == '~' || c == '{'; }),
+               text.end());
+    if (text.size() > 67) text.resize(67);
+    message_seq_ = message_seq_ % 99999 + 1;
     std::stringstream ss;
     ss << my_callsign_ << ">APRS,TCPIP*::" << std::setw(9) << std::left << to_callsign
-       << ":" << sanitizeText(message) << "\r\n";
-    sendPacket(ss.str());
+       << ":" << text << "{" << message_seq_ << "\r\n";
+    return sendPacket(ss.str());
 }
 
 void APRSClient::setFilter(const std::string& filter) {
-    if (!isConnected()) return;
+    filter_ = sanitizeText(filter);
+    refreshServerFilter();
+}
 
-    std::string packet = "#filter " + sanitizeText(filter) + "\r\n";
-    sendPacket(packet);
+std::string APRSClient::effectivePasscode(const std::string& configured,
+                                         const std::string& callsign) {
+    std::string trimmed = configured;
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.back()))) trimmed.pop_back();
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.front()))) trimmed.erase(0, 1);
+    if (!trimmed.empty()) return trimmed;
+    // No callsign: "-1" logs in receive-only.
+    if (callsign.find_first_not_of(" \t\r\n") == std::string::npos) return "-1";
+    return std::to_string(calculatePasscode(callsign));
 }
 
 int32_t APRSClient::calculatePasscode(const std::string& callsign) {
@@ -623,105 +692,130 @@ bool APRSClient::sendPacket(const std::string& packet) {
 #endif
 }
 
+namespace {
+
+// "FROM>TO,PATH:info" -> FROM and info; false for anything else.
+bool splitPacket(const std::string& line, std::string* from, std::string* info) {
+    const size_t arrow = line.find('>');
+    if (arrow == std::string::npos || arrow == 0) return false;
+    const size_t colon = line.find(':', arrow);
+    if (colon == std::string::npos) return false;
+    *from = line.substr(0, arrow);
+    *info = line.substr(colon + 1);
+    return true;
+}
+
+std::string upperTrim(std::string s) {
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    while (!s.empty() && s.front() == ' ') s.erase(0, 1);
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// "DDMM.hh" + N/S (or "DDDMM.hh" + E/W) with all-digit fields.
+bool parseCoord(const std::string& text, int deg_digits, char pos_hemi, char neg_hemi,
+                double max_deg, double* out) {
+    const size_t len = static_cast<size_t>(deg_digits) + 6;  // DD MM . hh H
+    if (text.size() != len) return false;
+    for (size_t i = 0; i + 1 < len; ++i) {
+        if (i == static_cast<size_t>(deg_digits) + 2) {
+            if (text[i] != '.') return false;
+        } else if (!std::isdigit(static_cast<unsigned char>(text[i]))) {
+            return false;
+        }
+    }
+    const char hemi = text[len - 1];
+    if (hemi != pos_hemi && hemi != neg_hemi) return false;
+    const double deg = std::stod(text.substr(0, static_cast<size_t>(deg_digits)));
+    const double min = std::stod(text.substr(static_cast<size_t>(deg_digits), 5));
+    if (min >= 60.0) return false;
+    double v = deg + min / 60.0;
+    if (v > max_deg) return false;
+    *out = (hemi == neg_hemi) ? -v : v;
+    return true;
+}
+
+} // namespace
+
+std::optional<APRSPosition> APRSClient::parsePositionReport(const std::string& line) {
+    std::string from, data;
+    if (!splitPacket(line, &from, &data) || data.empty()) return std::nullopt;
+    size_t off = 0;
+    switch (data[0]) {
+        case '!': case '=': off = 1; break;
+        case '/': case '@': off = 8; break;  // 7-character timestamp
+        default: return std::nullopt;        // not a position report
+    }
+    if (data.size() < off + 19) return std::nullopt;  // lat(8) table lon(9) symbol
+    APRSPosition pos;
+    try {
+        if (!parseCoord(data.substr(off, 8), 2, 'N', 'S', 90.0, &pos.latitude) ||
+            !parseCoord(data.substr(off + 9, 9), 3, 'E', 'W', 180.0, &pos.longitude)) {
+            return std::nullopt;  // compressed or malformed
+        }
+    } catch (...) {
+        return std::nullopt;
+    }
+    pos.callsign = from;
+    pos.symbol.table = data[off + 8];
+    pos.symbol.symbol = data[off + 18];
+    pos.comment = sanitizeText(data.substr(off + 19));
+    pos.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return pos;
+}
+
+std::optional<APRSClient::ParsedMessage> APRSClient::parseMessageFor(
+    const std::string& line, const std::string& my_callsign) {
+    std::string from, info;
+    if (!splitPacket(line, &from, &info)) return std::nullopt;
+    // ":ADDRESSEE:text" with a 9-character, space-padded addressee.
+    if (info.size() < 11 || info[0] != ':' || info[10] != ':') return std::nullopt;
+    if (upperTrim(info.substr(1, 9)) != upperTrim(my_callsign) || my_callsign.empty()) {
+        return std::nullopt;
+    }
+    std::string text = info.substr(11);
+    // Acks and rejects ("ack12", "rej12") are protocol, not messages.
+    if ((text.rfind("ack", 0) == 0 || text.rfind("rej", 0) == 0) && text.size() > 3 &&
+        text.find(' ') == std::string::npos) {
+        return std::nullopt;
+    }
+    ParsedMessage msg;
+    msg.from = from;
+    const size_t brace = text.find('{');
+    if (brace != std::string::npos) {
+        std::string id = text.substr(brace + 1);
+        const size_t close = id.find('}');  // reply-ack form "{id}ack"
+        if (close != std::string::npos) id.resize(close);
+        if (id.size() > 5) id.resize(5);
+        msg.id = sanitizeText(id);
+        text.resize(brace);
+    }
+    msg.text = sanitizeText(text);
+    return msg;
+}
+
 void APRSClient::processLine(const std::string& line) {
-    // Skip server messages (start with #)
-    if (!line.empty() && line[0] == '#') {
+    // Server comments (logresp, keepalives) start with '#'.
+    if (line.empty() || line[0] == '#') {
         return;
     }
 
-    // Try to parse as position report
-    APRSPosition pos = parsePosition(line);
-    if (!pos.callsign.empty()) {
-        if (position_callback_) {
-            position_callback_(pos);
+    if (auto pos = parsePositionReport(line)) {
+        if (position_callback_) position_callback_(*pos);
+        return;
+    }
+
+    if (auto msg = parseMessageFor(line, my_callsign_)) {
+        if (!msg->id.empty() && isValidCallsign(msg->from)) {
+            // Numbered messages are acknowledged, or the sender retries.
+            std::stringstream ss;
+            ss << my_callsign_ << ">APRS,TCPIP*::" << std::setw(9) << std::left << msg->from
+               << ":ack" << msg->id << "\r\n";
+            sendPacket(ss.str());
         }
+        if (message_callback_) message_callback_(msg->from, msg->text);
     }
-
-    // Check for messages
-    // Format: FROMCALL>...:MSG:message{seq
-    size_t msg_start = line.find("::");
-    if (msg_start != std::string::npos) {
-        // Extract sender
-        size_t arrow = line.find('>');
-        if (arrow != std::string::npos) {
-            std::string from = line.substr(0, arrow);
-            std::string msg_part = line.substr(msg_start + 2);
-
-            // Skip addressee (9 chars)
-            if (msg_part.length() > 10) {
-                std::string message = msg_part.substr(10);
-
-                // Remove message ID
-                size_t brace = message.find('{');
-                if (brace != std::string::npos) {
-                    message = message.substr(0, brace);
-                }
-
-                if (message_callback_) {
-                    message_callback_(from, message);
-                }
-            }
-        }
-    }
-}
-
-APRSPosition APRSClient::parsePosition(const std::string& packet) {
-    APRSPosition pos;
-
-    // Extract callsign
-    size_t arrow = packet.find('>');
-    if (arrow == std::string::npos) return pos;
-    pos.callsign = packet.substr(0, arrow);
-
-    // Find position data (after last :)
-    size_t colon = packet.rfind(':');
-    if (colon == std::string::npos || colon + 1 >= packet.length()) return pos;
-
-    std::string data = packet.substr(colon + 1);
-
-    // Check for position format markers
-    char marker = data[0];
-    if (marker != '!' && marker != '=' && marker != '/' && marker != '@') {
-        return pos;  // Not a position packet
-    }
-
-    // Simple parsing - just extract lat/lon
-    // Full implementation would handle all APRS formats
-    if (data.length() < 20) return pos;
-
-    // Parse latitude: DDMM.hhN
-    try {
-        int lat_deg = std::stoi(data.substr(1, 2));
-        double lat_min = std::stod(data.substr(3, 5));
-        char lat_ns = data[8];
-        pos.latitude = lat_deg + lat_min / 60.0;
-        if (lat_ns == 'S') pos.latitude = -pos.latitude;
-
-        // Parse longitude: DDDMM.hhW (after symbol table char)
-        int lon_deg = std::stoi(data.substr(10, 3));
-        double lon_min = std::stod(data.substr(13, 5));
-        char lon_ew = data[18];
-        pos.longitude = lon_deg + lon_min / 60.0;
-        if (lon_ew == 'W') pos.longitude = -pos.longitude;
-
-        // Symbol
-        pos.symbol.table = data[9];
-        pos.symbol.symbol = data[19];
-
-        // Comment (rest of packet)
-        if (data.length() > 20) {
-            pos.comment = data.substr(20);
-        }
-
-        pos.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-
-    } catch (...) {
-        // Parsing failed
-        pos.callsign.clear();
-    }
-
-    return pos;
 }
 
 void APRSClient::checkBeaconTimer() {

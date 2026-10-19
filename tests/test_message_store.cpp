@@ -1,10 +1,10 @@
 // MessageStore tests (SQLite in-memory)
 #include "test_macros.hpp"
+#include <cmath>
+#include <limits>
 #include <cstdio>
 #include "skywave_link/message_store.hpp"
 #include <chrono>
-
-#ifdef SKYWAVE_LINK_HAS_SQLITE
 
 TEST(store_open_memory) {
     skylink::MessageStore store;
@@ -392,6 +392,29 @@ TEST(beacon_save_load) {
     PASS();
 }
 
+TEST(unmeasured_snr_round_trips_as_nan) {
+    skylink::MessageStore store;
+    ASSERT_TRUE(store.open(":memory:"));
+    skylink::BeaconRecord b;
+    b.callsign = "N0SNR";
+    b.snr_db = std::numeric_limits<float>::quiet_NaN();
+    b.timestamp = 100;
+    ASSERT_GT(store.saveBeacon(b), (int64_t)0);
+    auto beacons = store.loadRecentBeacons(10);
+    ASSERT_EQ(beacons.size(), (size_t)1);
+    ASSERT_TRUE(std::isnan(beacons[0].snr_db));
+
+    skylink::PingRecord p;
+    p.callsign = "N0SNR";
+    p.snr_db = std::numeric_limits<float>::quiet_NaN();
+    p.timestamp = 100;
+    ASSERT_GT(store.savePingResult(p), (int64_t)0);
+    auto pings = store.loadRecentPings(10);
+    ASSERT_EQ(pings.size(), (size_t)1);
+    ASSERT_TRUE(std::isnan(pings[0].snr_db));
+    PASS();
+}
+
 TEST(beacon_load_ordering) {
     skylink::MessageStore store;
     ASSERT_TRUE(store.open(":memory:"));
@@ -634,15 +657,6 @@ TEST(filter_limit_validation) {
     PASS();
 }
 
-#else
-// No SQLite - just pass
-TEST(store_no_sqlite) {
-    std::cout << "  SKIP: SQLite not available\n";
-    PASS();
-}
-#endif
-
-#ifdef SKYWAVE_LINK_HAS_SQLITE
 // Internet-relay mail stays queued in the store until a confirmed send, so a
 // quit (or crash) between queueing and sending never drops it.
 TEST(store_internet_relay_queue_survives_reopen) {
@@ -655,7 +669,7 @@ TEST(store_internet_relay_queue_survives_reopen) {
         skylink::Message msg;
         msg.type = skylink::MessageType::Email;
         msg.status = skylink::MessageStatus::Pending;
-        msg.from_callsign = "N0CALL";
+        msg.from_callsign = "K1AAA";
         msg.to_callsign = "test@example.com";
         msg.subject = "one";
         a = store.createMessage(msg);
@@ -683,6 +697,118 @@ TEST(store_internet_relay_queue_survives_reopen) {
     std::remove((path + "-shm").c_str());
     PASS();
 }
-#endif
+
+// K22: maintenance expires undelivered outgoing mail, trims the pending
+// queue, cleans old history - and never touches received/delivered mail
+// or mail waiting for internet relay.
+TEST(store_maintenance_expires_trims_and_cleans) {
+    skylink::MessageStore store;
+    ASSERT_TRUE(store.open(":memory:"));
+    const int64_t now = 1800000000;
+    const int64_t day = 86400;
+    auto make = [&](skylink::MessageStatus st, int64_t created, const std::string& id) {
+        skylink::Message m;
+        m.type = skylink::MessageType::Private;
+        m.status = st;
+        m.from_callsign = "K1AAA";
+        m.to_callsign = "K1BBB";
+        m.subject = id;
+        m.message_id = id;
+        m.created_at = created;
+        return store.createMessage(m);
+    };
+    const int64_t old_pending = make(skylink::MessageStatus::Pending, now - 10 * day, "old_pending");
+    const int64_t old_sent = make(skylink::MessageStatus::Sent, now - 9 * day, "old_sent");
+    const int64_t queued = make(skylink::MessageStatus::Pending, now - 20 * day, "queued");
+    ASSERT_TRUE(store.queueInternetRelay(queued));
+    const int64_t received = make(skylink::MessageStatus::Delivered, now - 90 * day, "received");
+    const int64_t fresh = make(skylink::MessageStatus::Pending, now - 1 * day, "fresh");
+
+    skylink::MaintenancePolicy policy;
+    policy.message_expiry_days = 7;
+    policy.max_pending_messages = 100;
+    policy.auto_cleanup = false;
+    auto r = store.runMaintenance(policy, now);
+    ASSERT_EQ(r.expired, 2);
+    ASSERT_TRUE(store.getMessage(old_pending)->status == skylink::MessageStatus::Expired);
+    ASSERT_TRUE(store.getMessage(old_sent)->status == skylink::MessageStatus::Expired);
+    ASSERT_TRUE(store.getMessage(queued)->status == skylink::MessageStatus::Pending);
+    ASSERT_TRUE(store.getMessage(fresh)->status == skylink::MessageStatus::Pending);
+    ASSERT_TRUE(store.getMessage(received)->status == skylink::MessageStatus::Delivered);
+
+    // Cap: of three non-queued pending messages only the newest two stay.
+    const int64_t p2 = make(skylink::MessageStatus::Pending, now - 3600, "p2");
+    const int64_t p3 = make(skylink::MessageStatus::Pending, now - 60, "p3");
+    policy.max_pending_messages = 2;
+    r = store.runMaintenance(policy, now);
+    ASSERT_EQ(r.trimmed, 1);
+    ASSERT_TRUE(store.getMessage(fresh)->status == skylink::MessageStatus::Expired);
+    ASSERT_TRUE(store.getMessage(p2)->status == skylink::MessageStatus::Pending);
+    ASSERT_TRUE(store.getMessage(p3)->status == skylink::MessageStatus::Pending);
+    ASSERT_TRUE(store.getMessage(queued)->status == skylink::MessageStatus::Pending);
+
+    // Clean-up: old expired mail and old history go; received mail stays.
+    skylink::BeaconRecord b;
+    b.callsign = "K1CCC";
+    b.timestamp = now - 40 * day;
+    store.saveBeacon(b);
+    b.timestamp = now - 1 * day;
+    store.saveBeacon(b);
+    policy.auto_cleanup = true;
+    policy.history_days = 30;
+    r = store.runMaintenance(policy, now);
+    ASSERT_EQ(r.deleted_messages, 2);  // old_pending, old_sent
+    ASSERT_FALSE(store.getMessage(old_pending).has_value());
+    ASSERT_TRUE(store.getMessage(fresh).has_value());  // expired, but only just
+    ASSERT_TRUE(store.getMessage(received).has_value());
+    ASSERT_TRUE(store.getMessage(queued).has_value());
+    ASSERT_EQ(r.deleted_history, 1);
+    ASSERT_EQ(store.loadRecentBeacons(10).size(), size_t(1));
+    PASS();
+}
+
+TEST(store_default_expiry_sets_expires_at) {
+    skylink::MessageStore store;
+    ASSERT_TRUE(store.open(":memory:"));
+    store.setDefaultExpiryDays(3);
+    skylink::Message m;
+    m.status = skylink::MessageStatus::Pending;
+    m.from_callsign = "K1AAA";
+    m.to_callsign = "K1BBB";
+    m.created_at = 1800000000;
+    const int64_t id = store.createMessage(m);
+    ASSERT_EQ(store.getMessage(id)->expires_at, int64_t(1800000000 + 3 * 86400));
+    m.status = skylink::MessageStatus::Delivered;  // received mail never expires
+    m.message_id = "rx1";
+    const int64_t rx = store.createMessage(m);
+    ASSERT_EQ(store.getMessage(rx)->expires_at, int64_t(0));
+    PASS();
+}
+
+// K22: the weather cache keeps the latest report per type+location and
+// survives a restart.
+TEST(store_weather_cache_persists_latest) {
+    const std::string path = "test_weather_cache.db";
+    std::remove(path.c_str());
+    {
+        skylink::MessageStore store;
+        ASSERT_TRUE(store.open(path));
+        store.saveWeatherReport("METAR", "KAAA", "old", 100);
+        store.saveWeatherReport("METAR", "KAAA", "new", 200);
+        store.saveWeatherReport("TAF", "KAAA", "taf", 150);
+    }
+    {
+        skylink::MessageStore store;
+        ASSERT_TRUE(store.open(path));
+        auto reports = store.loadWeatherReports(10);
+        ASSERT_EQ(reports.size(), size_t(2));
+        ASSERT_EQ(reports[0].report, std::string("new"));
+        ASSERT_EQ(reports[1].report, std::string("taf"));
+    }
+    std::remove(path.c_str());
+    std::remove((path + "-wal").c_str());
+    std::remove((path + "-shm").c_str());
+    PASS();
+}
 
 TEST_MAIN()

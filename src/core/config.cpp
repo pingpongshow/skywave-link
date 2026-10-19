@@ -1,6 +1,8 @@
 // Configuration management implementation
 
 #include "skywave_link/config.hpp"
+#include "skywave_link/modem_client.hpp"
+#include "skywave_link/secret_store.hpp"
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -107,7 +109,7 @@ void AppConfig::setDefaults() {
     radio.auto_connect = true;
     radio.ptt_server_enabled = true;
     radio.ptt_server_bind = "127.0.0.1";
-    radio.ptt_server_port = 4533;
+    radio.ptt_server_port = 4532;
     radio.default_band = "40m";
     radio.auto_qsy = true;
     radio.qsy_ack_timeout_ms = 8000;
@@ -125,6 +127,9 @@ void AppConfig::setDefaults() {
     aprs.symbol_table = '/';
     aprs.symbol = '-';
     aprs.comment = "Skywave Link HF Digital";
+    aprs.auto_beacon = true;
+    aprs.filter.clear();
+    aprs.filter_range_km = 100;
     aprs.gps_enabled = false;
     aprs.gps_port = "";
     aprs.gps_baud = 9600;
@@ -145,9 +150,9 @@ void AppConfig::setDefaults() {
     email.gateway_enabled = false;
     email.allowed_relays.clear();
     email.winlink_telnet_enabled = false;
-    email.winlink_telnet_host = "server.winlink.org";
-    email.winlink_telnet_port = 8772;
-    email.winlink_telnet_use_tls = false;
+    email.winlink_telnet_host = "cms.winlink.org";   // CMS secure telnet (TLS)
+    email.winlink_telnet_port = 8773;
+    email.winlink_telnet_use_tls = true;
     email.winlink_telnet_callsign = "";
     email.winlink_telnet_password = "";
     email.winlink_fetch_interval_sec = 300;
@@ -175,18 +180,25 @@ void AppConfig::setDefaults() {
     files.auto_accept = false;
     files.trusted_callsigns.clear();
 
+    // BBS defaults
+    bbs = BBSConfig{};
+
+    // Beacon defaults
+    beacon = BeaconConfig{};
+
+    // Away defaults
+    away = AwayConfig{};
+
     // PSK Reporter defaults
     psk_reporter.enabled = false;
     psk_reporter.antenna = "Dipole";
     psk_reporter.min_snr = -20;
-    psk_reporter.upload_interval_sec = 300;
 
     // UI defaults
     ui.dark_mode = true;
     ui.font_size = 15;
     ui.show_timestamps = true;
     ui.sound_notifications = true;
-    ui.notification_sound = "";
     ui.window_width = 0;   // 0 = ~80% of the display on first run
     ui.window_height = 0;
 }
@@ -273,11 +285,27 @@ bool AppConfig::save(const std::string& path) const {
         std::filesystem::create_directories(dir, ec);
     }
 
-    std::ofstream file(path);
+    // Written to a temporary file and renamed over the old one, so a crash
+    // or force-quit mid-write never leaves a truncated config behind.
+    const std::string tmp_path = path + ".tmp";
+    std::ofstream file(tmp_path, std::ios::trunc);
     if (!file) {
-        std::cerr << "[Config] Failed to open file for writing: " << path << "\n";
+        std::cerr << "[Config] Failed to open file for writing: " << tmp_path << "\n";
         return false;
     }
+
+    // Account passwords: in the system keychain when it is active, else in
+    // this file (which is then readable by its owner only). They used to
+    // be read but never written, so every save erased them.
+    bool secrets_ok = true;
+    auto secretLine = [&](const char* key, const std::string& value) {
+        if (secrets::systemStoreActive()) {
+            if (!secrets::store(key, value)) secrets_ok = false;
+            if (!value.empty()) file << "# " << key << " is kept in the system keychain\n";
+        } else {
+            file << key << " = \"" << escapeToml(value) << "\"\n";
+        }
+    };
 
     file << "# Skywave Link Configuration\n";
     file << "# Generated automatically - edit with care\n\n";
@@ -347,6 +375,9 @@ bool AppConfig::save(const std::string& path) const {
     file << "symbol_table = \"" << aprs.symbol_table << "\"\n";
     file << "symbol = \"" << aprs.symbol << "\"\n";
     file << "comment = \"" << escapeToml(aprs.comment) << "\"\n";
+    file << "auto_beacon = " << (aprs.auto_beacon ? "true" : "false") << "\n";
+    file << "filter = \"" << escapeToml(aprs.filter) << "\"\n";
+    file << "filter_range_km = " << aprs.filter_range_km << "\n";
     file << "gps_enabled = " << (aprs.gps_enabled ? "true" : "false") << "\n";
     file << "gps_port = \"" << escapeToml(aprs.gps_port) << "\"\n";
     file << "gps_baud = " << aprs.gps_baud << "\n";
@@ -357,21 +388,23 @@ bool AppConfig::save(const std::string& path) const {
     file << "smtp_host = \"" << escapeToml(email.smtp_host) << "\"\n";
     file << "smtp_port = " << email.smtp_port << "\n";
     file << "smtp_username = \"" << escapeToml(email.smtp_username) << "\"\n";
-    file << "# smtp_password stored securely\n";
+    secretLine("smtp_password", email.smtp_password);
     file << "smtp_use_tls = " << (email.smtp_use_tls ? "true" : "false") << "\n";
     file << "pop3_host = \"" << escapeToml(email.pop3_host) << "\"\n";
     file << "pop3_port = " << email.pop3_port << "\n";
     file << "pop3_username = \"" << escapeToml(email.pop3_username) << "\"\n";
+    secretLine("pop3_password", email.pop3_password);
     file << "pop3_use_tls = " << (email.pop3_use_tls ? "true" : "false") << "\n";
     file << "pop3_poll_interval_sec = " << email.pop3_poll_interval_sec << "\n";
     file << "pop3_max_messages = " << email.pop3_max_messages << "\n";
     file << "gateway_enabled = " << (email.gateway_enabled ? "true" : "false") << "\n";
+    file << "allowed_relays = \"" << escapeToml(joinCallsignList(email.allowed_relays)) << "\"\n";
     file << "winlink_telnet_enabled = " << (email.winlink_telnet_enabled ? "true" : "false") << "\n";
     file << "winlink_telnet_host = \"" << escapeToml(email.winlink_telnet_host) << "\"\n";
     file << "winlink_telnet_port = " << email.winlink_telnet_port << "\n";
     file << "winlink_telnet_use_tls = " << (email.winlink_telnet_use_tls ? "true" : "false") << "\n";
     file << "winlink_telnet_callsign = \"" << escapeToml(email.winlink_telnet_callsign) << "\"\n";
-    file << "# winlink_telnet_password stored securely\n";
+    secretLine("winlink_telnet_password", email.winlink_telnet_password);
     file << "winlink_fetch_interval_sec = " << email.winlink_fetch_interval_sec << "\n";
     file << "winlink_fetch_max_messages = " << email.winlink_fetch_max_messages << "\n";
     file << "winlink_compat_mode = " << (email.winlink_compat_mode ? "true" : "false") << "\n";
@@ -410,6 +443,7 @@ bool AppConfig::save(const std::string& path) const {
     file << "welcome_message = \"" << escapeToml(bbs.welcome_message) << "\"\n";
     file << "allow_uploads = " << (bbs.allow_uploads ? "true" : "false") << "\n";
     file << "max_upload_size = " << bbs.max_upload_size << "\n";
+    file << "allowed_uploaders = \"" << escapeToml(joinCallsignList(bbs.allowed_uploaders)) << "\"\n";
     file << "\n";
 
     file << "[beacon]\n";
@@ -419,12 +453,20 @@ bool AppConfig::save(const std::string& path) const {
     file << "notify_pending = " << (beacon.notify_pending ? "true" : "false") << "\n";
     file << "\n";
 
+    // Away section (away mode itself is a runtime toggle, not saved)
+    file << "[away]\n";
+    file << "away_message = \"" << escapeToml(away.away_message) << "\"\n";
+    file << "allow_message_query = " << (away.allow_message_query ? "true" : "false") << "\n";
+    file << "allow_email_gateway = " << (away.allow_email_gateway ? "true" : "false") << "\n";
+    file << "allow_bbs_access = " << (away.allow_bbs_access ? "true" : "false") << "\n";
+    file << "auto_reply = " << (away.auto_reply ? "true" : "false") << "\n";
+    file << "\n";
+
     // PSK Reporter section
     file << "[psk_reporter]\n";
     file << "enabled = " << (psk_reporter.enabled ? "true" : "false") << "\n";
     file << "antenna = \"" << escapeToml(psk_reporter.antenna) << "\"\n";
     file << "min_snr = " << psk_reporter.min_snr << "\n";
-    file << "upload_interval_sec = " << psk_reporter.upload_interval_sec << "\n";
     file << "\n";
 
     // UI section
@@ -436,6 +478,30 @@ bool AppConfig::save(const std::string& path) const {
     file << "window_width = " << ui.window_width << "\n";
     file << "window_height = " << ui.window_height << "\n";
 
+    file.close();
+    if (!file) {
+        std::cerr << "[Config] Failed to write: " << tmp_path << "\n";
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp_path, rm_ec);
+        return false;
+    }
+    std::error_code ec;
+    // Owner-only: the file may hold account passwords (no keychain) and
+    // always holds station and server details.
+    std::filesystem::permissions(tmp_path,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, ec);
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+        std::cerr << "[Config] Failed to replace " << path << ": " << ec.message() << "\n";
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+    }
+    if (!secrets_ok) {
+        std::cerr << "[Config] Could not store a password in the system keychain\n";
+        return false;
+    }
     return true;
 }
 
@@ -547,6 +613,9 @@ bool AppConfig::load(const std::string& path) {
             else if (key == "symbol_table") { if (!value.empty()) aprs.symbol_table = value[0]; }
             else if (key == "symbol") { if (!value.empty()) aprs.symbol = value[0]; }
             else if (key == "comment") aprs.comment = value;
+            else if (key == "auto_beacon") aprs.auto_beacon = (value == "true");
+            else if (key == "filter") aprs.filter = value;
+            else if (key == "filter_range_km") aprs.filter_range_km = safeStoi(value, 100);
             else if (key == "gps_enabled") aprs.gps_enabled = (value == "true");
             else if (key == "gps_port") aprs.gps_port = value;
             else if (key == "gps_baud") aprs.gps_baud = safeStoi(value, 9600);
@@ -565,6 +634,7 @@ bool AppConfig::load(const std::string& path) {
             else if (key == "pop3_poll_interval_sec") email.pop3_poll_interval_sec = safeStoi(value, 300);
             else if (key == "pop3_max_messages") email.pop3_max_messages = safeStoi(value, 50);
             else if (key == "gateway_enabled") email.gateway_enabled = (value == "true");
+            else if (key == "allowed_relays") email.allowed_relays = parseCallsignList(value);
             else if (key == "winlink_telnet_enabled") email.winlink_telnet_enabled = (value == "true");
             else if (key == "winlink_telnet_host") email.winlink_telnet_host = value;
             else if (key == "winlink_telnet_port") email.winlink_telnet_port = safeUint16(value);
@@ -606,7 +676,8 @@ bool AppConfig::load(const std::string& path) {
             else if (key == "bbs_path") bbs.bbs_path = value;
             else if (key == "welcome_message") bbs.welcome_message = value;
             else if (key == "allow_uploads") bbs.allow_uploads = (value == "true");
-            else if (key == "max_upload_size") bbs.max_upload_size = size_t(safeStoi(value, 50 * 1024));
+            else if (key == "max_upload_size") bbs.max_upload_size = safeStoull(value, 50 * 1024);
+            else if (key == "allowed_uploaders") bbs.allowed_uploaders = parseCallsignList(value);
         }
         else if (current_section == "beacon") {
             if (key == "enabled") beacon.enabled = (value == "true");
@@ -614,11 +685,17 @@ bool AppConfig::load(const std::string& path) {
             else if (key == "beacon_text") beacon.beacon_text = value;
             else if (key == "notify_pending") beacon.notify_pending = (value == "true");
         }
+        else if (current_section == "away") {
+            if (key == "away_message") away.away_message = value;
+            else if (key == "allow_message_query") away.allow_message_query = (value == "true");
+            else if (key == "allow_email_gateway") away.allow_email_gateway = (value == "true");
+            else if (key == "allow_bbs_access") away.allow_bbs_access = (value == "true");
+            else if (key == "auto_reply") away.auto_reply = (value == "true");
+        }
         else if (current_section == "psk_reporter") {
             if (key == "enabled") psk_reporter.enabled = (value == "true");
             else if (key == "antenna") psk_reporter.antenna = value;
             else if (key == "min_snr") psk_reporter.min_snr = safeStoi(value, -20);
-            else if (key == "upload_interval_sec") psk_reporter.upload_interval_sec = safeStoi(value, 300);
         }
         else if (current_section == "ui") {
             if (key == "dark_mode") ui.dark_mode = (value == "true");
@@ -630,11 +707,11 @@ bool AppConfig::load(const std::string& path) {
         }
     }
 
-    if (voice.codec.empty()) {
-        voice.codec = "AUTO";
-    } else {
-        voice.codec = "AUTO";
-    }
+    // VOICECODEC accepts AUTO|700C|1300|2400|3200; anything else is AUTO.
+    voice.codec = normalizeVoiceCodec(voice.codec);
+    if (voice.codec.empty()) voice.codec = "AUTO";
+    aprs.filter_range_km = std::clamp(aprs.filter_range_km, 1, 5000);
+    if (radio.ptt_server_port == 0) radio.ptt_server_port = 4532;
 
     if (radio.backend.empty()) {
         if (!radio.kenwood_host.empty()) {
@@ -653,6 +730,19 @@ bool AppConfig::load(const std::string& path) {
         modem.family = (upper == "MID" || upper == "NARROW" || upper == "ULTRA")
                            ? upper
                            : "WIDE";
+    }
+
+    // Passwords kept in the system keychain. A value still present in the
+    // file (written before the keychain was used) wins and moves to the
+    // keychain at the next save.
+    if (secrets::systemStoreActive()) {
+        auto fill = [](const char* key, std::string& field) {
+            if (!field.empty()) return;
+            if (auto v = secrets::load(key)) field = *v;
+        };
+        fill("smtp_password", email.smtp_password);
+        fill("pop3_password", email.pop3_password);
+        fill("winlink_telnet_password", email.winlink_telnet_password);
     }
 
     return true;
