@@ -1,6 +1,7 @@
 // SMTP Client - Email sending via SMTP with TLS support
 
 #include "skywave_link/smtp_client.hpp"
+#include "net_timeouts.hpp"
 
 #include <string>
 #include <vector>
@@ -125,56 +126,12 @@ public:
     //   use_tls == false     -> plain connection
     bool connect(const std::string& host, uint16_t port, bool use_tls,
                  int timeout_sec, std::string* error) {
-        struct addrinfo hints{}, *result = nullptr;
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-
-        std::string port_str = std::to_string(port);
-        if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result) != 0) {
-            if (error) *error = "DNS resolution failed for " + host;
-            return false;
-        }
-
-        bool connected = false;
-        for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
-            socket_ = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-            if (socket_ == INVALID_SOCK) {
-                continue;
-            }
-            if (::connect(socket_, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
-                connected = true;
-                break;
-            }
-#ifdef _WIN32
-            closesocket(socket_);
-#else
-            close(socket_);
-#endif
-            socket_ = INVALID_SOCK;
-        }
-        freeaddrinfo(result);
-        if (!connected) {
-            if (error) *error = "Failed to connect to " + host + ":" + port_str;
-            return false;
-        }
-
-        // Socket timeouts so a stalled server cannot hang the caller forever.
-        // They also bound the TLS handshake and every SSL_read/SSL_write,
-        // since OpenSSL runs over this blocking socket.
-        if (timeout_sec <= 0) timeout_sec = 30;
-#ifdef _WIN32
-        DWORD timeout_ms = static_cast<DWORD>(timeout_sec) * 1000;
-        if (setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms)) != 0 ||
-            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms)) != 0) {
-#else
-        struct timeval tv;
-        tv.tv_sec = timeout_sec;
-        tv.tv_usec = 0;
-        if (setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
-            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
-#endif
-            if (error) *error = "Failed to set socket timeouts";
-            disconnect();
+        // Bounded connect (5 s); the read/write timeouts also bound the TLS
+        // handshake and every SSL_read/SSL_write (see net_timeouts.hpp).
+        if (timeout_sec <= 0) timeout_sec = 15;
+        socket_ = netio::connectTcp(host, port, netio::kConnectTimeoutMs,
+                                    timeout_sec * 1000, error);
+        if (socket_ == INVALID_SOCK) {
             return false;
         }
 

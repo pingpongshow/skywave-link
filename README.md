@@ -353,5 +353,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE)
 for the full text (GPL-3.0-or-later).
 
 Bundled components keep their own licenses, all compatible with GPL-3.0:
-Dear ImGui (MIT), nlohmann/json (MIT), stb_image (MIT / public domain);
+Dear ImGui (MIT), nlohmann/json (MIT), stb_image (MIT / public domain),
+the embedded GUI fonts Roboto (Apache-2.0) and Cousine (SIL OFL 1.1, see
+[thirdparty/imgui/misc/fonts/LICENSE.txt](thirdparty/imgui/misc/fonts/LICENSE.txt));
 linked SDL2 (zlib), SQLite (public domain) and OpenSSL 3 (Apache-2.0).

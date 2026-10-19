@@ -1,4 +1,5 @@
 #include "skywave_link/frequency_window.hpp"
+#include "skywave_link/modern_style.hpp"
 #include "imgui.h"
 
 #include <algorithm>
@@ -324,35 +325,37 @@ void FrequencyWindow::render() {
     if (state_.freq_mgr) {
         auto slots = state_.freq_mgr->getSlots(*state_.current_band);
 
-        if (ImGui::BeginChild("SlotGrid", ImVec2(-1, 200), true)) {
+        if (ImGui::BeginChild("SlotGrid", ImVec2(-1, ImGui::GetFontSize() * 14.0f), true)) {
             ImGui::Columns(4, "SlotColumns");
 
             for (const auto& slot : slots) {
                 const std::string label = slotLabel(slot.slot_number);
 
-                // Color based on status
-                ImVec4 color;
+                // Color based on status (theme palette; unknown keeps the
+                // theme's neutral button colour)
+                const ui::Palette& pal = ui::palette();
+                ImVec4 color = ImGui::GetStyleColorVec4(ImGuiCol_Button);
                 switch (slot.status) {
                     case SlotStatus::Available:
-                        color = ImVec4(0.2f, 0.8f, 0.2f, 1.0f);
+                        color = pal.success;
                         break;
                     case SlotStatus::InUse:
-                        color = ImVec4(0.8f, 0.2f, 0.2f, 1.0f);
+                        color = pal.danger;
                         break;
                     case SlotStatus::MySlot:
-                        color = ImVec4(0.2f, 0.2f, 0.8f, 1.0f);
+                        color = pal.accent;
                         break;
                     default:
-                        color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
                         break;
                 }
 
-                ImGui::PushStyleColor(ImGuiCol_Button, color);
-                if (ImGui::Button(label.c_str(), ImVec2(60, 30))) {
+                ui::PushButtonColor(color);
+                if (ImGui::Button(label.c_str(),
+                                  ImVec2(ImGui::GetFontSize() * 4.5f, ImGui::GetFrameHeight() * 1.15f))) {
                     requestSlotChange(state_.current_band ? *state_.current_band : std::string{},
                                       slot.slot_number);
                 }
-                ImGui::PopStyleColor();
+                ui::PopButtonColor();
 
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("%.3f MHz\nStatus: %s%s",
@@ -408,13 +411,14 @@ void FrequencyWindow::render() {
     ImGui::Separator();
     ImGui::Text("Legend:");
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Available");
+    const ui::Palette& pal = ui::palette();
+    ImGui::TextColored(pal.success, "Available");
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.2f, 1.0f), "Busy");
+    ImGui::TextColored(pal.danger, "Busy");
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.2f, 0.2f, 0.8f, 1.0f), "My Slot");
+    ImGui::TextColored(pal.accent, "My Slot");
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Unknown");
+    ImGui::TextColored(pal.muted, "Unknown");
 
     renderRecommendations();
 }
@@ -426,9 +430,9 @@ void FrequencyWindow::renderSnifferResults() {
     for (const auto& status : *state_.slot_status) {
         const std::string label = slotLabel(status.first);
         if (status.second) {
-            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "  Slot %s: BUSY", label.c_str());
+            ImGui::TextColored(ui::palette().danger, "  Slot %s: BUSY", label.c_str());
         } else {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "  Slot %s: FREE", label.c_str());
+            ImGui::TextColored(ui::palette().success, "  Slot %s: FREE", label.c_str());
         }
     }
 }

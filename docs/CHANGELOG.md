@@ -6,8 +6,73 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed (2026-10-18)
+
+- **Modern GUI look.** Roboto (UI) and Cousine (monospace) are compiled
+  into the binary from `thirdparty/imgui/misc/fonts` (CMake generates
+  `embedded_fonts.cpp`; a missing TTF falls back to ImGui's built-in font)
+  and render sharp on Retina displays. New dark and light themes
+  (`src/gui/modern_style.cpp`): neutral backgrounds, one blue accent,
+  rounded corners, roomier padding, semantic colours for RX/TX, warnings
+  and callsigns. Settings -> UI -> Font Size now applies live (default 15)
+- Main window opens at ~80% of the display on first run (`[ui]
+  window_width/height = 0`), remembers its size on exit and has a minimum
+  size. The main view's layout scales with the font: the status bar and
+  window buttons are no longer cut off, heard-station lists and chat use
+  tables, panels have section headers. Tool windows open centred,
+  staggered and sized to the font. Multi-line mail/message bodies no
+  longer clip their labels
+- Test hook: `show <window>` and `theme dark|light`
+
 ### Fixed (2026-10-18)
 
+- GUI frame pacing: the loop slept a fixed 16 ms on top of the VSync
+  wait (halving the frame rate); it now sleeps only the unused part of
+  the frame budget
+- The 4 Hz voice-status poll no longer blocks the GUI thread waiting for
+  the reply (>= 10 ms each, up to 500 ms); the pending-message counter is
+  queried once a second instead of every frame
+- **No GUI-thread waits on the modem.** User actions and settings
+  (connect, disconnect, abort, CQ, beacon, PTT, voice, QSY, MYCALL, ...)
+  are sent without waiting for the reply: `ModemClient` gains
+  `sendCommandAsync()` and `setNonBlockingCommands()` (the GUI turns it
+  on; replies, including `ERROR:`, are matched in order as `poll()` reads
+  them and logged as before). Blocking calls stay available for tests and
+  tools
+- Connecting to the modem runs in the background (`beginConnect()` /
+  `pollConnect()`, 3 s connect timeout): an unreachable host no longer
+  hangs the window; "CONNECTING..." shows on the button and status bar and
+  a log line reports failure. The blocking `connect()` also times out
+- Weather requests no longer sleep-poll the link state for up to 400 ms;
+  native file/folder pickers run on a helper thread so the window keeps
+  rendering while they are open
+- **Email gateway network I/O off the GUI thread.** POP3 / Winlink Telnet
+  fetches and Winlink Telnet / SMTP deliveries run as one job at a time on
+  a helper thread (`EmailGatewayWorker`, `src/email/email_gateway_job.cpp`);
+  requests are snapshotted and results (store writes, diagnostics, chat
+  notices, retry queue) applied on the GUI thread. Relayed radio mail no
+  longer blocks while it is delivered
+- **Bounded, lossless email gateway.** POP3, SMTP and Winlink Telnet
+  connects time out after 5 s and every socket read/write (and TLS
+  handshake) after 15 s (`src/email/net_timeouts.hpp`). Fetched mail is
+  stored before the server copy is deleted: POP3 sends QUIT (which commits
+  the DELEs, RFC 1939) and Winlink kills messages only after the app has
+  written them to the store; otherwise the server keeps them. POP3
+  Message-ID is used for deduplication. Outgoing internet-relay mail is kept
+  in a durable queue (`internet_relay_queue` table) until a confirmed send
+  and reloaded at start. On quit a running job is stopped (no new fetch or
+  delivery), finished and applied (up to 45 s with the window hidden);
+  abandoning it after that still deletes nothing on the server
+- **APRS-IS login in the background** (`APRSClient::beginConnect()` /
+  `pollConnect()`, 5 s connect timeout, also for the blocking
+  `connect()`); "Send to APRS-IS Now" while logged out queues the beacon
+  until the login completes
+- Quitting hides the window at once and bounds the radio-link teardown to
+  ~0.7 s (was up to ~2 s)
+- `imgui.ini` (window layout) is stored in `~/.config/skywave-link/`
+  instead of the current directory. Right-panel scrollbar, clipped
+  Weather buttons and the Frequency window's hard-coded slot colours fixed.
+  Dead `App::renderMainContent/renderSettingsTab/renderPositionTab` removed
 - File-transfer **trusted callsigns** can be set: `[files]
   trusted_callsigns` in `config.toml` and a Trusted Callsigns field in
   Settings -> Files. The list was consulted but never loaded, saved or

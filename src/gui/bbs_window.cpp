@@ -41,11 +41,12 @@ void BBSWindow::render() {
     ImGui::SameLine();
     if (ImGui::Button("Browse##BBS")) {
         if (onOpenFileDialog) {
-            std::string selected = onOpenFileDialog();
-            if (!selected.empty()) {
-                std::strncpy(state_.bbs_upload_path, selected.c_str(), state_.bbs_upload_path_size - 1);
-                state_.bbs_upload_path[state_.bbs_upload_path_size - 1] = '\0';
-            }
+            onOpenFileDialog([this](const std::string& selected) {
+                if (!selected.empty() && state_.bbs_upload_path) {
+                    std::strncpy(state_.bbs_upload_path, selected.c_str(), state_.bbs_upload_path_size - 1);
+                    state_.bbs_upload_path[state_.bbs_upload_path_size - 1] = '\0';
+                }
+            });
         }
     }
 

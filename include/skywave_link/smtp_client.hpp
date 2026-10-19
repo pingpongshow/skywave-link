@@ -13,8 +13,9 @@ struct SMTPDeliveryRequest {
     // Port 465: implicit TLS. Any other port: STARTTLS is required (the
     // connection fails rather than authenticating in cleartext).
     bool use_tls = true;
-    // Socket send/receive timeout (also bounds the TLS handshake).
-    int timeout_sec = 30;
+    // Socket send/receive timeout (also bounds the TLS handshake). The TCP
+    // connect itself is bounded to 5 s.
+    int timeout_sec = 15;
 
     std::string username;
     std::string password;

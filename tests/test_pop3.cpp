@@ -360,6 +360,67 @@ TEST(fetch_oversized_message_not_deleted) {
     ASSERT_TRUE(srv.saw("DELE 3"));  // protocol stayed in sync after the cap
     PASS();
 }
+// RFC 1939: DELE only marks; the server removes messages when QUIT moves the
+// session to UPDATE. The commit gate sees the messages before QUIT, and a
+// refused commit ends the session without QUIT so the server keeps them.
+TEST(fetch_commit_gate_controls_quit) {
+    {
+        FakePop3 srv;
+        ASSERT_TRUE(srv.start(false, 0));
+        size_t messages_at_commit = 0;
+        bool quit_before_commit = true;
+        auto result = fetchPOP3Messages(localRequest(srv.port), [&](const POP3FetchResult& r) {
+            messages_at_commit = r.messages.size();
+            quit_before_commit = srv.saw("QUIT");
+            return false;
+        });
+        srv.finish();
+        ASSERT_EQ(messages_at_commit, size_t(3));
+        ASSERT_FALSE(quit_before_commit);
+        ASSERT_TRUE(srv.saw("DELE 1"));      // marked ...
+        ASSERT_FALSE(srv.saw("QUIT"));       // ... but never committed
+        ASSERT_FALSE(result.committed);
+        ASSERT_EQ(result.messages.size(), size_t(3));
+    }
+    {
+        FakePop3 srv;
+        ASSERT_TRUE(srv.start(false, 0));
+        auto result = fetchPOP3Messages(localRequest(srv.port),
+                                        [](const POP3FetchResult&) { return true; });
+        srv.finish();
+        ASSERT_TRUE(srv.saw("QUIT"));
+        ASSERT_TRUE(result.committed);
+    }
+    PASS();
+}
+
+// A server that accepts but never sends a greeting cannot hold the fetch.
+TEST(fetch_silent_server_times_out) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(listen(lfd, 1), 0);
+    socklen_t len = sizeof(addr);
+    getsockname(lfd, reinterpret_cast<sockaddr*>(&addr), &len);
+    POP3FetchRequest req = localRequest(ntohs(addr.sin_port));
+    req.timeout_ms = 1000;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = fetchPOP3Messages(req);  // connect completes via the backlog
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    close(lfd);
+    ASSERT_FALSE(result.success);
+    ASSERT_FALSE(result.error.empty());
+    ASSERT_TRUE(elapsed < std::chrono::seconds(5));
+    PASS();
+}
+
+TEST(parse_message_id_header) {
+    auto msg = parseEmailMessage("From: a@b\r\nMessage-ID: <abc@example.com>\r\n\r\nbody");
+    ASSERT_EQ(msg.message_id, std::string("<abc@example.com>"));
+    PASS();
+}
 #endif
 
 TEST_MAIN()

@@ -65,9 +65,9 @@ TEST(config_defaults) {
     ASSERT_EQ(cfg.email.hf_store_forward_hop_limit, 6);
     ASSERT_EQ(cfg.email.hf_store_forward_dedup_window_sec, 300);
     ASSERT_TRUE(cfg.ui.dark_mode);
-    ASSERT_EQ(cfg.ui.font_size, 14);
-    ASSERT_EQ(cfg.ui.window_width, 1024);
-    ASSERT_EQ(cfg.ui.window_height, 768);
+    ASSERT_EQ(cfg.ui.font_size, 15);
+    ASSERT_EQ(cfg.ui.window_width, 0);
+    ASSERT_EQ(cfg.ui.window_height, 0);
     PASS();
 }
 

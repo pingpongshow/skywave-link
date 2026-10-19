@@ -2,9 +2,16 @@
 #pragma once
 
 #include "shared_state.hpp"
+#include <functional>
 #include <string>
 
 namespace skylink {
+
+// Native file/folder pickers run without blocking the GUI: the window asks
+// for a path and the App calls `done` on the GUI thread once the user has
+// chosen (an empty string means cancelled).
+using PathPickedCallback = std::function<void(const std::string& path)>;
+using PathPicker = std::function<void(PathPickedCallback done)>;
 
 class WindowBase {
 public:

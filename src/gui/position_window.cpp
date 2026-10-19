@@ -188,6 +188,7 @@ void PositionWindow::render() {
             state_.chat_history->push_back(msg);
             if (state_.chat_scroll_to_bottom) *state_.chat_scroll_to_bottom = true;
         } else {
+            bool queued_for_login = false;
             if (state_.aprs->getState() != APRSState::Connected) {
                 if (!state_.config->aprs.enabled) {
                     ChatMessage msg;
@@ -199,16 +200,28 @@ void PositionWindow::render() {
                     state_.chat_history->push_back(msg);
                     if (state_.chat_scroll_to_bottom) *state_.chat_scroll_to_bottom = true;
                 } else {
-                    bool reconnected = state_.aprs->connect(state_.config->aprs.server,
-                                                            state_.config->aprs.port);
-                    if (reconnected) {
-                        state_.aprs->authenticate(state_.config->station.callsign,
+                    // Log in in the background (never on the GUI thread);
+                    // the App reports when the queued beacon goes out.
+                    state_.aprs->setMyPosition(*state_.my_lat, *state_.my_lon,
+                                               state_.config->station.altitude_m);
+                    state_.aprs->setMyComment(std::strlen(state_.position_comment) > 0
+                                                  ? std::string(state_.position_comment)
+                                                  : state_.config->aprs.comment);
+                    if (!state_.aprs->isConnecting()) {
+                        state_.aprs->beginConnect(state_.config->aprs.server,
+                                                  state_.config->aprs.port,
+                                                  state_.config->station.callsign,
                                                   aprsPasscodeForConfig(*state_.config));
                     }
+                    state_.aprs->sendPositionWhenConnected();
+                    state_.addSystemMessage("APRS-IS connecting; the position beacon is sent once logged in");
+                    queued_for_login = true;
                 }
             }
 
-            if (state_.aprs->getState() == APRSState::Connected) {
+            if (queued_for_login) {
+                // Sent by the App once the background login completes.
+            } else if (state_.aprs->getState() == APRSState::Connected) {
                 state_.aprs->setMyPosition(*state_.my_lat, *state_.my_lon,
                                            state_.config->station.altitude_m);
                 if (std::strlen(state_.position_comment) > 0) {

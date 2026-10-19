@@ -190,12 +190,12 @@ struct PSKReporterConfig {
 // UI preferences
 struct UIConfig {
     bool dark_mode = true;
-    int font_size = 14;
+    int font_size = 15;
     bool show_timestamps = true;
     bool sound_notifications = true;
     std::string notification_sound;
-    int window_width = 1024;
-    int window_height = 768;
+    int window_width = 0;   // 0 = size to the display on first run
+    int window_height = 0;
 };
 
 // Complete application configuration

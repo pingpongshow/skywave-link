@@ -94,7 +94,7 @@ void MailWindow::render() {
             ImGui::InputText("Incident", ics_incident, sizeof(ics_incident));
             ImGui::InputText("Priority", ics_priority, sizeof(ics_priority));
             ImGui::InputTextMultiline("Message", state_.mail_body_input, state_.mail_body_input_size,
-                                      ImVec2(-1, 100));
+                                      ImVec2(ImGui::CalcItemWidth(), ImGui::GetTextLineHeight() * 7.0f));
         } else if (template_mode == 2) {
             ImGui::InputText("Precedence", rg_precedence, sizeof(rg_precedence));
             ImGui::InputText("Handling", rg_handling, sizeof(rg_handling));
@@ -105,10 +105,10 @@ void MailWindow::render() {
             ImGui::InputText("Date", rg_date, sizeof(rg_date));
             ImGui::InputText("Radiogram To", rg_to, sizeof(rg_to));
             ImGui::InputTextMultiline("Text", state_.mail_body_input, state_.mail_body_input_size,
-                                      ImVec2(-1, 100));
+                                      ImVec2(ImGui::CalcItemWidth(), ImGui::GetTextLineHeight() * 7.0f));
         } else {
             ImGui::InputTextMultiline("Body", state_.mail_body_input, state_.mail_body_input_size,
-                                      ImVec2(-1, 100));
+                                      ImVec2(ImGui::CalcItemWidth(), ImGui::GetTextLineHeight() * 7.0f));
         }
 
         if (ImGui::Button("Send Mail")) {

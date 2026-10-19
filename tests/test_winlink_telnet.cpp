@@ -4,6 +4,7 @@
 #include "skywave_link/winlink_telnet_client.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <future>
 #include <thread>
 #include <vector>
@@ -439,6 +440,116 @@ TEST(mock_transcript_fetch_messages) {
     ASSERT_TRUE(result.messages[0].body.find("Body A") != std::string::npos);
     ASSERT_TRUE(result.messages[0].body.find("Body B") != std::string::npos);
     ASSERT_TRUE(run.error.empty());
+    PASS();
+#endif
+}
+
+#ifndef _WIN32
+namespace {
+
+// Mailbox with one message; records every command. Ends when the client
+// sends BYE or closes the connection.
+void scriptedMailbox(int client, std::vector<std::string>& lines, std::string& error) {
+    if (!sendLine(client, "Callsign:")) { error = "failed callsign prompt"; return; }
+    std::string line;
+    if (!recvLine(client, &line)) { error = "missing callsign"; return; }
+    if (!sendLine(client, "Password:")) { error = "failed password prompt"; return; }
+    if (!recvLine(client, &line)) { error = "missing password"; return; }
+    if (!sendAll(client, "Welcome\r\n>\r\n")) { error = "failed welcome"; return; }
+    while (recvLine(client, &line)) {
+        lines.push_back(line);
+        if (startsWith(line, "LM") || startsWith(line, "L ") || line == "L" || startsWith(line, "LIST")) {
+            (void)sendAll(client, "1 TEST Inbox item\r\n>\r\n");
+        } else if (startsWith(line, "R ") || startsWith(line, "RM ") || startsWith(line, "READ ")) {
+            (void)sendAll(client,
+                          "From: TEST\r\nTo: N0CALL\r\nSubject: Gate\r\nMsgId: MID-7\r\n\r\nBody\r\n>\r\n");
+        } else if (startsWith(line, "K ") || startsWith(line, "KM ") ||
+                   startsWith(line, "DEL ") || startsWith(line, "DELETE ")) {
+            (void)sendAll(client, "Deleted\r\n>\r\n");
+        } else if (startsWith(line, "BYE")) {
+            break;
+        }
+    }
+}
+
+WinlinkTelnetFetchRequest gateRequest(uint16_t port) {
+    WinlinkTelnetFetchRequest req;
+    req.host = "127.0.0.1";
+    req.port = port;
+    req.use_tls = false;
+    req.timeout_ms = 8000;
+    req.callsign = "N0CALL";
+    req.password = "secret";
+    req.max_messages = 3;
+    req.delete_after_fetch = true;
+    return req;
+}
+
+bool sawKill(const std::vector<std::string>& lines) {
+    return std::any_of(lines.begin(), lines.end(), [](const std::string& l) {
+        return startsWith(l, "K ") || startsWith(l, "KM ") || startsWith(l, "DEL");
+    });
+}
+
+} // namespace
+#endif
+
+// Messages are only killed on the server after the caller holds them; a
+// refused commit leaves them on the server.
+TEST(fetch_kills_only_after_commit) {
+#ifdef _WIN32
+    PASS();
+#else
+    {
+        auto run = startMockServer(scriptedMailbox);
+        std::vector<std::string> seen_at_commit;
+        size_t lines_at_commit = 0;
+        auto result = fetchWinlinkTelnetMessages(
+            gateRequest(run.port), [&](const WinlinkTelnetFetchResult& r) {
+                lines_at_commit = run.lines.size();
+                for (const auto& m : r.messages) seen_at_commit.push_back(m.subject);
+                return false;  // not stored: keep server copies
+            });
+        run.thread.join();
+        ASSERT_TRUE(result.success);
+        ASSERT_FALSE(result.committed);
+        ASSERT_EQ(seen_at_commit.size(), size_t(1));
+        ASSERT_FALSE(sawKill(run.lines));
+        ASSERT_TRUE(lines_at_commit > 0);
+    }
+    {
+        auto run = startMockServer(scriptedMailbox);
+        bool killed_before_commit = true;
+        auto result = fetchWinlinkTelnetMessages(
+            gateRequest(run.port), [&](const WinlinkTelnetFetchResult&) {
+                killed_before_commit = sawKill(run.lines);
+                return true;
+            });
+        run.thread.join();
+        ASSERT_TRUE(result.committed);
+        ASSERT_FALSE(killed_before_commit);
+        ASSERT_TRUE(sawKill(run.lines));
+    }
+    PASS();
+#endif
+}
+
+// A server that accepts but never says anything cannot hold the fetch.
+TEST(fetch_silent_server_times_out) {
+#ifdef _WIN32
+    PASS();
+#else
+    auto run = startMockServer([](int client, std::vector<std::string>&, std::string&) {
+        char c;
+        while (::recv(client, &c, 1, 0) > 0) {}  // never answer
+    });
+    WinlinkTelnetFetchRequest req = gateRequest(run.port);
+    req.timeout_ms = 1000;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = fetchWinlinkTelnetMessages(req);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    ASSERT_FALSE(result.success);
+    ASSERT_TRUE(elapsed < std::chrono::seconds(8));
     PASS();
 #endif
 }

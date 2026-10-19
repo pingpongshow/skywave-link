@@ -15,7 +15,7 @@ public:
     std::function<void(const std::string&, const std::string&)> onUpload;
     std::function<void(const BBSFile&)> onDownload;
     std::function<void(const std::string&)> onDelete;
-    std::function<std::string()> onOpenFileDialog;
+    PathPicker onOpenFileDialog;
 };
 
 } // namespace skylink

@@ -20,7 +20,10 @@
     #include <unistd.h>
     #include <fcntl.h>
     #include <errno.h>
+    #include <poll.h>
 #endif
+#include <mutex>
+#include <thread>
 
 namespace skylink {
 
@@ -58,58 +61,105 @@ APRSClient::~APRSClient() {
     disconnect();
 }
 
-bool APRSClient::connect(const std::string& server, uint16_t port) {
-    if (isConnected()) {
-        disconnect();
+void APRSClient::closeSocket(socket_t& sock) {
+    if (sock != INVALID_SOCK) {
+#ifdef _WIN32
+        closesocket(sock);
+#else
+        close(sock);
+#endif
+        sock = INVALID_SOCK;
     }
+}
 
-    state_ = APRSState::Connecting;
-    if (state_callback_) state_callback_(state_);
-
+// DNS lookup plus a non-blocking connect with a deadline per address, so an
+// unreachable server costs at most `timeout_ms` instead of the OS timeout.
+// The returned socket is left non-blocking.
+bool APRSClient::openSocket(const std::string& server, uint16_t port, int timeout_ms,
+                            socket_t* out, std::string* error) {
+    *out = INVALID_SOCK;
     struct addrinfo hints{}, *result = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     std::string port_str = std::to_string(port);
     if (getaddrinfo(server.c_str(), port_str.c_str(), &hints, &result) != 0) {
-        state_ = APRSState::Error;
-        if (state_callback_) state_callback_(state_);
+        if (error) *error = "Cannot resolve " + server;
         return false;
     }
 
-    bool connected = false;
+    socket_t sock = INVALID_SOCK;
     for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
-        socket_ = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (socket_ == INVALID_SOCK) {
+        sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (sock == INVALID_SOCK) {
             continue;
         }
-        if (::connect(socket_, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
+        bool connected = false;
+#ifdef _WIN32
+        u_long mode = 1;
+        ioctlsocket(sock, FIONBIO, &mode);
+        if (::connect(sock, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
             connected = true;
+        } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+            if (select(0, nullptr, &wfds, nullptr, &tv) == 1) {
+                int err = 0;
+                int len = sizeof(err);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+                connected = (err == 0);
+            }
+        }
+#else
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        if (::connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) {
+            connected = true;
+        } else if (errno == EINPROGRESS) {
+            pollfd pfd{sock, POLLOUT, 0};
+            int rc;
+            do {
+                rc = ::poll(&pfd, 1, timeout_ms);
+            } while (rc < 0 && errno == EINTR);
+            if (rc == 1) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+                connected = (err == 0);
+            }
+        }
+#endif
+        if (connected) {
             break;
         }
-#ifdef _WIN32
-        closesocket(socket_);
-#else
-        close(socket_);
-#endif
-        socket_ = INVALID_SOCK;
+        closeSocket(sock);
     }
 
     freeaddrinfo(result);
-    if (!connected || socket_ == INVALID_SOCK) {
+    if (sock == INVALID_SOCK) {
+        if (error) *error = "Cannot connect to " + server + ":" + port_str;
+        return false;
+    }
+    *out = sock;
+    return true;
+}
+
+bool APRSClient::connect(const std::string& server, uint16_t port) {
+    if (isConnected()) {
+        disconnect();
+    }
+    cancelConnect();
+
+    state_ = APRSState::Connecting;
+    if (state_callback_) state_callback_(state_);
+
+    if (!openSocket(server, port, kConnectTimeoutMs, &socket_, &last_connect_error_)) {
         state_ = APRSState::Error;
         if (state_callback_) state_callback_(state_);
         return false;
     }
-
-    // Set non-blocking
-#ifdef _WIN32
-    u_long mode = 1;
-    ioctlsocket(socket_, FIONBIO, &mode);
-#else
-    int flags = fcntl(socket_, F_GETFL, 0);
-    fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
-#endif
 
     state_ = APRSState::Authenticating;
     if (state_callback_) state_callback_(state_);
@@ -117,11 +167,12 @@ bool APRSClient::connect(const std::string& server, uint16_t port) {
     return true;
 }
 
-bool APRSClient::authenticate(const std::string& callsign, const std::string& passcode_in) {
+int APRSClient::loginOnSocket(socket_t sock, const std::string& callsign,
+                              const std::string& passcode_in, std::string* error) {
     std::string passcode = passcode_in;
     while (!passcode.empty() && std::isspace(static_cast<unsigned char>(passcode.back()))) passcode.pop_back();
     while (!passcode.empty() && std::isspace(static_cast<unsigned char>(passcode.front()))) passcode.erase(0, 1);
-    if (socket_ == INVALID_SOCK) return false;
+    if (sock == INVALID_SOCK) return 0;
     // Both go verbatim on the login line: callsign must be a plain callsign
     // and the passcode an integer (e.g. "12345" or "-1" for receive-only).
     bool passcode_ok = !passcode.empty() && passcode.size() <= 6;
@@ -131,18 +182,26 @@ bool APRSClient::authenticate(const std::string& callsign, const std::string& pa
     }
     if (!isValidCallsign(callsign) || !passcode_ok) {
         std::cerr << "[APRS] Invalid callsign/passcode for login\n";
-        return false;
+        if (error) *error = "Invalid callsign/passcode for login";
+        return 0;
     }
-
-    my_callsign_ = callsign;
 
     // Build login string: user CALLSIGN pass PASSCODE vers SOFTWARE VERSION filter FILTER
     std::stringstream ss;
     ss << "user " << callsign << " pass " << passcode
        << " vers Skywave-Link 1.0.0\r\n";
-
-    if (!sendPacket(ss.str())) {
-        return false;
+    const std::string login = ss.str();
+#ifdef _WIN32
+    const bool sent = send(sock, login.c_str(), static_cast<int>(login.size()), 0) ==
+                      static_cast<int>(login.size());
+#else
+    const bool sent = send(sock, login.c_str(), login.size(), 0) ==
+                      static_cast<ssize_t>(login.size());
+#endif
+    if (!sent) {
+        std::cerr << "[APRS] send() failed for login\n";
+        if (error) *error = "Login send failed";
+        return 0;
     }
 
     // Read server response to verify authentication
@@ -150,30 +209,139 @@ bool APRSClient::authenticate(const std::string& callsign, const std::string& pa
     char resp_buf[512];
     fd_set readfds;
     FD_ZERO(&readfds);
-    FD_SET(socket_, &readfds);
+    FD_SET(sock, &readfds);
     struct timeval tv = {2, 0};  // 2 second timeout
-    if (select(static_cast<int>(socket_) + 1, &readfds, nullptr, nullptr, &tv) > 0) {
-        int rn = recv(socket_, resp_buf, sizeof(resp_buf) - 1, 0);
+    if (select(static_cast<int>(sock) + 1, &readfds, nullptr, nullptr, &tv) > 0) {
+        int rn = static_cast<int>(recv(sock, resp_buf, sizeof(resp_buf) - 1, 0));
         if (rn == 0) {
-            disconnect();  // server closed the connection
-            return false;
+            if (error) *error = "Server closed the connection";
+            return -1;  // server closed the connection
         }
         if (rn > 0) {
             resp_buf[rn] = '\0';
             std::string response(resp_buf);
             if (response.find("unverified") != std::string::npos) {
                 std::cerr << "[APRS] Authentication failed: unverified\n";
-                return false;
+                if (error) *error = "Authentication failed: unverified";
+                return 0;
             }
         }
     }
+    return 1;
+}
 
+bool APRSClient::authenticate(const std::string& callsign, const std::string& passcode) {
+    if (socket_ == INVALID_SOCK) return false;
+    const int rc = loginOnSocket(socket_, callsign, passcode, &last_connect_error_);
+    if (rc < 0) {
+        disconnect();  // server closed the connection
+        return false;
+    }
+    if (rc == 0) {
+        return false;
+    }
+    my_callsign_ = callsign;
     state_ = APRSState::Connected;
     if (state_callback_) state_callback_(state_);
     return true;
 }
 
+// Shared by the helper thread and the client; the client may be destroyed
+// (or the connect cancelled) while the helper still waits on the network.
+struct APRSClient::ConnectJob {
+    std::mutex mu;
+    bool done = false;
+    bool cancelled = false;
+    bool ok = false;
+    socket_t sock = INVALID_SOCK;
+    std::string callsign;
+    std::string error;
+};
+
+bool APRSClient::beginConnect(const std::string& server, uint16_t port,
+                              const std::string& callsign, const std::string& passcode) {
+    if (socket_ != INVALID_SOCK) {
+        disconnect();
+    }
+    cancelConnect();
+    last_connect_error_.clear();
+    state_ = APRSState::Connecting;
+    if (state_callback_) state_callback_(state_);
+
+    auto job = std::make_shared<ConnectJob>();
+    job->callsign = callsign;
+    connect_job_ = job;
+    try {
+        std::thread([job, server, port, callsign, passcode]() {
+            socket_t sock = INVALID_SOCK;
+            std::string error;
+            bool ok = openSocket(server, port, kConnectTimeoutMs, &sock, &error);
+            if (ok && loginOnSocket(sock, callsign, passcode, &error) != 1) {
+                ok = false;
+                closeSocket(sock);
+            }
+            std::lock_guard<std::mutex> lock(job->mu);
+            if (job->cancelled) {
+                closeSocket(sock);
+            } else {
+                job->ok = ok;
+                job->sock = sock;
+                job->error = error;
+            }
+            job->done = true;
+        }).detach();
+    } catch (const std::exception&) {
+        connect_job_.reset();
+        state_ = APRSState::Error;
+        if (state_callback_) state_callback_(state_);
+        return false;
+    }
+    return true;
+}
+
+APRSConnectProgress APRSClient::pollConnect() {
+    if (!connect_job_) return APRSConnectProgress::None;
+    std::shared_ptr<ConnectJob> job = connect_job_;
+    {
+        std::lock_guard<std::mutex> lock(job->mu);
+        if (!job->done) return APRSConnectProgress::InProgress;
+        connect_job_.reset();
+        if (!job->ok) {
+            last_connect_error_ = job->error;
+        } else {
+            socket_ = job->sock;
+            job->sock = INVALID_SOCK;
+            my_callsign_ = job->callsign;
+        }
+    }
+    if (socket_ == INVALID_SOCK) {
+        send_position_on_connect_ = false;
+        state_ = APRSState::Error;
+        if (state_callback_) state_callback_(state_);
+        return APRSConnectProgress::Failed;
+    }
+    state_ = APRSState::Connected;
+    if (state_callback_) state_callback_(state_);
+    if (send_position_on_connect_) {
+        send_position_on_connect_ = false;
+        queued_position_sent_ = sendPositionNow();
+    }
+    return APRSConnectProgress::Connected;
+}
+
+void APRSClient::cancelConnect() {
+    if (!connect_job_) return;
+    {
+        std::lock_guard<std::mutex> lock(connect_job_->mu);
+        connect_job_->cancelled = true;
+        closeSocket(connect_job_->sock);  // finished but never adopted
+    }
+    connect_job_.reset();
+    send_position_on_connect_ = false;
+}
+
 void APRSClient::disconnect() {
+    cancelConnect();
     if (socket_ != INVALID_SOCK) {
 #ifdef _WIN32
         closesocket(socket_);

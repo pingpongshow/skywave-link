@@ -286,6 +286,11 @@ bool MessageStore::createTables() {
         CREATE INDEX IF NOT EXISTS idx_ping_callsign ON ping_history(callsign);
         CREATE INDEX IF NOT EXISTS idx_ping_timestamp ON ping_history(timestamp);
 
+        CREATE TABLE IF NOT EXISTS internet_relay_queue (
+            message_store_id INTEGER PRIMARY KEY,
+            queued_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS mail_read_state (
             message_id TEXT PRIMARY KEY,
             is_read INTEGER NOT NULL DEFAULT 0,
@@ -680,6 +685,91 @@ int MessageStore::countPendingMessages() {
     return count;
 #else
     return 0;
+#endif
+}
+
+bool MessageStore::queueInternetRelay(int64_t id) {
+#ifdef SKYWAVE_LINK_HAS_SQLITE
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_ || id <= 0) return false;
+    const char* sql =
+        "INSERT OR IGNORE INTO internet_relay_queue (message_store_id, queued_at) VALUES (?, ?)";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    sqlite3_bind_int64(stmt, 1, id);
+    sqlite3_bind_int64(stmt, 2, now);
+    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+#else
+    (void)id;
+    return false;
+#endif
+}
+
+bool MessageStore::markRelayedAndDequeue(int64_t id) {
+#ifdef SKYWAVE_LINK_HAS_SQLITE
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_ || id <= 0) return false;
+    auto* db = static_cast<sqlite3*>(db_);
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    bool ok = true;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "UPDATE messages SET status = ?, sent_at = ? WHERE id = ?",
+                           -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, static_cast<int>(MessageStatus::Sent));
+        sqlite3_bind_int64(stmt, 2, now);
+        sqlite3_bind_int64(stmt, 3, id);
+        ok = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+    } else {
+        ok = false;
+    }
+    if (ok && sqlite3_prepare_v2(db, "DELETE FROM internet_relay_queue WHERE message_store_id = ?",
+                                 -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, id);
+        ok = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+    } else {
+        ok = false;
+    }
+    sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", nullptr, nullptr, nullptr);
+    return ok;
+#else
+    (void)id;
+    return false;
+#endif
+}
+
+std::vector<Message> MessageStore::loadInternetRelayQueue() {
+#ifdef SKYWAVE_LINK_HAS_SQLITE
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) return {};
+    const char* sql =
+        "SELECT m.id, m.message_id, m.type, m.status, m.from_callsign, m.to_callsign, "
+        "m.subject, m.body, m.attachments, m.created_at, m.sent_at, m.delivered_at, "
+        "m.expires_at, m.retry_count, m.priority FROM internet_relay_queue q "
+        "JOIN messages m ON m.id = q.message_store_id ORDER BY q.queued_at, m.id";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return {};
+    }
+    std::vector<Message> messages;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        messages.push_back(rowToMessage(stmt));
+    }
+    sqlite3_finalize(stmt);
+    return messages;
+#else
+    return {};
 #endif
 }
 

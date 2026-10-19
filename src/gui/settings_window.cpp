@@ -837,13 +837,13 @@ void SettingsWindow::render() {
             }
             if (ImGui::Button("Browse...")) {
                 if (onBrowseDownloadPath) {
-                    const std::string selected = onBrowseDownloadPath();
-                    if (!selected.empty()) {
-                        std::strncpy(download_path, selected.c_str(), sizeof(download_path) - 1);
-                        download_path[sizeof(download_path) - 1] = '\0';
-                        config_.files.download_path = download_path;
-                        last_loaded_download_path = config_.files.download_path;
-                    }
+                    // The field above reloads from config_ when it changes.
+                    AppConfig* config = &config_;
+                    onBrowseDownloadPath([config](const std::string& selected) {
+                        if (!selected.empty()) {
+                            config->files.download_path = selected;
+                        }
+                    });
                 }
             }
             if (!onBrowseDownloadPath) {
@@ -1347,7 +1347,8 @@ void SettingsWindow::render() {
 
             static char away_msg[512] = "";
             std::strncpy(away_msg, config_.away.away_message.c_str(), sizeof(away_msg) - 1);
-            if (ImGui::InputTextMultiline("Away Message", away_msg, sizeof(away_msg), ImVec2(-1, 60))) {
+            if (ImGui::InputTextMultiline("Away Message", away_msg, sizeof(away_msg),
+                                          ImVec2(ImGui::CalcItemWidth(), ImGui::GetTextLineHeight() * 4.0f))) {
                 config_.away.away_message = away_msg;
             }
 

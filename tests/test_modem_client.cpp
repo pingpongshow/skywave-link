@@ -362,6 +362,95 @@ TEST(voice_status_fields_parse) {
     PASS();
 }
 
+// Non-blocking commands: replies are matched in order without the caller
+// waiting, ERROR: fails the oldest pending command, and a command whose
+// reply never comes is reported once the deadline passes.
+TEST(async_commands_resolve_in_order) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    m.reply("ABORT", 0, "ERROR:STATE");
+    m.reply("CQ", 0, "");  // swallowed: no reply line
+
+    std::vector<std::string> log;
+    auto record = [&log](const char* name) {
+        return [&log, name](bool ok, const std::string& resp) {
+            log.push_back(std::string(name) + (ok ? ":ok:" : ":fail:") + resp);
+        };
+    };
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(c.sendCommandAsync("MYCALL N0CALL", record("mycall")));
+    ASSERT_TRUE(c.sendCommandAsync("ABORT", record("abort")));
+    ASSERT_TRUE(c.sendCommandAsync("CQ", record("cq"), 200));
+    const auto sent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    ASSERT_TRUE(sent_ms < 50);  // nothing waited for the modem
+    ASSERT_EQ(c.pendingAsyncCommands(), size_t(3));
+
+    pump(c, 400);
+    ASSERT_EQ(log.size(), size_t(3));
+    ASSERT_EQ(log[0], std::string("mycall:ok:MYCALL"));
+    ASSERT_EQ(log[1], std::string("abort:fail:ERROR:STATE"));
+    ASSERT_EQ(log[2], std::string("cq:fail:"));
+    ASSERT_EQ(c.pendingAsyncCommands(), size_t(0));
+
+    // In non-blocking mode the high-level commands return at once.
+    c.setNonBlockingCommands(true);
+    m.reply("CONNECT", 300, "CONNECT N1CALL");
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(c.connectToStation("n1call"));
+    ASSERT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(100));
+    ASSERT_EQ(c.pendingAsyncCommands(), size_t(1));
+    pump(c, 450);
+    ASSERT_EQ(c.pendingAsyncCommands(), size_t(0));
+    PASS();
+}
+
+// Background connect: returns at once, reports the result once from
+// pollConnect(), and a refused port fails without hanging.
+TEST(background_connect_reports_once) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.beginConnect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    ASSERT_TRUE(c.isConnecting());
+    ConnectProgress p = ConnectProgress::InProgress;
+    for (int i = 0; i < 200 && p == ConnectProgress::InProgress; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        p = c.pollConnect();
+    }
+    ASSERT_TRUE(p == ConnectProgress::Connected);
+    ASSERT_TRUE(c.isConnected());
+    ASSERT_TRUE(c.pollConnect() == ConnectProgress::None);
+    m.acceptAll();
+    ASSERT_EQ(c.getVersion().empty(), false);
+    c.disconnect();
+
+    // Nothing listens on the freed port: the connect is refused.
+    uint16_t dead_port = 0;
+    int l = makeListener(&dead_port);
+    close(l);
+    ModemClient d;
+    ASSERT_TRUE(d.beginConnect("127.0.0.1", dead_port, dead_port, dead_port));
+    p = ConnectProgress::InProgress;
+    for (int i = 0; i < 400 && p == ConnectProgress::InProgress; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        p = d.pollConnect();
+    }
+    ASSERT_TRUE(p == ConnectProgress::Failed);
+    ASSERT_FALSE(d.isConnected());
+
+    // Cancelling an in-flight connect leaves the client disconnected.
+    ModemClient e;
+    ASSERT_TRUE(e.beginConnect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    e.disconnect();
+    ASSERT_FALSE(e.isConnecting());
+    ASSERT_FALSE(e.isConnected());
+    PASS();
+}
+
 #endif
 
 TEST_MAIN()

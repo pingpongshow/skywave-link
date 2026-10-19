@@ -26,6 +26,7 @@
     #include <unistd.h>
     #include <fcntl.h>
     #include <errno.h>
+    #include <poll.h>
 #endif
 
 namespace skylink {
@@ -284,10 +285,17 @@ ModemClient::ModemClient() {
 }
 
 ModemClient::~ModemClient() {
+    // Owners' callbacks must not run while the owner is being torn down.
+    async_commands_.clear();
     disconnect();
 }
 
-bool ModemClient::connectSocket(socket_t& sock, const std::string& host, uint16_t port) {
+// Connects with a deadline: the socket is made non-blocking first, so an
+// unreachable host costs at most `timeout_ms` per address instead of the
+// OS connect timeout (over a minute).
+
+bool ModemClient::connectSocket(socket_t& sock, const std::string& host, uint16_t port,
+                                int timeout_ms) {
     struct addrinfo hints{}, *result = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -305,7 +313,41 @@ bool ModemClient::connectSocket(socket_t& sock, const std::string& host, uint16_
         if (sock == INVALID_SOCK) {
             continue;
         }
+        setNonBlocking(sock);
+        bool connected = false;
+#ifdef _WIN32
         if (::connect(sock, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
+            connected = true;
+        } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+            if (select(0, nullptr, &wfds, nullptr, &tv) == 1) {
+                int err = 0;
+                int len = sizeof(err);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+                connected = (err == 0);
+            }
+        }
+#else
+        if (::connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) {
+            connected = true;
+        } else if (errno == EINPROGRESS) {
+            pollfd pfd{sock, POLLOUT, 0};
+            int rc;
+            do {
+                rc = ::poll(&pfd, 1, timeout_ms);
+            } while (rc < 0 && errno == EINTR);
+            if (rc == 1) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+                connected = (err == 0);
+            }
+        }
+#endif
+        if (connected) {
             break;
         }
         closeSocket(sock);
@@ -357,37 +399,12 @@ bool ModemClient::connect(const std::string& host,
         disconnect();
     }
 
+    cancelConnect();
     host_ = host;
     cmd_port_ = cmd_port;
     data_port_ = data_port;
     voice_port_ = voice_port;
-
-    {
-        std::lock_guard<std::mutex> lock(status_mutex_);
-        status_.state = ModemState::Connecting;
-        status_.link_state = LinkState::Idle;
-        status_.remote_callsign.clear();
-        status_.busy_detected = false;
-        status_.ptt_active = false;
-        status_.tx_buffer_bytes = 0;
-        status_.voice = VoiceStatus{};
-    }
-
-    clearResponseQueue();
-    cmd_buffer_.clear();
-    data_buffer_.clear();
-    session_rx_.clear();
-    {
-        std::lock_guard<std::mutex> lock(data_tx_mutex_);
-        data_tx_pending_.clear();
-    }
-    voice_buffer_.clear();
-    {
-        std::lock_guard<std::mutex> lock(voice_mutex_);
-        voice_rx_samples_.clear();
-    }
-    voice_tx_sequence_ = 0;
-    voice_tx_sample_counter_ = 0;
+    resetSessionState();
 
     // Connect command port
     if (!connectSocket(cmd_socket_, host, cmd_port)) {
@@ -421,7 +438,141 @@ bool ModemClient::connect(const std::string& host,
     return true;
 }
 
+// Shared by the helper thread and the client: the client may be destroyed
+// (or the connect cancelled) while the helper still waits on the network.
+struct ModemClient::ConnectJob {
+    std::mutex mu;
+    bool done = false;
+    bool cancelled = false;
+    bool ok = false;
+    socket_t cmd = INVALID_SOCK;
+    socket_t data = INVALID_SOCK;
+    socket_t voice = INVALID_SOCK;
+};
+
+bool ModemClient::beginConnect(const std::string& host,
+                               uint16_t cmd_port,
+                               uint16_t data_port,
+                               uint16_t voice_port) {
+    if (isConnected()) {
+        disconnect();
+    }
+    cancelConnect();
+    host_ = host;
+    cmd_port_ = cmd_port;
+    data_port_ = data_port;
+    voice_port_ = voice_port;
+    resetSessionState();
+
+    auto job = std::make_shared<ConnectJob>();
+    connect_job_ = job;
+    try {
+        std::thread([job, host, cmd_port, data_port, voice_port]() {
+            socket_t cmd = INVALID_SOCK;
+            socket_t data = INVALID_SOCK;
+            socket_t voice = INVALID_SOCK;
+            bool ok = connectSocket(cmd, host, cmd_port);
+            if (ok) {
+                ok = connectSocket(data, host, data_port);
+                if (!ok) closeSocket(cmd);
+            }
+            if (ok && !connectSocket(voice, host, voice_port)) {
+                voice = INVALID_SOCK;
+            }
+            std::lock_guard<std::mutex> lock(job->mu);
+            if (job->cancelled) {
+                closeSocket(cmd);
+                closeSocket(data);
+                closeSocket(voice);
+            } else {
+                job->ok = ok;
+                job->cmd = cmd;
+                job->data = data;
+                job->voice = voice;
+            }
+            job->done = true;
+        }).detach();
+    } catch (const std::exception&) {
+        connect_job_.reset();
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.state = ModemState::Error;
+        return false;
+    }
+    return true;
+}
+
+ConnectProgress ModemClient::pollConnect() {
+    if (!connect_job_) return ConnectProgress::None;
+    std::shared_ptr<ConnectJob> job = connect_job_;
+    std::lock_guard<std::mutex> lock(job->mu);
+    if (!job->done) return ConnectProgress::InProgress;
+    connect_job_.reset();
+    if (!job->ok) {
+        std::lock_guard<std::mutex> status_lock(status_mutex_);
+        status_.state = ModemState::Error;
+        return ConnectProgress::Failed;
+    }
+    cmd_socket_ = job->cmd;
+    data_socket_ = job->data;
+    voice_socket_ = job->voice;
+    job->cmd = job->data = job->voice = INVALID_SOCK;
+    if (voice_socket_ == INVALID_SOCK) {
+        std::cerr << "[ModemClient] voice port " << voice_port_
+                  << " unavailable; continuing without voice media\n";
+    }
+    std::lock_guard<std::mutex> status_lock(status_mutex_);
+    status_.state = ModemState::Connected;
+    return ConnectProgress::Connected;
+}
+
+void ModemClient::cancelConnect() {
+    if (!connect_job_) return;
+    {
+        std::lock_guard<std::mutex> lock(connect_job_->mu);
+        connect_job_->cancelled = true;
+        // Finished but never adopted: the sockets are ours to close.
+        closeSocket(connect_job_->cmd);
+        closeSocket(connect_job_->data);
+        closeSocket(connect_job_->voice);
+    }
+    connect_job_.reset();
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    if (status_.state == ModemState::Connecting) {
+        status_.state = ModemState::Disconnected;
+    }
+}
+
+void ModemClient::resetSessionState() {
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.state = ModemState::Connecting;
+        status_.link_state = LinkState::Idle;
+        status_.remote_callsign.clear();
+        status_.busy_detected = false;
+        status_.ptt_active = false;
+        status_.tx_buffer_bytes = 0;
+        status_.voice = VoiceStatus{};
+    }
+
+    clearResponseQueue();
+    cmd_buffer_.clear();
+    data_buffer_.clear();
+    session_rx_.clear();
+    {
+        std::lock_guard<std::mutex> lock(data_tx_mutex_);
+        data_tx_pending_.clear();
+    }
+    voice_buffer_.clear();
+    {
+        std::lock_guard<std::mutex> lock(voice_mutex_);
+        voice_rx_samples_.clear();
+    }
+    voice_tx_sequence_ = 0;
+    voice_tx_sample_counter_ = 0;
+}
+
 void ModemClient::disconnect() {
+    cancelConnect();
     closeSocket(cmd_socket_);
     closeSocket(data_socket_);
     closeSocket(voice_socket_);
@@ -447,7 +598,7 @@ void ModemClient::disconnect() {
         voice_rx_samples_.clear();
     }
     clearResponseQueue();
-
+    failAsyncCommands("disconnected");
 }
 
 void ModemClient::clearResponseQueue() {
@@ -465,6 +616,9 @@ bool ModemClient::hasVoiceMedia() const {
 }
 
 void ModemClient::poll() {
+    if (!isConnected()) return;
+
+    expireAsyncCommands();
     if (!isConnected()) return;
 
     flushPendingData();
@@ -1101,6 +1255,10 @@ void ModemClient::processCommandResponse(const std::string& line) {
         if (state_callback_) state_callback_(state);
     }
 
+    if (takeAsyncReply(line)) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(response_mutex_);
     response_queue_.push(line);
     // Fire-and-forget commands (sendCommand without getResponse) leave
@@ -1128,6 +1286,17 @@ void ModemClient::onLinkStateChanged(LinkState previous, LinkState next) {
 }
 
 bool ModemClient::sendCommand(const std::string& cmd) {
+    if (!nonblocking_commands_) {
+        return writeCommandLine(cmd);
+    }
+    // Fire-and-forget, but still tracked so its reply (or `ERROR:`) is not
+    // mistaken for the answer to a later non-blocking command.
+    if (!writeCommandLine(cmd)) return false;
+    trackAsyncCommand(cmd, {}, 3000, /*silent=*/true);
+    return true;
+}
+
+bool ModemClient::writeCommandLine(const std::string& cmd) {
     if (!isConnected()) return false;
 
     std::string full_cmd = cmd + "\n";
@@ -1144,6 +1313,9 @@ bool ModemClient::sendCommand(const std::string& cmd) {
 // Skywave answers a command by echoing its verb (`LISTEN ON`, `CONNECT W1AW`)
 // or with `ERROR:<reason>`. There is no `OK`.
 bool ModemClient::sendCommandOk(const std::string& cmd, int timeout_ms) {
+    if (nonblocking_commands_) {
+        return sendCommandAsync(cmd, {}, std::max(timeout_ms, 3000));
+    }
     const auto response = sendCommandForResponse(cmd, timeout_ms);
     if (!response) return false;
     if (startsWith(*response, "ERROR:")) {
@@ -1151,6 +1323,89 @@ bool ModemClient::sendCommandOk(const std::string& cmd, int timeout_ms) {
         return false;
     }
     return true;
+}
+
+bool ModemClient::sendCommandAsync(const std::string& cmd,
+                                   CommandResultCallback cb,
+                                   int timeout_ms) {
+    if (!writeCommandLine(cmd)) {
+        std::cerr << "[ModemClient] '" << trimCopy(cmd) << "' -> not sent\n";
+        if (cb) cb(false, "");
+        return false;
+    }
+    trackAsyncCommand(cmd, std::move(cb), timeout_ms, /*silent=*/false);
+    return true;
+}
+
+void ModemClient::trackAsyncCommand(const std::string& cmd, CommandResultCallback cb,
+                                    int timeout_ms, bool silent) {
+    const std::string trimmed = trimCopy(cmd);
+    PendingCommand pending;
+    pending.cmd = trimmed;
+    pending.verb = upperCopy(trimmed.substr(0, trimmed.find(' ')));
+    pending.cb = std::move(cb);
+    pending.silent = silent;
+    pending.deadline = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(std::max(timeout_ms, 1));
+    async_commands_.push_back(std::move(pending));
+}
+
+// The modem answers control commands in order, so a reply belongs to the
+// oldest pending async command with that verb; older ones got no reply.
+// `ERROR:` carries no verb and is taken as the oldest command's answer.
+bool ModemClient::takeAsyncReply(const std::string& line) {
+    if (async_commands_.empty()) return false;
+    size_t match = async_commands_.size();
+    if (startsWith(line, "ERROR:")) {
+        match = 0;
+    } else {
+        for (size_t i = 0; i < async_commands_.size(); ++i) {
+            if (responseMatchesVerb(line, async_commands_[i].verb)) {
+                match = i;
+                break;
+            }
+        }
+    }
+    if (match == async_commands_.size()) return false;
+
+    std::vector<PendingCommand> skipped(std::make_move_iterator(async_commands_.begin()),
+                                        std::make_move_iterator(async_commands_.begin() + match));
+    PendingCommand answered = std::move(async_commands_[match]);
+    async_commands_.erase(async_commands_.begin(), async_commands_.begin() + match + 1);
+
+    for (auto& p : skipped) {
+        if (!p.silent) std::cerr << "[ModemClient] '" << p.cmd << "' -> no reply\n";
+        if (p.cb) p.cb(false, "");
+    }
+    const bool ok = !startsWith(line, "ERROR:");
+    if (!ok && !answered.silent) {
+        std::cerr << "[ModemClient] '" << answered.cmd << "' -> " << line << "\n";
+    }
+    if (answered.cb) answered.cb(ok, line);
+    return true;
+}
+
+void ModemClient::expireAsyncCommands() {
+    const auto now = std::chrono::steady_clock::now();
+    while (!async_commands_.empty() && async_commands_.front().deadline <= now) {
+        PendingCommand expired = std::move(async_commands_.front());
+        async_commands_.pop_front();
+        if (!expired.silent) {
+            std::cerr << "[ModemClient] '" << expired.cmd << "' -> no reply (timeout)\n";
+        }
+        if (expired.cb) expired.cb(false, "");
+    }
+}
+
+void ModemClient::failAsyncCommands(const char* reason) {
+    std::deque<PendingCommand> failed;
+    failed.swap(async_commands_);
+    for (auto& p : failed) {
+        if (reason && *reason && !p.silent) {
+            std::cerr << "[ModemClient] '" << p.cmd << "' -> " << reason << "\n";
+        }
+        if (p.cb) p.cb(false, "");
+    }
 }
 
 // Responses carry no id, so correlation is by position plus verb: stale
@@ -1163,7 +1418,7 @@ std::optional<std::string> ModemClient::sendCommandForResponse(const std::string
     const std::string verb = upperCopy(trimmed.substr(0, trimmed.find(' ')));
 
     clearResponseQueue();
-    if (!sendCommand(cmd)) {
+    if (!writeCommandLine(cmd)) {
         return std::nullopt;
     }
 

@@ -1,6 +1,7 @@
 // POP3 Client - Email retrieval via POP3 with TLS support
 
 #include "skywave_link/pop3_client.hpp"
+#include "net_timeouts.hpp"
 
 #include <string>
 #include <vector>
@@ -145,6 +146,8 @@ POP3RetrievedMessage parseEmailMessage(const std::string& raw) {
             msg.to = trim(line.substr(3));
         } else if (startsWithCI(line, "subject:")) {
             msg.subject = trim(line.substr(8));
+        } else if (startsWithCI(line, "message-id:")) {
+            msg.message_id = trim(line.substr(11));
         }
     }
 
@@ -185,67 +188,21 @@ public:
     }
 
     bool connect(const std::string& host, uint16_t port, bool use_tls,
-                 std::string* error) {
+                 int timeout_ms, std::string* error) {
 #ifdef _WIN32
         WSADATA wsa_data;
         WSAStartup(MAKEWORD(2, 2), &wsa_data);
 #endif
 
-        struct addrinfo hints{}, *result = nullptr;
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-
-        std::string port_str = std::to_string(port);
-        if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result) != 0) {
-            if (error) *error = "DNS resolution failed for " + host;
-            return false;
-        }
-
-        bool connected = false;
-        for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
-            socket_ = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-            if (socket_ == INVALID_SOCK) {
-                continue;
-            }
-            if (::connect(socket_, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
-                connected = true;
-                break;
-            }
-#ifdef _WIN32
-            closesocket(socket_);
-#else
-            close(socket_);
-#endif
-            socket_ = INVALID_SOCK;
-        }
-        freeaddrinfo(result);
-        if (!connected) {
-            if (error) *error = "Failed to connect to " + host + ":" + port_str;
+        // Bounded connect (5 s) and 15 s read/write timeouts, which also
+        // bound the TLS handshake (see net_timeouts.hpp).
+        socket_ = netio::connectTcp(host, port, netio::kConnectTimeoutMs,
+                                    timeout_ms > 0 ? timeout_ms : netio::kIoTimeoutMs, error);
+        if (socket_ == INVALID_SOCK) {
             return false;
         }
         connected_ = true;
         connected_host_ = host;
-
-        // Set socket timeouts (30 seconds)
-#ifdef _WIN32
-        DWORD timeout_ms = 30000;
-        if (setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms)) != 0 ||
-            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms)) != 0) {
-            if (error) *error = "Failed to set socket timeouts";
-            disconnect();
-            return false;
-        }
-#else
-        struct timeval tv;
-        tv.tv_sec = 30;
-        tv.tv_usec = 0;
-        if (setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
-            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
-            if (error) *error = "Failed to set socket timeouts";
-            disconnect();
-            return false;
-        }
-#endif
 
         // Implicit TLS for port 995, or any non-standard port when TLS requested
         if (use_tls && port != 110) {
@@ -387,14 +344,16 @@ public:
 
     bool isConnected() const { return connected_ && !read_error_; }
 
-    void quit() {
+    // Returns true when the server answered +OK, i.e. entered the UPDATE
+    // state and committed any DELEs.
+    bool quit() {
         if (!isConnected()) {
             disconnect();
-            return;
+            return false;
         }
-        sendLine("QUIT");
-        readLine();  // Ignore response
+        bool ok = sendLine("QUIT") && isOK(readLine());
         disconnect();
+        return ok;
     }
 
 private:
@@ -600,6 +559,10 @@ private:
 };
 
 POP3FetchResult fetchPOP3Messages(const POP3FetchRequest& req) {
+    return fetchPOP3Messages(req, [](const POP3FetchResult&) { return true; });
+}
+
+POP3FetchResult fetchPOP3Messages(const POP3FetchRequest& req, const POP3CommitGate& commit) {
     POP3FetchResult result;
 
     if (req.host.empty()) {
@@ -612,7 +575,7 @@ POP3FetchResult fetchPOP3Messages(const POP3FetchRequest& req) {
     }
 
     POP3Client client;
-    if (!client.connect(req.host, req.port, req.use_tls, &result.error)) {
+    if (!client.connect(req.host, req.port, req.use_tls, req.timeout_ms, &result.error)) {
         return result;
     }
 
@@ -631,6 +594,9 @@ POP3FetchResult fetchPOP3Messages(const POP3FetchRequest& req) {
     std::string errors_accumulated;
 
     for (int i = 1; i <= fetch_count; ++i) {
+        if (req.stop && req.stop->load()) {
+            break;  // owner is shutting down: keep what was read, end cleanly
+        }
         std::string msg_error;
         bool complete = false;
         std::string raw = client.retrieveMessage(i, &msg_error, &complete);
@@ -659,13 +625,20 @@ POP3FetchResult fetchPOP3Messages(const POP3FetchRequest& req) {
         }
     }
 
-    client.quit();
-
     if (!result.messages.empty() || count == 0) {
         result.success = true;
     }
     if (!errors_accumulated.empty()) {
         result.error = errors_accumulated;
+    }
+
+    // The DELEs above only mark messages; the server removes them when QUIT
+    // moves the session to UPDATE. Commit only once the caller holds the
+    // messages; otherwise drop the connection and the server keeps them.
+    if (commit && commit(result)) {
+        result.committed = client.quit();
+    } else {
+        client.disconnect();
     }
 
     return result;

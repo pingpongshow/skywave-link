@@ -23,11 +23,12 @@ void FileWindow::render() {
         ImGui::SameLine();
         if (ImGui::Button("Browse...")) {
             if (onOpenFileDialog) {
-                std::string selected = onOpenFileDialog();
-                if (!selected.empty()) {
-                    std::strncpy(state_.file_path_input, selected.c_str(), state_.file_path_input_size - 1);
-                    state_.file_path_input[state_.file_path_input_size - 1] = '\0';
-                }
+                onOpenFileDialog([this](const std::string& selected) {
+                    if (!selected.empty() && state_.file_path_input) {
+                        std::strncpy(state_.file_path_input, selected.c_str(), state_.file_path_input_size - 1);
+                        state_.file_path_input[state_.file_path_input_size - 1] = '\0';
+                    }
+                });
             }
         }
 

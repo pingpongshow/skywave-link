@@ -135,6 +135,50 @@ TEST(relay_injection_blocked_and_eof_disconnects) {
     ASSERT_EQ(static_cast<int>(client.getState()), static_cast<int>(APRSState::Disconnected));
     PASS();
 }
+
+// Background login: beginConnect() returns at once, pollConnect() adopts
+// the session and sends a queued position; an unreachable server never
+// blocks the caller and can be cancelled.
+TEST(background_login_and_queued_position) {
+    FakeAprsIs srv;
+    ASSERT_TRUE(srv.start());
+    std::thread acceptor([&]() {
+        srv.acceptClient();
+        const char* banner = "# logresp N0CALL verified\r\n";
+        send(srv.client_fd, banner, strlen(banner), 0);
+    });
+    APRSClient client;
+    client.setMyPosition(41.7, -72.7);
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(client.beginConnect("127.0.0.1", srv.port, "N0CALL", "12345"));
+    ASSERT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
+    ASSERT_TRUE(client.isConnecting());
+    client.sendPositionWhenConnected();
+    APRSConnectProgress p = APRSConnectProgress::InProgress;
+    for (int i = 0; i < 300 && p == APRSConnectProgress::InProgress; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        p = client.pollConnect();
+    }
+    acceptor.join();
+    ASSERT_TRUE(p == APRSConnectProgress::Connected);
+    ASSERT_TRUE(client.isConnected());
+    ASSERT_TRUE(client.takeQueuedPositionSent());
+    ASSERT_FALSE(client.takeQueuedPositionSent());
+    const std::string sent = srv.readAvailable(200);
+    ASSERT_CONTAINS(sent, "user N0CALL pass 12345");
+    ASSERT_CONTAINS(sent, "N0CALL>APRS,TCPIP*:");
+    client.disconnect();
+
+    // TEST-NET-1 (RFC 5737) is never routed: the connect cannot complete.
+    APRSClient unreachable;
+    const auto t1 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(unreachable.beginConnect("192.0.2.1", 14580, "N0CALL", "-1"));
+    ASSERT_TRUE(std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(50));
+    ASSERT_TRUE(unreachable.pollConnect() != APRSConnectProgress::Connected);
+    unreachable.disconnect();  // cancels without waiting
+    ASSERT_FALSE(unreachable.isConnecting());
+    PASS();
+}
 #endif
 
 TEST_MAIN()

@@ -14,6 +14,7 @@
 #include "mesh_relay.hpp"
 #include "shared_state.hpp"
 #include "window_base.hpp"
+#include "email_gateway_job.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -426,6 +427,9 @@ private:
 
     // Email gateway state
     std::vector<Message> email_outbox_;
+    std::vector<Message> email_inflight_;   // being delivered by email_worker_
+    bool email_send_requested_ = false;
+    EmailGatewayWorker email_worker_;
     std::vector<Message> radio_outbox_;
     bool email_gateway_active_ = false;
     std::chrono::steady_clock::time_point last_email_check_;
@@ -589,9 +593,6 @@ private:
     // UI rendering
     void renderMenuBar();
     void renderStatusBar();
-    void renderMainContent();
-    void renderPositionTab();
-    void renderSettingsTab();
 
     // Where a received payload came from. Only Link traffic is from the
     // connected peer; Broadcast carries the modem-reported source; Mesh is
@@ -610,6 +611,17 @@ private:
 
     // Actions
     void connectToModem();
+    void pollModemConnect();   // finishes a background connectToModem()
+    void pollAPRSConnect();    // finishes a background APRS-IS login
+    // Native pickers run on a helper thread; the result is handed back to
+    // the GUI thread by pollPathPicker(). One picker at a time.
+    std::string imgui_ini_path_;   // must outlive the ImGui context
+    struct PathPickerJob;
+    std::shared_ptr<PathPickerJob> path_picker_job_;
+    PathPickedCallback path_picker_done_;
+    void startPathPicker(bool folder, PathPickedCallback done);
+    void pollPathPicker();
+    void onModemConnected();
     void disconnectFromModem();
     void connectToStation(const std::string& callsign);
     void sendChatMessage(const std::string& text);
@@ -701,8 +713,13 @@ private:
     void keepInboundLocally(const std::string& from, const std::string& to, const std::string& subject,
                             const std::string& body, const std::string& message_id);
     void relayRadioToEmail(const Message& msg);
-    void checkPOP3Inbox(bool poll_pop3 = true, bool poll_winlink = true);
-    void sendQueuedEmails();
+    // Gateway network I/O runs on email_worker_; these run on the GUI thread.
+    bool startEmailGatewayJob(bool poll_pop3, bool poll_winlink, bool send_outbox);
+    void pollEmailGatewayJob();
+    void applyInboundEmail(const EmailGatewayJobOutput& output);
+    void prepareQueuedEmails(EmailGatewayJobInput& input);
+    void applyEmailSendResults(const EmailGatewayJobOutput& output);
+    void sendQueuedEmails();   // starts (or requests) a delivery job
 
     // Beacon system
     void sendBeacon();

@@ -2,7 +2,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,9 @@ struct WinlinkTelnetFetchRequest {
     std::string password;
     int max_messages = 20;
     bool delete_after_fetch = true;
+
+    // When set and true, no further message is read (see POP3FetchRequest).
+    const std::atomic<bool>* stop = nullptr;
 };
 
 struct WinlinkTelnetFetchResult {
@@ -48,7 +53,14 @@ struct WinlinkTelnetFetchResult {
     std::string login_mode_used;
     int login_attempts = 0;
     std::vector<WinlinkTelnetInboundMessage> messages;
+    // True when the fetched messages were deleted (killed) on the server.
+    bool committed = false;
 };
+
+// Called once the messages are read, before any is deleted. Return true
+// once they are stored durably: the messages are then killed on the server.
+// Return false and the server keeps them all.
+using WinlinkCommitGate = std::function<bool(const WinlinkTelnetFetchResult&)>;
 
 // Deliver a single message through a Winlink-compatible Telnet mailbox session.
 // On success, the message is accepted by the remote BBS/CMS for forwarding.
@@ -59,6 +71,8 @@ bool sendWinlinkTelnetDelivery(const WinlinkTelnetRequest& req,
 
 // Poll inbound messages from Winlink-compatible Telnet mailbox.
 WinlinkTelnetFetchResult fetchWinlinkTelnetMessages(const WinlinkTelnetFetchRequest& req);
+WinlinkTelnetFetchResult fetchWinlinkTelnetMessages(const WinlinkTelnetFetchRequest& req,
+                                                    const WinlinkCommitGate& commit);
 
 // Exposed helpers for tests and diagnostics.
 std::string extractWinlinkChallengeToken(const std::string& prompt);

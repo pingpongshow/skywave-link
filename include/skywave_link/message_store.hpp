@@ -127,6 +127,13 @@ public:
     bool markAsFailed(int64_t id);
     bool incrementRetry(int64_t id);
 
+    // Durable queue of messages waiting for internet relay (SMTP/Winlink):
+    // a message stays queued until markRelayedAndDequeue() records a
+    // confirmed send, so mail still waiting at exit is retried next start.
+    bool queueInternetRelay(int64_t id);
+    bool markRelayedAndDequeue(int64_t id);   // markAsSent + dequeue, atomically
+    std::vector<Message> loadInternetRelayQueue();
+
     // Maintenance
     int deleteExpiredMessages();
     int deleteOldMessages(int64_t before_timestamp);

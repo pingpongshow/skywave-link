@@ -1,5 +1,6 @@
 // MessageStore tests (SQLite in-memory)
 #include "test_macros.hpp"
+#include <cstdio>
 #include "skywave_link/message_store.hpp"
 #include <chrono>
 
@@ -637,6 +638,49 @@ TEST(filter_limit_validation) {
 // No SQLite - just pass
 TEST(store_no_sqlite) {
     std::cout << "  SKIP: SQLite not available\n";
+    PASS();
+}
+#endif
+
+#ifdef SKYWAVE_LINK_HAS_SQLITE
+// Internet-relay mail stays queued in the store until a confirmed send, so a
+// quit (or crash) between queueing and sending never drops it.
+TEST(store_internet_relay_queue_survives_reopen) {
+    const std::string path = "test_relay_queue.db";
+    std::remove(path.c_str());
+    int64_t a = 0, b = 0;
+    {
+        skylink::MessageStore store;
+        ASSERT_TRUE(store.open(path));
+        skylink::Message msg;
+        msg.type = skylink::MessageType::Email;
+        msg.status = skylink::MessageStatus::Pending;
+        msg.from_callsign = "N0CALL";
+        msg.to_callsign = "test@example.com";
+        msg.subject = "one";
+        a = store.createMessage(msg);
+        msg.subject = "two";
+        msg.message_id = "relay-two";
+        b = store.createMessage(msg);
+        ASSERT_TRUE(store.queueInternetRelay(a));
+        ASSERT_TRUE(store.queueInternetRelay(b));
+        ASSERT_TRUE(store.queueInternetRelay(b));  // idempotent
+        ASSERT_TRUE(store.markRelayedAndDequeue(a));
+    }
+    {
+        skylink::MessageStore store;  // next start
+        ASSERT_TRUE(store.open(path));
+        auto queued = store.loadInternetRelayQueue();
+        ASSERT_EQ(queued.size(), size_t(1));
+        ASSERT_EQ(queued[0].id, b);
+        ASSERT_EQ(queued[0].subject, std::string("two"));
+        auto sent = store.getMessage(a);
+        ASSERT_TRUE(sent.has_value());
+        ASSERT_TRUE(sent->status == skylink::MessageStatus::Sent);
+    }
+    std::remove(path.c_str());
+    std::remove((path + "-wal").c_str());
+    std::remove((path + "-shm").c_str());
     PASS();
 }
 #endif

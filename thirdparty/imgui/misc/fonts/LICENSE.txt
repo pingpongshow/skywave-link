@@ -1,0 +1,21 @@
+Fonts embedded in the Skywave Link GUI
+======================================
+
+These TTF files are the copies distributed with Dear ImGui (misc/fonts).
+CMake compiles them into the skywave_link binary (see CMakeLists.txt,
+"UI fonts"); they are not loaded from disk at run time. The license of
+each font is the one recorded in the font file's own metadata (name table).
+
+Roboto-Medium.ttf
+  Copyright 2011 Google Inc. All Rights Reserved.
+  Licensed under the Apache License, Version 2.0
+  https://www.apache.org/licenses/LICENSE-2.0
+
+Cousine-Regular.ttf
+  Digitized data copyright (c) 2010 Google Corporation.
+  Licensed under the SIL Open Font License, Version 1.1
+  https://openfontlicense.org (formerly http://scripts.sil.org/OFL)
+  The OFL permits bundling and embedding the font with software,
+  including commercial software, provided the font is not sold by itself.
+  (Older Cousine releases, and Dear ImGui's FONTS.md, list Apache 2.0;
+  the metadata of this file states OFL 1.1.)

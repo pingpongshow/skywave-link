@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <functional>
@@ -54,6 +55,9 @@ enum class APRSState {
     Error
 };
 
+// Outcome of a background login started with APRSClient::beginConnect().
+enum class APRSConnectProgress { None, InProgress, Connected, Failed };
+
 // Callback types
 using PositionCallback = std::function<void(const APRSPosition& pos)>;
 using MessageCallback = std::function<void(const std::string& from, const std::string& message)>;
@@ -71,6 +75,26 @@ public:
     // Connection management
     bool connect(const std::string& server = "rotate.aprs.net", uint16_t port = 14580);
     bool authenticate(const std::string& callsign, const std::string& passcode);
+
+    // Background connect + login for UI threads: DNS, the TCP connect
+    // (with kConnectTimeoutMs) and the login exchange run on a helper
+    // thread. Call pollConnect() from the main loop; it adopts the session
+    // and reports Connected/Failed exactly once. A position queued with
+    // sendPositionWhenConnected() goes out as soon as the login succeeds.
+    bool beginConnect(const std::string& server, uint16_t port,
+                      const std::string& callsign, const std::string& passcode);
+    bool isConnecting() const { return connect_job_ != nullptr; }
+    APRSConnectProgress pollConnect();
+    void cancelConnect();
+    void sendPositionWhenConnected() { send_position_on_connect_ = true; }
+    // True once after pollConnect() sent a queued position.
+    bool takeQueuedPositionSent() {
+        const bool sent = queued_position_sent_;
+        queued_position_sent_ = false;
+        return sent;
+    }
+    const std::string& lastConnectError() const { return last_connect_error_; }
+    static constexpr int kConnectTimeoutMs = 5000;
     void disconnect();
     bool isConnected() const;
     APRSState getState() const { return state_; }
@@ -152,7 +176,21 @@ private:
     MessageCallback message_callback_;
     APRSStateCallback state_callback_;
 
+    // Background connect state shared with the helper thread.
+    struct ConnectJob;
+    std::shared_ptr<ConnectJob> connect_job_;
+    bool send_position_on_connect_ = false;
+    bool queued_position_sent_ = false;
+    std::string last_connect_error_;
+
     // Internal methods
+    static bool openSocket(const std::string& server, uint16_t port, int timeout_ms,
+                           socket_t* out, std::string* error);
+    static void closeSocket(socket_t& sock);
+    // Sends the login line and checks the server's answer (2 s). Returns
+    // 1 when logged in, 0 when refused/invalid, -1 when the server closed.
+    static int loginOnSocket(socket_t sock, const std::string& callsign,
+                             const std::string& passcode, std::string* error);
     bool sendPacket(const std::string& packet);
     void processLine(const std::string& line);
     APRSPosition parsePosition(const std::string& packet);

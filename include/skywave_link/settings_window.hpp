@@ -34,7 +34,7 @@ public:
     std::function<void()> onEnableAwayMode;
     std::function<void()> onDisableAwayMode;
     std::function<void()> onUploadPSKReporterSpots;
-    std::function<std::string()> onBrowseDownloadPath;
+    PathPicker onBrowseDownloadPath;
     std::function<void()> onSetupStyle;
 
     // Beacon timer reference (set by App so the countdown can be displayed)

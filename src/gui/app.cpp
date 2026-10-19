@@ -19,6 +19,7 @@
 #include "skywave_link/ping_panel.hpp"
 #include "skywave_link/main_content.hpp"
 #include "skywave_link/station_map_window.hpp"
+#include "skywave_link/modern_style.hpp"
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -1185,6 +1186,9 @@ bool App::initialize() {
 
     // Create core components
     modem_ = std::make_unique<ModemClient>();
+    // User actions and settings must never wait on the modem's reply on the
+    // GUI thread; replies are matched as poll() reads them.
+    modem_->setNonBlockingCommands(true);
     radio_ = std::make_unique<RadioController>();
     store_ = std::make_unique<MessageStore>();
     freq_mgr_ = std::make_unique<FrequencyManager>();
@@ -1299,6 +1303,11 @@ bool App::initialize() {
     // Open message store relative to the active config directory when configured path is relative.
     store_->open(resolveStorePath(loaded_config_path, config_.store.db_path));
     loadMailFromStore();
+    // Internet-relay mail that was still waiting at the last exit.
+    for (auto& msg : store_->loadInternetRelayQueue()) {
+        msg.status = MessageStatus::Pending;
+        email_outbox_.push_back(std::move(msg));
+    }
 
     applyMeshRelaySettings();
 
@@ -1370,8 +1379,9 @@ bool App::initialize() {
     // Connect to APRS-IS if configured
     if (config_.aprs.enabled) {
         const std::string aprs_passcode = aprsPasscodeForConfig(config_);
-        aprs_->connect(config_.aprs.server, config_.aprs.port);
-        aprs_->authenticate(config_.station.callsign, aprs_passcode);
+        // Connect + login run in the background (pollAPRSConnect()).
+        aprs_->beginConnect(config_.aprs.server, config_.aprs.port,
+                            config_.station.callsign, aprs_passcode);
         aprs_->setMyPosition(config_.station.latitude, config_.station.longitude,
                              config_.station.altitude_m);
         aprs_->setMyComment(config_.aprs.comment);
@@ -1428,10 +1438,27 @@ bool App::initSDL() {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
 
+    // Size: the saved size, or ~80% of the usable display on first run;
+    // never larger than the display, never smaller than the layout needs.
+    constexpr int kMinWindowWidth = 960;
+    constexpr int kMinWindowHeight = 640;
+    SDL_Rect usable{0, 0, 1280, 800};
+    if (SDL_GetDisplayUsableBounds(0, &usable) != 0) {
+        usable = SDL_Rect{0, 0, 1280, 800};
+    }
+    int win_w = config_.ui.window_width;
+    int win_h = config_.ui.window_height;
+    if (win_w <= 0 || win_h <= 0) {
+        win_w = usable.w * 4 / 5;
+        win_h = usable.h * 4 / 5;
+    }
+    win_w = std::clamp(win_w, std::min(kMinWindowWidth, usable.w), usable.w);
+    win_h = std::clamp(win_h, std::min(kMinWindowHeight, usable.h), usable.h);
+
     window_ = SDL_CreateWindow(
         "Skywave Link - HF Digital Communications",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        config_.ui.window_width, config_.ui.window_height,
+        win_w, win_h,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
 
@@ -1439,6 +1466,8 @@ bool App::initSDL() {
         std::cerr << "[App] SDL_CreateWindow error: " << SDL_GetError() << "\n";
         return false;
     }
+    SDL_SetWindowMinimumSize(window_, std::min(kMinWindowWidth, usable.w),
+                             std::min(kMinWindowHeight, usable.h));
 
     gl_context_ = SDL_GL_CreateContext(window_);
     if (!gl_context_) {
@@ -1545,7 +1574,8 @@ void App::applyVoiceSettingsToModem(bool restart_if_open) {
         voice_start_inflight_ = false;
     }
     if (changed) {
-        (void)modem_->queryVoiceStatus();
+        // Answer folded into the voice status by poll(); do not wait for it.
+        modem_->sendCommand("VOICESTATUS");
     }
 }
 
@@ -1679,14 +1709,21 @@ bool App::initImGui() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;  // Allow windows outside main viewport
 
-    setupStyle();
-
-    // When viewports are enabled, tweak WindowRounding/WindowBg for consistency
-    ImGuiStyle& style = ImGui::GetStyle();
-    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
-        style.WindowRounding = 0.0f;
-        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    // Window layout lives next to config.toml, not in whatever directory the
+    // app was started from (that is "/" for a Finder launch).
+    {
+        std::error_code ec;
+        const std::filesystem::path config_dir =
+            std::filesystem::path(AppConfig::getDefaultConfigPath()).parent_path();
+        if (!config_dir.empty()) {
+            std::filesystem::create_directories(config_dir, ec);
+            imgui_ini_path_ = (config_dir / "imgui.ini").string();
+            io.IniFilename = imgui_ini_path_.c_str();
+        }
     }
+
+    ui::loadFonts();
+    setupStyle();
 
     ImGui_ImplSDL2_InitForOpenGL(window_, gl_context_);
     ImGui_ImplOpenGL2_Init();
@@ -1696,19 +1733,9 @@ bool App::initImGui() {
 }
 
 void App::setupStyle() {
-    if (config_.ui.dark_mode) {
-        ImGui::StyleColorsDark();
-    } else {
-        ImGui::StyleColorsLight();
-    }
-
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.FrameRounding = 4.0f;
-    style.WindowRounding = 6.0f;
-    style.PopupRounding = 4.0f;
-    style.ScrollbarRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.TabRounding = 4.0f;
+    // Windows dragged out of the main window become OS windows; ImGui drops
+    // their rounding itself, and the theme's WindowBg is already opaque.
+    ui::applyModernStyle(config_.ui.dark_mode, static_cast<float>(config_.ui.font_size));
 }
 
 void App::initializeSharedState() {
@@ -1865,7 +1892,9 @@ void App::initializeWindows() {
     // Wire up callbacks for FileWindow
     file_window_->onSendFile = [this](const std::string& path) { sendFile(path); };
 #ifdef __APPLE__
-    file_window_->onOpenFileDialog = []() -> std::string { return openNativeFileDialog(); };
+    file_window_->onOpenFileDialog = [this](PathPickedCallback done) {
+        startPathPicker(false, std::move(done));
+    };
 #endif
 
     // Wire up callbacks for MessageWindow
@@ -1882,8 +1911,8 @@ void App::initializeWindows() {
         email.created_at = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         if (store_) {
-            store_->createMessage(email);
-            email_outbox_.push_back(email);
+            email.id = store_->createMessage(email);
+            relayRadioToEmail(email);
         }
     };
     message_window_->onDeleteMessage = [this](int64_t message_store_id) {
@@ -1967,7 +1996,9 @@ void App::initializeWindows() {
         (void)openVoiceAudioDevices();
     };
 #ifdef __APPLE__
-    settings_window_->onBrowseDownloadPath = []() -> std::string { return openNativeFolderDialog(); };
+    settings_window_->onBrowseDownloadPath = [this](PathPickedCallback done) {
+        startPathPicker(true, std::move(done));
+    };
 #endif
     settings_window_->last_beacon_sent = &last_beacon_sent_;
 
@@ -2030,7 +2061,9 @@ void App::initializeWindows() {
     bbs_window_->onDownload = [this](const BBSFile& file) { downloadFromBBS(file); };
     bbs_window_->onDelete = [this](const std::string& name) { deleteBBSFile(name); };
 #ifdef __APPLE__
-    bbs_window_->onOpenFileDialog = []() -> std::string { return openNativeFileDialog(); };
+    bbs_window_->onOpenFileDialog = [this](PathPickedCallback done) {
+        startPathPicker(false, std::move(done));
+    };
 #endif
 
     // Wire up callbacks for FrequencyWindow
@@ -2075,13 +2108,21 @@ void App::initializeWindows() {
 }
 
 void App::run() {
+    constexpr Uint32 kFrameBudgetMs = 16;  // ~60 FPS cap
     while (running_) {
+        const Uint32 frame_start = SDL_GetTicks();
         processEvents();
         update();
         render();
 
-        // Cap frame rate
-        SDL_Delay(16);  // ~60 FPS
+        // Cap the frame rate without stacking a fixed sleep on top of the
+        // VSync wait (that halved the frame rate and added input lag). Only
+        // the unused part of the budget is slept, e.g. when VSync is off or
+        // the window is occluded and the swap returns immediately.
+        const Uint32 elapsed = SDL_GetTicks() - frame_start;
+        if (elapsed < kFrameBudgetMs) {
+            SDL_Delay(kFrameBudgetMs - elapsed);
+        }
     }
 }
 
@@ -2090,6 +2131,40 @@ void App::shutdown() {
         return;
     }
     shutdown_done_ = true;
+
+    // Remember the window size (so it reopens the same), then hide the
+    // window so quitting feels immediate while the bounded modem teardown
+    // and saves finish.
+    if (window_) {
+        if (!(SDL_GetWindowFlags(window_) &
+              (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED))) {
+            SDL_GetWindowSize(window_, &config_.ui.window_width, &config_.ui.window_height);
+        }
+        SDL_HideWindow(window_);
+    }
+
+    // A running email gateway job is stopped (no new fetch or delivery)
+    // and finished: fetched mail is stored before the server deletes it and
+    // delivery results are recorded. The job is bounded by the socket
+    // timeouts (5 s connect, 15 s per read/write), so this waits at most for
+    // the operation in progress plus the commit. Abandoning it after that
+    // is still lossless: an abandoned job never sends POP3 QUIT or a Winlink
+    // kill, and unconfirmed outgoing mail stays in the store's relay queue.
+    if (email_worker_.busy()) {
+        email_send_requested_ = false;
+        email_worker_.requestStop();
+        constexpr auto kEmailShutdownBound = std::chrono::seconds(45);
+        const auto deadline = std::chrono::steady_clock::now() + kEmailShutdownBound;
+        while (email_worker_.busy() && std::chrono::steady_clock::now() < deadline) {
+            (void)email_worker_.waitFor(100);
+            pollEmailGatewayJob();
+        }
+        if (email_worker_.busy()) {
+            email_worker_.abandon();
+            std::cerr << "[Email] gateway job did not finish at exit; abandoned "
+                         "(server copies and relay queue kept)\n";
+        }
+    }
 
     saveMailToStore();
 
@@ -2135,40 +2210,39 @@ void App::gracefulDisconnectModem() {
         return;
     }
 
-    // Refresh link state before deciding how to tear down.
-    modem_->sendCommand("STATE");
-    for (int i = 0; i < 20; ++i) {
-        modem_->poll();
-        if (modem_->getStatus().link_state == LinkState::Idle) {
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    // The cached link state is at most one STATUS poll (500 ms) old and
+    // link changes also arrive as events, so no refresh round-trip.
+    const auto link_state = modem_->getStatus().link_state;
+    if (link_state != LinkState::Connected && link_state != LinkState::Connecting &&
+        link_state != LinkState::Disconnecting) {
+        return;
     }
 
-    const auto link_state = modem_->getStatus().link_state;
-    if (link_state == LinkState::Connected || link_state == LinkState::Connecting ||
-        link_state == LinkState::Disconnecting) {
-        (void)modem_->disconnectStation();
-
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+    // Quitting must stay prompt: the whole teardown is bounded to ~0.7 s.
+    // Once the modem has started its disconnect it completes the handshake
+    // on its own after our sockets close; only a modem that has not reacted
+    // at all gets an ABORT.
+    auto wait_for = [this](int ms, auto done) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
         while (std::chrono::steady_clock::now() < deadline) {
             modem_->poll();
-            if (modem_->getStatus().link_state == LinkState::Idle) {
-                return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (done()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        return false;
+    };
+    auto is_idle = [this]() { return modem_->getStatus().link_state == LinkState::Idle; };
 
+    if (link_state != LinkState::Disconnecting) {
+        modem_->sendCommand("DISCONNECT");
+    }
+    if (wait_for(600, is_idle)) {
+        return;
+    }
+    if (modem_->getStatus().link_state != LinkState::Disconnecting) {
         // Fallback in case remote or PHY state machine is stuck.
-        (void)modem_->abort();
-        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-        while (std::chrono::steady_clock::now() < deadline) {
-            modem_->poll();
-            if (modem_->getStatus().link_state == LinkState::Idle) {
-                return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
+        modem_->sendCommand("ABORT");
+        (void)wait_for(100, is_idle);
     }
 }
 
@@ -2327,6 +2401,9 @@ bool App::handleVoiceHotkeyEvent(const SDL_KeyboardEvent& key, bool pressed) {
 void App::update() {
     auto now = std::chrono::steady_clock::now();
     runTestScript();
+    pollModemConnect();
+    pollAPRSConnect();
+    pollPathPicker();
 
     // Poll modem and APRS at regular intervals
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_poll_);
@@ -2361,7 +2438,10 @@ void App::update() {
         auto voice_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - last_voice_status_poll_);
         if (voice_elapsed.count() >= 250) {
-            modem_->queryVoiceStatus();
+            // Fire-and-forget: the VOICESTATUS reply is folded into the
+            // status snapshot by poll(). queryVoiceStatus() would block the
+            // GUI thread (>= 10 ms, up to 500 ms) four times a second.
+            modem_->sendCommand("VOICESTATUS");
             last_voice_status_poll_ = now;
         }
 
@@ -2492,6 +2572,7 @@ void App::update() {
     updateGPS();
 
     // Update email gateway if active
+    pollEmailGatewayJob();
     updateEmailGateway();
 
     // Update PSK Reporter uploads
@@ -2536,7 +2617,35 @@ void App::update() {
     }
 }
 
+namespace {
+
+// First-use placement for the detachable tool windows: sizes scale with the
+// font (they were tuned for a 13 px font), are clamped to the main window,
+// and each window gets its own small offset from the centre so windows opened
+// together do not land exactly on top of each other. Later runs restore the
+// user's own placement from imgui.ini.
+void prepareToolWindow(float width, float height, int slot) {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float scale = ImGui::GetFontSize() / 13.0f;
+    const ImVec2 size(std::min(width * scale, vp->WorkSize.x * 0.9f),
+                      std::min(height * scale, vp->WorkSize.y * 0.9f));
+    const float offset = static_cast<float>(slot % 8 - 4) * 22.0f;
+    const ImVec2 centre(vp->WorkPos.x + vp->WorkSize.x * 0.5f + offset,
+                        vp->WorkPos.y + vp->WorkSize.y * 0.5f + offset);
+    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(centre, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+}
+
+} // namespace
+
 void App::render() {
+    // Settings -> UI -> Font Size applies live.
+    ImGuiStyle& frame_style = ImGui::GetStyle();
+    const float wanted_font_size = static_cast<float>(std::clamp(config_.ui.font_size, 10, 24));
+    if (frame_style.FontSizeBase != wanted_font_size) {
+        frame_style._NextFrameFontSizeBase = wanted_font_size;
+    }
+
     ImGui_ImplOpenGL2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
@@ -2552,7 +2661,14 @@ void App::render() {
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
         ImGuiWindowFlags_MenuBar;
 
+    // The main window sits a shade darker than floating tool windows so
+    // those read as raised panels.
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::palette().app_bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::Begin("MainWindow", nullptr, window_flags);
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
 
     renderMenuBar();
     if (main_content_) main_content_->render();
@@ -2566,7 +2682,7 @@ void App::render() {
 
     // Settings window
     if (show_settings_) {
-        ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
+        prepareToolWindow(620, 520, 0);
         if (ImGui::Begin("Settings", &show_settings_)) {
             if (settings_window_) settings_window_->render();
         }
@@ -2577,7 +2693,7 @@ void App::render() {
     static bool show_mail = false;
     if (current_tab_ == AppTab::Mail) show_mail = true;
     if (show_mail) {
-        ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+        prepareToolWindow(600, 500, 1);
         if (ImGui::Begin("Mail", &show_mail)) {
             if (mail_window_) mail_window_->render();
         }
@@ -2589,7 +2705,7 @@ void App::render() {
     static bool show_files = false;
     if (current_tab_ == AppTab::Files) show_files = true;
     if (show_files) {
-        ImGui::SetNextWindowSize(ImVec2(600, 420), ImGuiCond_FirstUseEver);
+        prepareToolWindow(600, 420, 2);
         if (ImGui::Begin("File Transfer", &show_files)) {
             if (file_window_) file_window_->render();
         }
@@ -2603,7 +2719,7 @@ void App::render() {
     static bool show_weather = false;
     if (current_tab_ == AppTab::Weather) show_weather = true;
     if (show_weather) {
-        ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
+        prepareToolWindow(500, 400, 3);
         if (ImGui::Begin("Weather", &show_weather)) {
             if (weather_window_) weather_window_->render();
         }
@@ -2615,7 +2731,7 @@ void App::render() {
     static bool show_position = false;
     if (current_tab_ == AppTab::Position) show_position = true;
     if (show_position) {
-        ImGui::SetNextWindowSize(ImVec2(450, 350), ImGuiCond_FirstUseEver);
+        prepareToolWindow(450, 350, 4);
         if (ImGui::Begin("Position", &show_position)) {
             if (position_window_) position_window_->render();
         }
@@ -2627,7 +2743,7 @@ void App::render() {
     static bool show_station_map = false;
     if (current_tab_ == AppTab::StationMap) show_station_map = true;
     if (show_station_map) {
-        ImGui::SetNextWindowSize(ImVec2(860, 620), ImGuiCond_FirstUseEver);
+        prepareToolWindow(860, 620, 5);
         if (ImGui::Begin("Station Map", &show_station_map)) {
             if (station_map_window_) station_map_window_->render();
         }
@@ -2639,7 +2755,7 @@ void App::render() {
     static bool show_messages = false;
     if (current_tab_ == AppTab::Messages) show_messages = true;
     if (show_messages) {
-        ImGui::SetNextWindowSize(ImVec2(600, 450), ImGuiCond_FirstUseEver);
+        prepareToolWindow(600, 450, 6);
         if (ImGui::Begin("Messages (Store & Forward)", &show_messages)) {
             if (message_window_) message_window_->render();
         }
@@ -2651,7 +2767,7 @@ void App::render() {
     static bool show_bbs = false;
     if (current_tab_ == AppTab::BBS) show_bbs = true;
     if (show_bbs) {
-        ImGui::SetNextWindowSize(ImVec2(650, 500), ImGuiCond_FirstUseEver);
+        prepareToolWindow(650, 500, 7);
         if (ImGui::Begin("BBS File Sharing", &show_bbs)) {
             if (bbs_window_) bbs_window_->render();
         }
@@ -2663,7 +2779,7 @@ void App::render() {
     static bool show_frequency = false;
     if (current_tab_ == AppTab::Frequency) show_frequency = true;
     if (show_frequency) {
-        ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
+        prepareToolWindow(500, 400, 8);
         if (ImGui::Begin("Frequency Management", &show_frequency)) {
             if (frequency_window_) frequency_window_->render();
         }
@@ -2675,7 +2791,8 @@ void App::render() {
     ImGui::Render();
     glViewport(0, 0, static_cast<int>(ImGui::GetIO().DisplaySize.x),
                static_cast<int>(ImGui::GetIO().DisplaySize.y));
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    const ImVec4 clear_color = ui::palette().app_bg;
+    glClearColor(clear_color.x, clear_color.y, clear_color.z, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
@@ -2726,7 +2843,7 @@ void App::renderMenuBar() {
         }
 
         if (ImGui::BeginMenu("Connection")) {
-            bool connected = modem_ && modem_->isConnected();
+            bool connected = modem_ && (modem_->isConnected() || modem_->isConnecting());
             if (ImGui::MenuItem("Connect to Modem", nullptr, false, !connected)) {
                 connectToModem();
             }
@@ -2797,619 +2914,21 @@ void App::renderMenuBar() {
     }
 }
 
-void App::renderMainContent() {
-    const auto& status = modem_ ? modem_->getStatus() : ModemStatus{};
-    bool station_connected = modem_ && status.link_state == LinkState::Connected;
-    static char connect_target[32] = "";
-
-    // Band/frequency options with calling frequencies
-    struct BandFreq {
-        const char* band;
-        uint64_t freq_hz;
-        const char* display;
-    };
-    static const BandFreq band_freqs[] = {
-        {"80m", 3590000,  "3.590.000 (80m)"},
-        {"40m", 7055000,  "7.055.000 (40m)"},
-        {"30m", 10130000, "10.130.000 (30m)"},
-        {"20m", 14105000, "14.105.000 (20m)"},
-        {"17m", 18105000, "18.105.000 (17m)"},
-        {"15m", 21105000, "21.105.000 (15m)"},
-        {"12m", 24925000, "24.925.000 (12m)"},
-        {"10m", 28120000, "28.120.000 (10m)"},
-    };
-
-    // ========================================================================
-    // CONTROL PANEL (Child Window at top)
-    // ========================================================================
-    ImGui::BeginChild("ControlPanel", ImVec2(-1, 85), true);
-
-    // Row 1: Frequency dropdown and connect target
-    ImGui::Text("FREQUENCY");
-    ImGui::SameLine(100);
-
-    // Find current selection
-    int current_idx = 1;  // Default to 40m
-    for (int i = 0; i < 8; i++) {
-        if (current_band_ == band_freqs[i].band) {
-            current_idx = i;
-            break;
-        }
-    }
-
-    ImGui::SetNextItemWidth(170);
-    if (ImGui::BeginCombo("##Freq", band_freqs[current_idx].display)) {
-        for (int i = 0; i < 8; i++) {
-            if (ImGui::Selectable(band_freqs[i].display, current_idx == i)) {
-                current_band_ = band_freqs[i].band;
-                if (radio_) {
-                    (void)radio_->setFrequency(band_freqs[i].freq_hz);
-                    current_frequency_hz_ = static_cast<uint32_t>(band_freqs[i].freq_hz);
-                }
-            }
-        }
-        ImGui::EndCombo();
-    }
-
-    ImGui::SameLine(300);
-    ImGui::Text("Connect");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(110);
-    ImGui::InputText("##ConnectTarget", connect_target, sizeof(connect_target),
-                     ImGuiInputTextFlags_CharsUppercase);
-
-    ImGui::Separator();
-
-    // Row 2: Control buttons - First line
-    if (ImGui::Button("CONNECT MODEM")) {
-        connectToModem();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("DISCONNECT MODEM")) {
-        disconnectFromModem();
-    }
-    ImGui::SameLine();
-    ImGui::Spacing(); ImGui::SameLine();
-
-    // Station controls
-    if (ImGui::Button("CONNECT")) {
-        std::string target = normalizeCallsign(connect_target);
-        if (!target.empty()) {
-            std::strncpy(connect_target, target.c_str(), sizeof(connect_target) - 1);
-            connect_target[sizeof(connect_target) - 1] = '\0';
-            connectToStation(target);
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("PING")) {
-        std::string target = normalizeCallsign(connect_target);
-        if (!target.empty()) {
-            std::strncpy(connect_target, target.c_str(), sizeof(connect_target) - 1);
-            connect_target[sizeof(connect_target) - 1] = '\0';
-            sendPing(target);
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("DISCONNECT")) {
-        if (modem_) modem_->disconnectStation();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("ABORT")) {
-        if (modem_) modem_->abort();
-    }
-
-    // Row 3: Second line of buttons
-    // TX/RX indicator
-    if (status.ptt_active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-        ImGui::Button("TX");
-        ImGui::PopStyleColor();
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-        ImGui::Button("RX");
-        ImGui::PopStyleColor();
-    }
-    ImGui::SameLine();
-
-    // Pending counter
-    int pending = store_ ? store_->countPendingMessages() : 0;
-    ImGui::Text("%d/%d", pending, static_cast<int>(mail_inbox_.size()));
-
-    ImGui::SameLine();
-    ImGui::Spacing(); ImGui::SameLine();
-
-    // CQ controls
-    if (cq_active_) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.4f, 0.2f, 1.0f));
-        if (ImGui::Button("END CQ")) {
-            stopCQ();
-        }
-        ImGui::PopStyleColor();
-    } else {
-        if (ImGui::Button("CALL CQ")) {
-            startCQ();
-        }
-    }
-    ImGui::SameLine();
-
-    // Beacon control
-    if (beacon_enabled_) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.8f, 1.0f));
-        if (ImGui::Button("STOP BEACONS")) {
-            config_.beacon.enabled = false;
-            beacon_enabled_ = false;
-        }
-        ImGui::PopStyleColor();
-    } else {
-        if (ImGui::Button("SEND BEACONS")) {
-            config_.beacon.enabled = true;
-            beacon_enabled_ = true;
-            sendBeacon();
-        }
-    }
-
-    // Status indicators on the right
-    ImGui::SameLine(ImGui::GetWindowWidth() - 350);
-
-    // New mail indicator
-    int unread_mail = 0;
-    for (const auto& m : mail_inbox_) {
-        if (!m.read) unread_mail++;
-    }
-    if (unread_mail > 0) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.6f, 0.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-        char mail_btn[32];
-        std::snprintf(mail_btn, sizeof(mail_btn), "%d NEW MAIL%s", unread_mail, unread_mail > 1 ? "S" : "");
-        ImGui::Button(mail_btn);
-        ImGui::PopStyleColor(2);
-        ImGui::SameLine();
-    }
-
-    // Outbox count
-    ImGui::Text("Outbox: %d", pending);
-    ImGui::SameLine();
-
-    // Parking (heard beacons)
-    ImGui::Text("Parking: %zu", heard_beacons_.size());
-
-    ImGui::EndChild();  // End ControlPanel
-
-    // ========================================================================
-    // VarAC-STYLE LAYOUT: Three horizontal panels, then main area below
-    // ========================================================================
-
-    float content_width = ImGui::GetContentRegionAvail().x;
-    float panel_row_height = 120;  // Height for the three top panels
-    float panel_width = (content_width - 20) / 3.0f;  // Three equal-width panels
-    float right_panel_width = 140;
-    float main_area_height = ImGui::GetContentRegionAvail().y - panel_row_height - 40;
-
-    // ========================================================================
-    // ROW 1: Log | Last heard beacons | Last heard CQ calls (horizontal)
-    // ========================================================================
-
-    // Log panel (left)
-    ImGui::BeginChild("LogPanel", ImVec2(panel_width, panel_row_height), true);
-    ImGui::Text("Skywave Link Log");
-    ImGui::Separator();
-    int count = 0;
-    for (auto it = chat_history_.rbegin(); it != chat_history_.rend() && count < 8; ++it) {
-        if (it->from == "SYSTEM") {
-            auto time_t_val = static_cast<time_t>(it->timestamp);
-            char time_str[16];
-            std::strftime(time_str, sizeof(time_str), "%H:%M:%S", std::localtime(&time_t_val));
-            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s - %s", time_str, it->text.c_str());
-            count++;
-        }
-    }
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-
-    // Last heard beacons panel (center)
-    ImGui::BeginChild("HeardBeaconsPanel", ImVec2(panel_width, panel_row_height), true);
-    ImGui::Text("Last heard beacons");
-    ImGui::Separator();
-    ImGui::Columns(5, "BeaconCols", false);
-    ImGui::SetColumnWidth(0, 30); ImGui::SetColumnWidth(1, 40);
-    ImGui::SetColumnWidth(2, 60); ImGui::SetColumnWidth(3, 30); ImGui::SetColumnWidth(4, 35);
-    ImGui::Text("Bnd"); ImGui::NextColumn();
-    ImGui::Text("Time"); ImGui::NextColumn();
-    ImGui::Text("Call"); ImGui::NextColumn();
-    ImGui::Text("BW"); ImGui::NextColumn();
-    ImGui::Text("SNR"); ImGui::NextColumn();
-    for (const auto& beacon : heard_beacons_) {
-        if (count++ > 5) break;
-        ImGui::Text("%s", current_band_.c_str()); ImGui::NextColumn();
-        auto time_t_val = static_cast<time_t>(beacon.timestamp);
-        char time_str[16];
-        std::strftime(time_str, sizeof(time_str), "%H:%M", std::localtime(&time_t_val));
-        ImGui::Text("%s", time_str); ImGui::NextColumn();
-        if (beacon.has_pending_messages) {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", beacon.callsign.c_str());
-        } else if (beacon.email_gateway) {
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s @", beacon.callsign.c_str());
-        } else {
-            ImGui::Text("%s", beacon.callsign.c_str());
-        }
-        if (beacon.email_gateway && ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Email gateway capable station");
-        }
-        ImGui::NextColumn();
-        ImGui::Text("2300"); ImGui::NextColumn();  // Bandwidth
-        ImGui::Text("%.0f", beacon.snr_db); ImGui::NextColumn();
-    }
-    ImGui::Columns(1);
-    ImGui::EndChild();  // End HeardBeaconsPanel
-
-    ImGui::SameLine();
-
-    // Last heard CQ calls panel (right)
-    ImGui::BeginChild("CQCallsPanel", ImVec2(panel_width, panel_row_height), true);
-    ImGui::Text("Last heard CQ calls");
-    ImGui::Separator();
-    ImGui::Columns(5, "CQCols", false);
-    ImGui::SetColumnWidth(0, 30); ImGui::SetColumnWidth(1, 40);
-    ImGui::SetColumnWidth(2, 60); ImGui::SetColumnWidth(3, 30); ImGui::SetColumnWidth(4, 35);
-    ImGui::Text("Bnd"); ImGui::NextColumn();
-    ImGui::Text("Time"); ImGui::NextColumn();
-    ImGui::Text("Call"); ImGui::NextColumn();
-    ImGui::Text("BW"); ImGui::NextColumn();
-    ImGui::Text("SNR"); ImGui::NextColumn();
-    count = 0;
-    for (const auto& [callsign, timestamp] : heard_stations_) {
-        if (count++ > 5) break;
-        ImGui::Text("%s", current_band_.c_str()); ImGui::NextColumn();
-        ImGui::Text("%s", timestamp.c_str()); ImGui::NextColumn();
-        if (ImGui::Selectable(callsign.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
-            std::strncpy(connect_target, callsign.c_str(), sizeof(connect_target) - 1);
-            connect_target[sizeof(connect_target) - 1] = '\0';
-        }
-        ImGui::NextColumn();
-        ImGui::Text("2300"); ImGui::NextColumn();
-        ImGui::Text("-"); ImGui::NextColumn();
-    }
-    ImGui::Columns(1);
-    ImGui::EndChild();  // End CQCallsPanel
-
-    // ========================================================================
-    // ROW 2: Main message area (cyan) + Right control panel
-    // ========================================================================
-
-    // Status row above main area
-    ImGui::Text("In QSO with");
-    ImGui::SameLine(90);
-    ImGui::SetNextItemWidth(100);
-    char qso_partner[32] = "";
-    if (station_connected) {
-        std::strncpy(qso_partner, current_chat_partner_.c_str(), sizeof(qso_partner) - 1);
-    }
-    ImGui::InputText("##QSOPartner", qso_partner, sizeof(qso_partner), ImGuiInputTextFlags_ReadOnly);
-
-    ImGui::SameLine(210);
-    ImGui::Text("Message");
-    ImGui::SameLine(280);
-    ImGui::Text(station_connected ? "CONNECTED" : "IDLE");
-
-    ImGui::SameLine(380);
-    ImGui::Text("File");
-    ImGui::SameLine(420);
-    ImGui::Text(transfers_.empty() ? "IDLE" : "ACTIVE");
-
-    ImGui::SameLine(520);
-    ImGui::Checkbox("I'm away (Auto)", &away_mode_active_);
-
-    // Main chat area with cyan background
-    float main_chat_width = content_width - right_panel_width - 10;
-    ImGui::BeginChild("MainChatArea", ImVec2(main_chat_width, main_area_height), false);
-
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.7f, 0.95f, 0.95f, 1.0f));  // Light cyan
-    float chat_height = ImGui::GetContentRegionAvail().y - 35;  // Leave room for input
-    if (ImGui::BeginChild("MainChat", ImVec2(-1, chat_height), true)) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));  // Black text
-
-        // Header row - using simple text layout instead of columns
-        ImGui::TextColored(ImVec4(0.5f, 0.0f, 0.0f, 1.0f), "Bnd   Time   From       To         Message");
-        ImGui::Separator();
-
-        // Messages
-        for (const auto& msg : chat_history_) {
-            if (msg.from == "SYSTEM") continue;  // Skip system messages in main view
-
-            auto time_t_val = static_cast<time_t>(msg.timestamp);
-            char time_str[16];
-            std::strftime(time_str, sizeof(time_str), "%H:%M", std::localtime(&time_t_val));
-
-            // Format: Bnd  Time  From  To  Message
-            ImGui::Text("%-4s", current_band_.c_str());
-            ImGui::SameLine(45);
-            ImGui::Text("%-6s", time_str);
-            ImGui::SameLine(95);
-
-            // From
-            if (msg.is_outgoing) {
-                ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.6f, 1.0f), "%-10s",
-                    config_.station.callsign.substr(0, 10).c_str());
-            } else {
-                ImGui::TextColored(ImVec4(0.6f, 0.0f, 0.0f, 1.0f), "%-10s",
-                    msg.from.substr(0, 10).c_str());
-            }
-            ImGui::SameLine(175);
-
-            // To
-            std::string to_call = msg.to;
-            if (to_call.empty()) {
-                if (msg.is_broadcast) {
-                    to_call = kMailBroadcastTarget;
-                } else if (msg.is_outgoing) {
-                    to_call = current_chat_partner_.empty() ? "UNKNOWN" : current_chat_partner_;
-                } else {
-                    to_call = config_.station.callsign;
-                }
-            }
-            ImGui::Text("%-10s", to_call.substr(0, 10).c_str());
-            ImGui::SameLine(255);
-
-            // Message text
-            ImGui::TextWrapped("%s", msg.text.c_str());
-        }
-
-        // Auto-scroll
-        if (chat_scroll_to_bottom_) {
-            ImGui::SetScrollHereY(1.0f);
-            chat_scroll_to_bottom_ = false;
-        }
-
-        ImGui::PopStyleColor();  // Text color
-    }
-    ImGui::EndChild();
-    ImGui::PopStyleColor();  // Child bg
-
-    // Input field
-    ImGui::PushItemWidth(-60);
-    bool send_msg = ImGui::InputText("##MsgInput", chat_input_, sizeof(chat_input_),
-                                      ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::PopItemWidth();
-    ImGui::SameLine();
-    if (ImGui::Button("Send") || send_msg) {
-        if (std::strlen(chat_input_) > 0) {
-            sendChatMessage(chat_input_);
-            chat_input_[0] = '\0';
-        }
-    }
-
-    // Typing indicator (send_typing declared in QSO status bar above)
-    if (std::strlen(chat_input_) > 0 && !last_input_was_empty_) {
-        sendTypingIndicator();
-    }
-    last_input_was_empty_ = (std::strlen(chat_input_) == 0);
-
-    ImGui::EndChild();  // End MainChatArea
-
-    ImGui::SameLine();
-
-    // ========================================================================
-    // RIGHT PANEL: Controls and buttons (VarAC style)
-    // ========================================================================
-
-    ImGui::BeginChild("RightPanel", ImVec2(right_panel_width, main_area_height), true);
-
-    // Duration
-    ImGui::Text("Duration:");
-    if (qso_active_) {
-        ImGui::Text("%s", formatQSODuration().c_str());
-    } else {
-        ImGui::Text("--:--:--");
-    }
-
-    ImGui::Separator();
-
-    // SNR display
-    ImGui::Text("SNR(db)");
-
-    // SNR values - simple text layout
-    ImGui::Text("Last  Avg   Mine");
-    ImGui::Text("%-5.0f %-5.0f %-5.0f", status.snr_db, status.snr_db, remote_snr_db_);
-
-    ImGui::Separator();
-
-    // QSY controls
-    ImGui::Text("QSY");
-    static int qsy_slot = 0;
-    ImGui::SetNextItemWidth(50);
-    ImGui::InputInt("##QSYSlot", &qsy_slot, 0, 0);
-    ImGui::SameLine();
-    if (ImGui::Button("^")) { qsy_slot++; }
-    ImGui::SameLine();
-    if (ImGui::Button("#")) {
-        auto recs = computeBandRecommendations();
-        if (!recs.empty()) {
-            current_band_ = recs.front().first;
-            if (freq_mgr_ && radio_) {
-                freq_mgr_->qsyToCallingFrequency(*radio_, current_band_);
-            }
-        }
-    }
-    auto recs = computeBandRecommendations();
-    if (!recs.empty()) {
-        ImGui::TextDisabled("Best: %s %.1f dB", recs.front().first.c_str(), recs.front().second);
-    }
-
-    ImGui::Separator();
-
-    // Bottom buttons
-    if (ImGui::Button("SEND FILE", ImVec2(-1, 0))) {
-        current_tab_ = AppTab::Files;
-    }
-    if (ImGui::Button("SEND MAIL", ImVec2(-1, 0))) {
-        current_tab_ = AppTab::Mail;
-    }
-    static bool open_broadcast_popup = false;
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-    if (ImGui::Button("BROADCAST", ImVec2(-1, 0))) {
-        open_broadcast_popup = true;
-    }
-    ImGui::PopStyleColor();
-
-    const VoiceStatus voice = modem_ ? modem_->getVoiceStatus() : VoiceStatus{};
-    const VoiceMode desired_voice_mode = configVoiceMode(config_.voice.mode);
-    const bool can_start_voice =
-        desired_voice_mode != VoiceMode::Off &&
-        ((desired_voice_mode == VoiceMode::Connected &&
-          status.link_state == LinkState::Connected) ||
-         (desired_voice_mode == VoiceMode::Broadcast &&
-          status.link_state == LinkState::Idle));
-    const bool ptt_available =
-        modem_ &&
-        modem_->isConnected() &&
-        (voice.ptt ||
-         voice.state == VoiceState::Opening ||
-         voiceSessionReadyForPtt(voice) ||
-         can_start_voice);
-    if (!ptt_available) {
-        ImGui::BeginDisabled();
-    }
-    if (voice.ptt) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.84f, 0.26f, 0.24f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.89f, 0.32f, 0.30f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.76f, 0.20f, 0.18f, 1.0f));
-    }
-    if (ImGui::Button(voice.ptt ? "PTT ON" : "PTT OFF", ImVec2(-1, 0))) {
-        (void)setVoicePttState(!voice.ptt);
-    }
-    if (voice.ptt) {
-        ImGui::PopStyleColor(3);
-    }
-    if (!ptt_available) {
-        ImGui::EndDisabled();
-    }
-    const float indicator_height = ImGui::GetFrameHeight();
-    const float remaining_height = ImGui::GetContentRegionAvail().y;
-    if (remaining_height > indicator_height) {
-        ImGui::Dummy(ImVec2(0.0f, remaining_height - indicator_height));
-    }
-    renderVoiceActivityIndicator(voice);
-
-    ImGui::EndChild();  // RightPanel
-
-    // Broadcast popup (rendered outside child window for proper display)
-    if (open_broadcast_popup) {
-        ImGui::OpenPopup("BroadcastPopup");
-        open_broadcast_popup = false;
-    }
-    if (ImGui::BeginPopupModal("BroadcastPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Broadcast Message:");
-        ImGui::InputTextMultiline("##BroadcastText", broadcast_message_, sizeof(broadcast_message_),
-                                   ImVec2(300, 80));
-
-        ImGui::Separator();
-        static bool include_position = false;
-        ImGui::Checkbox("Include Position Report", &include_position);
-        if (include_position) {
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                "Position: %.4f, %.4f (%s)", my_lat_, my_lon_,
-                config_.station.grid_square.c_str());
-            ImGui::TextWrapped("Receiving stations will relay your position to APRS-IS");
-        }
-
-        ImGui::Separator();
-        if (ImGui::Button("Send", ImVec2(100, 0))) {
-            if (include_position) {
-                // Send position beacon (0xF4)
-                std::vector<uint8_t> packet;
-                packet.push_back(0xF4);  // Position beacon marker
-
-                // Pack lat/lon as little-endian doubles
-                writeDoubleLE(packet, my_lat_);
-                writeDoubleLE(packet, my_lon_);
-
-                // Add grid square
-                std::string grid = config_.station.grid_square;
-                packet.push_back(static_cast<uint8_t>(grid.size()));
-                packet.insert(packet.end(), grid.begin(), grid.end());
-
-                // Add callsign and message
-                std::string msg_text = config_.station.callsign;
-                if (std::strlen(broadcast_message_) > 0) {
-                    msg_text += " ";
-                    msg_text += broadcast_message_;
-                }
-                packet.insert(packet.end(), msg_text.begin(), msg_text.end());
-
-                if (modem_) {
-                    (void)sendBroadcastPayload(packet);
-
-                    ChatMessage chat_msg;
-                    chat_msg.from = config_.station.callsign;
-                    chat_msg.text = "[POSITION BROADCAST] " + grid + " - " +
-                                   std::string(broadcast_message_);
-                    chat_msg.timestamp = std::chrono::system_clock::to_time_t(
-                        std::chrono::system_clock::now());
-                    chat_msg.is_outgoing = true;
-                    chat_msg.delivered = true;
-                    chat_history_.push_back(chat_msg);
-                    chat_scroll_to_bottom_ = true;
-                }
-            } else if (std::strlen(broadcast_message_) > 0) {
-                sendBroadcast(broadcast_message_);
-            }
-            broadcast_message_[0] = '\0';
-            include_position = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(100, 0))) {
-            include_position = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-
-    // ========================================================================
-    // BOTTOM BUTTONS (Data stream)
-    // ========================================================================
-
-    ImGui::Separator();
-
-    // Bottom buttons for accessing other tabs
-    if (ImGui::Button("Settings")) {
-        current_tab_ = AppTab::Settings;
-        show_settings_ = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("BBS")) {
-        current_tab_ = AppTab::BBS;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Frequency")) {
-        current_tab_ = AppTab::Frequency;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Messages")) {
-        current_tab_ = AppTab::Messages;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Position")) {
-        current_tab_ = AppTab::Position;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Mail")) {
-        current_tab_ = AppTab::Mail;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Weather")) {
-        current_tab_ = AppTab::Weather;
-    }
-
-    // Note: Detachable windows (Settings, Mail, Weather) are rendered
-    // in render() after the main window ends, so they can use viewports
-    // No ImGui::End() here - renderMainContent is called inside main window from render()
-}
-
 void App::renderStatusBar() {
-    // Status bar as child window at bottom
-    ImGui::BeginChild("StatusBar", ImVec2(-1, 25), true);
+    // Status bar as child window at bottom (MainContentRenderer reserves
+    // ui::statusBarHeight() for it)
+    const ui::Palette& pal = ui::palette();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
+    ImGui::BeginChild("StatusBar", ImVec2(-1, ui::statusBarHeight()),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    // Fields flow left to right, split by a faint divider.
+    auto divider = []() {
+        ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.8f);
+        ImGui::TextDisabled("|");
+        ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.8f);
+    };
 
     const auto& status = modem_ ? modem_->getStatus() : ModemStatus{};
     const VoiceStatus voice = modem_ ? modem_->getVoiceStatus() : VoiceStatus{};
@@ -3421,30 +2940,32 @@ void App::renderStatusBar() {
     std::strftime(utc_str, sizeof(utc_str), "UTC: %Y-%m-%d %H:%M:%S", std::gmtime(&time_t_now));
     ImGui::Text("%s", utc_str);
 
-    ImGui::SameLine(250);
+    divider();
 
     // Modem status
     if (status.state == ModemState::Connected) {
-        ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "MODEM OK");
+        ImGui::TextColored(pal.success, "MODEM OK");
+    } else if (modem_ && modem_->isConnecting()) {
+        ImGui::TextColored(pal.warning, "MODEM CONNECTING...");
     } else {
-        ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.2f, 1.0f), "MODEM OFF");
+        ImGui::TextColored(pal.danger, "MODEM OFF");
     }
 
-    ImGui::SameLine(350);
+    divider();
 
     // Link status
     if (status.link_state == LinkState::Connected) {
-        ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "LINK: %s", status.remote_callsign.c_str());
+        ImGui::TextColored(pal.success, "LINK: %s", status.remote_callsign.c_str());
     } else {
         ImGui::Text("LINK: IDLE");
     }
 
-    ImGui::SameLine(500);
+    divider();
 
     // Band
     ImGui::Text("Band: %s", current_band_.c_str());
 
-    ImGui::SameLine(600);
+    divider();
 
     // Grid square
     ImGui::Text("Grid: %s", config_.station.grid_square.c_str());
@@ -3464,9 +2985,9 @@ void App::renderStatusBar() {
             voice.state == VoiceState::TxActive ||
             voice.state == VoiceState::RxActive ||
             voice_start_pending_;
-        ImGui::SameLine(760);
+        divider();
         if (voice_hot) {
-            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.18f, 1.0f),
+            ImGui::TextColored(pal.warning,
                                "VOICE: %s %s %s %s%s",
                                voiceModeLabel(voice.mode),
                                voiceStateLabel(voice.state),
@@ -4299,672 +3820,6 @@ void App::removeRemoteBBSFile(const std::string& from, const std::string& filena
     }
 }
 
-void App::renderPositionTab() {
-    const auto& status = modem_ ? modem_->getStatus() : ModemStatus{};
-    bool station_connected = isStationLinkConnected(false);
-    std::string remote_callsign = status.remote_callsign.empty() ? current_chat_partner_ : status.remote_callsign;
-    if (remote_callsign.empty()) {
-        remote_callsign = "(unknown)";
-    }
-
-    ImGui::Text("Position Reporting");
-    ImGui::Separator();
-
-    // Current position
-    ImGui::Text("My Position:");
-    ImGui::InputDouble("Latitude", &my_lat_, 0.0001, 0.001, "%.6f");
-    ImGui::InputDouble("Longitude", &my_lon_, 0.0001, 0.001, "%.6f");
-    ImGui::InputText("Comment", position_comment_, sizeof(position_comment_));
-
-    if (ImGui::Button("Update Position")) {
-        updatePosition(my_lat_, my_lon_);
-    }
-
-    ImGui::Separator();
-
-    // ========================================================================
-    // RADIO POSITION REPORTING (via beacon or connected station)
-    // ========================================================================
-    ImGui::Text("Radio Position Reporting:");
-
-    if (station_connected) {
-        // Connected to a remote station - offer to relay through them
-        ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Connected to: %s",
-                           remote_callsign.c_str());
-        ImGui::TextWrapped("Position can be relayed to APRS-IS through the connected station if they have internet access.");
-
-        if (ImGui::Button("Send Position via Connected Station")) {
-            // Send position relay request: 0xFB | lat(8 bytes double) | lon(8 bytes double) | comment
-            std::vector<uint8_t> packet;
-            packet.push_back(0xF5);  // Position relay request marker
-
-            // Pack lat/lon as little-endian doubles
-            writeDoubleLE(packet, my_lat_);
-            writeDoubleLE(packet, my_lon_);
-
-            // Add grid square and comment
-            std::string grid = config_.station.grid_square;
-            packet.push_back(static_cast<uint8_t>(grid.size()));
-            packet.insert(packet.end(), grid.begin(), grid.end());
-
-            std::string comment = position_comment_;
-            packet.insert(packet.end(), comment.begin(), comment.end());
-
-            if (modem_) {
-                modem_->sendData(packet);
-
-                // Add to chat history
-                ChatMessage msg;
-                msg.from = config_.station.callsign;
-                msg.text = "[Position relay request sent via " + remote_callsign + " - waiting for relay ACK]";
-                msg.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                msg.is_outgoing = true;
-                msg.delivered = true;
-                chat_history_.push_back(msg);
-            }
-        }
-    } else {
-        // Not connected - send as radio beacon
-        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "Not connected to any station");
-        ImGui::TextWrapped("Position will be sent as a radio beacon. Other stations can receive and optionally relay to APRS-IS.");
-
-        if (ImGui::Button("Send Position Beacon")) {
-            // Send position beacon: 0xFC | lat(8) | lon(8) | grid_len | grid | comment
-            std::vector<uint8_t> packet;
-            packet.push_back(0xF4);  // Position beacon marker
-
-            // Pack lat/lon as little-endian doubles
-            writeDoubleLE(packet, my_lat_);
-            writeDoubleLE(packet, my_lon_);
-
-            // Add grid square
-            std::string grid = config_.station.grid_square;
-            if (grid.size() > 8) grid = grid.substr(0, 8);
-            packet.push_back(static_cast<uint8_t>(grid.size()));
-            packet.insert(packet.end(), grid.begin(), grid.end());
-
-            // Add callsign and comment
-            std::string msg_text = config_.station.callsign;
-            if (std::strlen(position_comment_) > 0) {
-                msg_text += " ";
-                msg_text += position_comment_;
-            }
-            packet.insert(packet.end(), msg_text.begin(), msg_text.end());
-
-            if (modem_) {
-                (void)sendBroadcastPayload(packet);
-
-                // Add to chat history
-                ChatMessage chat_msg;
-                chat_msg.from = config_.station.callsign;
-                chat_msg.text = "[Position beacon sent: " + grid + "]";
-                chat_msg.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                chat_msg.is_outgoing = true;
-                chat_msg.delivered = true;
-                chat_history_.push_back(chat_msg);
-            }
-        }
-    }
-
-    ImGui::Separator();
-
-    // ========================================================================
-    // APRS-IS DIRECT (if internet available locally)
-    // ========================================================================
-    ImGui::Text("APRS-IS Direct (requires internet):");
-
-    if (ImGui::Button("Send to APRS-IS Now")) {
-        if (!aprs_) {
-            ChatMessage msg;
-            msg.from = "SYSTEM";
-            msg.text = "APRS-IS send failed: APRS client unavailable";
-            msg.is_outgoing = false;
-            msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            chat_history_.push_back(msg);
-            chat_scroll_to_bottom_ = true;
-        } else {
-            if (aprs_->getState() != APRSState::Connected) {
-                if (!config_.aprs.enabled) {
-                    ChatMessage msg;
-                    msg.from = "SYSTEM";
-                    msg.text = "APRS-IS send failed: APRS is disabled in Settings";
-                    msg.is_outgoing = false;
-                    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    chat_history_.push_back(msg);
-                    chat_scroll_to_bottom_ = true;
-                } else {
-                    bool reconnected = aprs_->connect(config_.aprs.server, config_.aprs.port);
-                    if (reconnected) {
-                        aprs_->authenticate(config_.station.callsign, aprsPasscodeForConfig(config_));
-                    }
-                }
-            }
-
-            if (aprs_->getState() == APRSState::Connected) {
-                aprs_->setMyPosition(my_lat_, my_lon_, config_.station.altitude_m);
-                if (std::strlen(position_comment_) > 0) {
-                    aprs_->setMyComment(position_comment_);
-                } else {
-                    aprs_->setMyComment(config_.aprs.comment);
-                }
-                aprs_->sendPositionNow();
-
-                ChatMessage msg;
-                msg.from = "SYSTEM";
-                msg.text = "APRS-IS position beacon sent";
-                msg.is_outgoing = false;
-                msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                chat_history_.push_back(msg);
-                chat_scroll_to_bottom_ = true;
-            } else {
-                ChatMessage msg;
-                msg.from = "SYSTEM";
-                msg.text = "APRS-IS send failed: Not connected/authenticated";
-                msg.is_outgoing = false;
-                msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                chat_history_.push_back(msg);
-                chat_scroll_to_bottom_ = true;
-            }
-        }
-    }
-
-    if (aprs_) {
-        ImGui::SameLine();
-        auto state = aprs_->getState();
-        if (state == APRSState::Connected) {
-            ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "APRS-IS Connected");
-        } else if (state == APRSState::Connecting) {
-            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "Connecting...");
-        } else {
-            ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.2f, 1.0f), "APRS-IS Disconnected");
-        }
-
-        bool beaconing = aprs_->isBeaconingEnabled();
-        if (ImGui::Checkbox("Enable Auto Beaconing", &beaconing)) {
-            aprs_->enableBeaconing(beaconing);
-        }
-    } else {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "APRS client not initialized");
-    }
-}
-
-void App::renderSettingsTab() {
-    if (ImGui::BeginTabBar("SettingsTabs")) {
-        if (ImGui::BeginTabItem("Station")) {
-            ImGui::InputText("Callsign", callsign_input_, sizeof(callsign_input_));
-
-            static char grid[16] = "";
-            std::strncpy(grid, config_.station.grid_square.c_str(), sizeof(grid) - 1);
-            if (ImGui::InputText("Grid Square", grid, sizeof(grid))) {
-                config_.station.grid_square = grid;
-            }
-
-            static char name[64] = "";
-            std::strncpy(name, config_.station.name.c_str(), sizeof(name) - 1);
-            if (ImGui::InputText("Operator Name", name, sizeof(name))) {
-                config_.station.name = name;
-            }
-
-            if (ImGui::Button("Apply")) {
-                config_.station.callsign = callsign_input_;
-                if (modem_) {
-                    modem_->setCallsign(config_.station.callsign);
-                }
-            }
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Modem")) {
-            ImGui::InputText("Host", modem_host_input_, sizeof(modem_host_input_));
-            ImGui::InputInt("Command Port", &modem_port_input_);
-
-            static int data_port_input = 8301;
-            data_port_input = config_.modem.data_port;
-            if (ImGui::InputInt("Data Port", &data_port_input)) {
-                config_.modem.data_port = static_cast<uint16_t>(data_port_input);
-            }
-
-            bool auto_connect = config_.modem.auto_connect;
-            if (ImGui::Checkbox("Auto-connect on startup", &auto_connect)) {
-                config_.modem.auto_connect = auto_connect;
-            }
-
-            ImGui::Separator();
-            if (ImGui::Button("Connect")) {
-                config_.modem.host = modem_host_input_;
-                config_.modem.command_port = static_cast<uint16_t>(modem_port_input_);
-                connectToModem();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Disconnect")) {
-                disconnectFromModem();
-            }
-
-            // Show connection status
-            if (modem_ && modem_->isConnected()) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Connected");
-            } else {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.2f, 1.0f), "Disconnected");
-            }
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("APRS")) {
-            bool aprs_enabled = config_.aprs.enabled;
-            if (ImGui::Checkbox("Enable APRS", &aprs_enabled)) {
-                config_.aprs.enabled = aprs_enabled;
-            }
-
-            static char server[256] = "";
-            std::strncpy(server, config_.aprs.server.c_str(), sizeof(server) - 1);
-            ImGui::InputText("Server", server, sizeof(server));
-
-            // Auto-generated passcode from callsign (APRS-IS standard hash)
-            if (!config_.station.callsign.empty()) {
-                int32_t code = APRSClient::calculatePasscode(config_.station.callsign);
-                ImGui::Text("Passcode: %d (auto-generated from %s)",
-                            code, config_.station.callsign.c_str());
-            } else {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f),
-                                   "Passcode: set callsign first");
-            }
-
-            int beacon_interval = config_.aprs.beacon_interval_sec;
-            ImGui::InputInt("Beacon Interval (sec)", &beacon_interval);
-
-            ImGui::Separator();
-            ImGui::Text("GPS Position Source");
-
-            bool gps_enabled = config_.aprs.gps_enabled;
-            if (ImGui::Checkbox("Enable GPS serial input", &gps_enabled)) {
-                config_.aprs.gps_enabled = gps_enabled;
-                if (!config_.aprs.gps_enabled) {
-                    closeGPSPort();
-                }
-            }
-
-            // Serial port dropdown
-            static std::vector<std::string> cached_ports;
-            static auto last_scan = std::chrono::steady_clock::time_point{};
-            auto now_scan = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now_scan - last_scan).count() >= 3) {
-                cached_ports = enumerateSerialPorts();
-                last_scan = now_scan;
-            }
-
-            // Find current selection index
-            int current_idx = 0;  // 0 = "(none)"
-            for (size_t i = 0; i < cached_ports.size(); ++i) {
-                if (cached_ports[i] == config_.aprs.gps_port) {
-                    current_idx = static_cast<int>(i + 1);
-                    break;
-                }
-            }
-
-            const std::string preview = current_idx > 0
-                ? cached_ports[current_idx - 1]
-                : (config_.aprs.gps_port.empty() ? "(none)" : config_.aprs.gps_port);
-            if (ImGui::BeginCombo("GPS Serial Port", preview.c_str())) {
-                if (ImGui::Selectable("(none)", current_idx == 0)) {
-                    config_.aprs.gps_port.clear();
-                }
-                for (size_t i = 0; i < cached_ports.size(); ++i) {
-                    bool selected = (current_idx == static_cast<int>(i + 1));
-                    if (ImGui::Selectable(cached_ports[i].c_str(), selected)) {
-                        config_.aprs.gps_port = cached_ports[i];
-                    }
-                }
-                ImGui::EndCombo();
-            }
-
-            int gps_baud = config_.aprs.gps_baud;
-            if (ImGui::InputInt("GPS Baud", &gps_baud)) {
-                if (gps_baud < 1200) gps_baud = 1200;
-                if (gps_baud > 115200) gps_baud = 115200;
-                config_.aprs.gps_baud = gps_baud;
-            }
-
-            if (config_.aprs.gps_enabled) {
-                if (!gps_port_.empty()) {
-                    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f),
-                                       "GPS connected: %s @ %d", gps_port_.c_str(), gps_baud_);
-                    if (gps_fix_valid_) {
-                        ImGui::Text("GPS fix: %.6f, %.6f", my_lat_, my_lon_);
-                    } else {
-                        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "GPS fix: waiting...");
-                    }
-                } else {
-                    ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.2f, 1.0f), "GPS disconnected");
-                }
-
-                if (ImGui::Button("Open GPS Port")) {
-                    if (!config_.aprs.gps_port.empty()) {
-                        closeGPSPort();
-                        openGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud);
-                    }
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Close GPS Port")) {
-                    closeGPSPort();
-                }
-            }
-
-            if (ImGui::Button("Apply APRS Settings")) {
-                config_.aprs.server = server;
-                config_.aprs.passcode.clear();  // Always use auto-generated passcode
-                config_.aprs.beacon_interval_sec = beacon_interval;
-
-                if (!config_.aprs.gps_enabled || config_.aprs.gps_port.empty()) {
-                    closeGPSPort();
-                } else if (gps_port_ != config_.aprs.gps_port || gps_baud_ != config_.aprs.gps_baud) {
-                    closeGPSPort();
-                    openGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud);
-                } else if (gps_port_.empty()) {
-                    openGPSPort(config_.aprs.gps_port, config_.aprs.gps_baud);
-                }
-            }
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Email")) {
-            static char smtp_host[256] = "";
-            std::strncpy(smtp_host, config_.email.smtp_host.c_str(), sizeof(smtp_host) - 1);
-            ImGui::InputText("SMTP Host", smtp_host, sizeof(smtp_host));
-
-            int smtp_port = config_.email.smtp_port;
-            ImGui::InputInt("SMTP Port", &smtp_port);
-
-            static char smtp_user[128] = "";
-            std::strncpy(smtp_user, config_.email.smtp_username.c_str(), sizeof(smtp_user) - 1);
-            ImGui::InputText("SMTP Username", smtp_user, sizeof(smtp_user));
-
-            static char smtp_pass[128] = "";
-            ImGui::InputText("SMTP Password", smtp_pass, sizeof(smtp_pass), ImGuiInputTextFlags_Password);
-
-            bool gateway_enabled = config_.email.gateway_enabled;
-            if (ImGui::Checkbox("Enable Email Gateway Relay", &gateway_enabled)) {
-                config_.email.gateway_enabled = gateway_enabled;
-            }
-
-            bool winlink_telnet_enabled = config_.email.winlink_telnet_enabled;
-            if (ImGui::Checkbox("Use Winlink Telnet (internet)", &winlink_telnet_enabled)) {
-                config_.email.winlink_telnet_enabled = winlink_telnet_enabled;
-            }
-
-            if (!winlink_telnet_enabled) ImGui::BeginDisabled();
-            static char winlink_host[256] = "";
-            std::strncpy(winlink_host, config_.email.winlink_telnet_host.c_str(), sizeof(winlink_host) - 1);
-            ImGui::InputText("Winlink Host", winlink_host, sizeof(winlink_host));
-
-            int winlink_port = config_.email.winlink_telnet_port;
-            ImGui::InputInt("Winlink Port", &winlink_port);
-
-            static char winlink_call[32] = "";
-            std::strncpy(winlink_call, config_.email.winlink_telnet_callsign.c_str(), sizeof(winlink_call) - 1);
-            ImGui::InputText("Winlink Callsign", winlink_call, sizeof(winlink_call));
-
-            static char winlink_pass[128] = "";
-            ImGui::InputText("Winlink Password", winlink_pass, sizeof(winlink_pass), ImGuiInputTextFlags_Password);
-
-            bool winlink_tls = config_.email.winlink_telnet_use_tls;
-            if (ImGui::Checkbox("Winlink Telnet TLS", &winlink_tls)) {
-                config_.email.winlink_telnet_use_tls = winlink_tls;
-            }
-            ImGui::TextDisabled("Default CMS telnet server: server.winlink.org:8772");
-            if (!winlink_telnet_enabled) ImGui::EndDisabled();
-
-            bool winlink_compat = config_.email.winlink_compat_mode;
-            if (ImGui::Checkbox("Winlink-compatible B2F envelope", &winlink_compat)) {
-                config_.email.winlink_compat_mode = winlink_compat;
-            }
-
-            ImGui::Separator();
-            ImGui::Text("Weak-Signal Profile");
-            bool weak_profile = config_.email.weak_signal_profile_enabled;
-            if (ImGui::Checkbox("Enable weak-signal profile", &weak_profile)) {
-                config_.email.weak_signal_profile_enabled = weak_profile;
-            }
-
-            int weak_snr_threshold = config_.email.weak_signal_snr_threshold_db;
-            if (ImGui::SliderInt("Weak SNR Threshold (dB)", &weak_snr_threshold, -25, 2)) {
-                config_.email.weak_signal_snr_threshold_db = weak_snr_threshold;
-            }
-
-            int weak_ack_timeout_ms = config_.email.weak_signal_ack_timeout_ms;
-            if (ImGui::SliderInt("Weak ACK Timeout (ms)", &weak_ack_timeout_ms, 15000, 120000)) {
-                config_.email.weak_signal_ack_timeout_ms = weak_ack_timeout_ms;
-            }
-
-            int weak_max_retries = config_.email.weak_signal_max_retries;
-            if (ImGui::SliderInt("Weak Max Retries", &weak_max_retries, 3, 10)) {
-                config_.email.weak_signal_max_retries = weak_max_retries;
-            }
-
-            bool weak_compress = config_.email.weak_signal_enable_compression;
-            if (ImGui::Checkbox("Compress payload on weak links", &weak_compress)) {
-                config_.email.weak_signal_enable_compression = weak_compress;
-            }
-
-            ImGui::Separator();
-            ImGui::Text("HF Store-and-Forward");
-            bool sf_enabled = config_.email.hf_store_forward_enabled;
-            if (ImGui::Checkbox("Enable HF mesh forwarding", &sf_enabled)) {
-                config_.email.hf_store_forward_enabled = sf_enabled;
-            }
-            int sf_ttl = config_.email.hf_store_forward_ttl;
-            ImGui::InputInt("Relay TTL", &sf_ttl);
-            int sf_hop_limit = config_.email.hf_store_forward_hop_limit;
-            ImGui::InputInt("Relay Hop Limit", &sf_hop_limit);
-            int sf_dedup_window = config_.email.hf_store_forward_dedup_window_sec;
-            ImGui::InputInt("Relay Dedup Window (sec)", &sf_dedup_window);
-
-            if (ImGui::Button("Apply Email Settings")) {
-                config_.email.smtp_host = smtp_host;
-                config_.email.smtp_port = static_cast<uint16_t>(smtp_port);
-                config_.email.smtp_username = smtp_user;
-                if (std::strlen(smtp_pass) > 0) {
-                    config_.email.smtp_password = smtp_pass;
-                }
-                config_.email.winlink_telnet_host = winlink_host;
-                config_.email.winlink_telnet_port = static_cast<uint16_t>(std::clamp(winlink_port, 1, 65535));
-                config_.email.winlink_telnet_callsign = winlink_call;
-                if (std::strlen(winlink_pass) > 0) {
-                    config_.email.winlink_telnet_password = winlink_pass;
-                }
-                config_.email.hf_store_forward_ttl = std::clamp(sf_ttl, 1, 15);
-                config_.email.hf_store_forward_hop_limit = std::clamp(sf_hop_limit, 1, 20);
-                config_.email.hf_store_forward_dedup_window_sec = std::clamp(sf_dedup_window, 30, 3600);
-                if (config_.email.gateway_enabled && !email_gateway_active_) {
-                    startEmailGateway();
-                } else if (!config_.email.gateway_enabled && email_gateway_active_) {
-                    stopEmailGateway();
-                }
-            }
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Beacon")) {
-            // Sync member with config
-            beacon_enabled_ = config_.beacon.enabled;
-
-            if (ImGui::Checkbox("Enable Beacon", &beacon_enabled_)) {
-                config_.beacon.enabled = beacon_enabled_;
-                if (beacon_enabled_) {
-                    last_beacon_sent_ = std::chrono::steady_clock::now();
-                }
-            }
-
-            ImGui::InputInt("Beacon Interval (sec)", &config_.beacon.interval_sec);
-            if (config_.beacon.interval_sec < 60) config_.beacon.interval_sec = 60;
-            if (config_.beacon.interval_sec > 3600) config_.beacon.interval_sec = 3600;
-
-            static char beacon_text[256] = "";
-            std::strncpy(beacon_text, config_.beacon.beacon_text.c_str(), sizeof(beacon_text) - 1);
-            if (ImGui::InputText("Beacon Message", beacon_text, sizeof(beacon_text))) {
-                config_.beacon.beacon_text = beacon_text;
-            }
-
-            bool notify_pending = config_.beacon.notify_pending;
-            if (ImGui::Checkbox("Notify stations with pending messages", &notify_pending)) {
-                config_.beacon.notify_pending = notify_pending;
-            }
-
-            ImGui::Separator();
-            ImGui::Text("Beacon status:");
-            if (beacon_enabled_) {
-                ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Active");
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_beacon_sent_);
-                int remaining = config_.beacon.interval_sec - static_cast<int>(elapsed.count());
-                if (remaining > 0) {
-                    ImGui::SameLine();
-                    ImGui::Text("(next in %d sec)", remaining);
-                }
-            } else {
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Disabled");
-            }
-
-            if (ImGui::Button("Send Beacon Now")) {
-                sendBeacon();
-            }
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Away Mode")) {
-            bool away_enabled = config_.away.enabled;
-            if (ImGui::Checkbox("Enable Away Mode Config", &away_enabled)) {
-                config_.away.enabled = away_enabled;
-            }
-
-            static char away_msg[512] = "";
-            std::strncpy(away_msg, config_.away.away_message.c_str(), sizeof(away_msg) - 1);
-            if (ImGui::InputTextMultiline("Away Message", away_msg, sizeof(away_msg), ImVec2(-1, 60))) {
-                config_.away.away_message = away_msg;
-            }
-
-            ImGui::Separator();
-            ImGui::Text("Remote Station Permissions:");
-
-            bool allow_query = config_.away.allow_message_query;
-            if (ImGui::Checkbox("Allow message query", &allow_query)) {
-                config_.away.allow_message_query = allow_query;
-            }
-
-            bool allow_email = config_.away.allow_email_gateway;
-            if (ImGui::Checkbox("Allow email gateway access", &allow_email)) {
-                config_.away.allow_email_gateway = allow_email;
-            }
-
-            bool allow_bbs = config_.away.allow_bbs_access;
-            if (ImGui::Checkbox("Allow BBS file download", &allow_bbs)) {
-                config_.away.allow_bbs_access = allow_bbs;
-            }
-
-            bool auto_reply = config_.away.auto_reply;
-            if (ImGui::Checkbox("Auto-reply with away message", &auto_reply)) {
-                config_.away.auto_reply = auto_reply;
-            }
-
-            ImGui::Separator();
-            if (away_mode_active_) {
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "Away Mode: ACTIVE");
-                if (ImGui::Button("Disable Away Mode")) {
-                    disableAwayMode();
-                }
-            } else {
-                ImGui::Text("Away Mode: Inactive");
-                if (ImGui::Button("Enable Away Mode")) {
-                    enableAwayMode();
-                }
-            }
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("PSK Reporter")) {
-            bool psk_enabled = config_.psk_reporter.enabled;
-            if (ImGui::Checkbox("Enable PSK Reporter", &psk_enabled)) {
-                config_.psk_reporter.enabled = psk_enabled;
-            }
-
-            ImGui::TextWrapped("Automatically upload reception reports to pskreporter.info when "
-                               "stations are heard via beacon, CQ, or connection.");
-
-            ImGui::Separator();
-
-            static char antenna[64] = "";
-            std::strncpy(antenna, config_.psk_reporter.antenna.c_str(), sizeof(antenna) - 1);
-            if (ImGui::InputText("Antenna", antenna, sizeof(antenna))) {
-                config_.psk_reporter.antenna = antenna;
-            }
-            ImGui::SetItemTooltip("Description of your antenna (e.g., \"Dipole\", \"Vertical\", \"Beam\")");
-
-            int min_snr = config_.psk_reporter.min_snr;
-            if (ImGui::SliderInt("Minimum SNR (dB)", &min_snr, -30, 10)) {
-                config_.psk_reporter.min_snr = min_snr;
-            }
-            ImGui::SetItemTooltip("Only report spots with SNR above this threshold");
-
-            int upload_interval = config_.psk_reporter.upload_interval_sec;
-            if (ImGui::SliderInt("Upload Interval (sec)", &upload_interval, 60, 900)) {
-                config_.psk_reporter.upload_interval_sec = upload_interval;
-            }
-            ImGui::SetItemTooltip("How often to batch-upload spots (default 300 = 5 min)");
-
-            ImGui::Separator();
-            ImGui::Text("Status:");
-
-            {
-                std::lock_guard<std::mutex> lock(psk_reporter_mutex_);
-                if (config_.psk_reporter.enabled) {
-                    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Active");
-                    ImGui::SameLine();
-                    ImGui::Text("(%zu spots queued)", psk_reporter_queue_.size());
-                } else {
-                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Disabled");
-                }
-            }
-
-            if (ImGui::Button("Upload Now")) {
-                uploadPSKReporterSpots();
-            }
-            ImGui::SameLine();
-            ImGui::TextWrapped("Mode: SKYWAVE");
-
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("UI")) {
-            bool dark_mode = config_.ui.dark_mode;
-            if (ImGui::Checkbox("Dark Mode", &dark_mode)) {
-                config_.ui.dark_mode = dark_mode;
-                setupStyle();
-            }
-
-            ImGui::SliderInt("Font Size", &config_.ui.font_size, 10, 24);
-
-            bool show_ts = config_.ui.show_timestamps;
-            if (ImGui::Checkbox("Show Timestamps", &show_ts)) {
-                config_.ui.show_timestamps = show_ts;
-            }
-
-            bool sound = config_.ui.sound_notifications;
-            if (ImGui::Checkbox("Sound Notifications", &sound)) {
-                config_.ui.sound_notifications = sound;
-            }
-            ImGui::EndTabItem();
-        }
-
-        ImGui::EndTabBar();
-    }
-}
-
 bool App::decidePendingFileOffer(const std::string& transfer_id, bool accept) {
     if (!file_transfer_mgr_ || !modem_) {
         return false;
@@ -5412,23 +4267,113 @@ void App::onDisconnected() {
 
 void App::connectToModem() {
     if (!modem_) return;
+    if (modem_->isConnecting()) return;
 
-    if (modem_->connect(config_.modem.host,
-                        config_.modem.command_port,
-                        config_.modem.data_port,
-                        config_.modem.voice_port)) {
-        // Set callsign
-        if (!config_.station.callsign.empty()) {
-            modem_->setCallsign(config_.station.callsign);
-        }
-        applyModemSettingsToModem();
-        applyVoiceSettingsToModem(false);
-        // Passive monitoring is opt-in on Skywave and is how this app hears
-        // CQ, beacons and broadcast traffic from stations it is not linked
-        // to (INTERFACES.md "MONITOR ON|OFF").
-        (void)modem_->setMonitorMode(true);
-        (void)modem_->refreshStatus();
+    // The TCP connects run on a helper thread (see pollModemConnect()), so an
+    // unreachable host never freezes the window.
+    if (modem_->beginConnect(config_.modem.host,
+                             config_.modem.command_port,
+                             config_.modem.data_port,
+                             config_.modem.voice_port)) {
+        shared_state_.addSystemMessage("Connecting to modem at " + config_.modem.host + ":" +
+                                       std::to_string(config_.modem.command_port) + "...");
     }
+}
+
+struct App::PathPickerJob {
+    std::mutex mu;
+    bool done = false;
+    std::string path;
+};
+
+void App::startPathPicker(bool folder, PathPickedCallback done) {
+#ifdef __APPLE__
+    if (path_picker_job_) {
+        return;  // a picker is already open
+    }
+    auto job = std::make_shared<PathPickerJob>();
+    path_picker_job_ = job;
+    path_picker_done_ = std::move(done);
+    try {
+        // osascript shows the dialog in its own process; waiting for it on a
+        // helper thread keeps the window rendering and the modem polled.
+        std::thread([job, folder]() {
+            std::string path = folder ? openNativeFolderDialog() : openNativeFileDialog();
+            std::lock_guard<std::mutex> lock(job->mu);
+            job->path = std::move(path);
+            job->done = true;
+        }).detach();
+    } catch (const std::exception&) {
+        path_picker_job_.reset();
+        path_picker_done_ = nullptr;
+    }
+#else
+    (void)folder;
+    (void)done;
+#endif
+}
+
+void App::pollPathPicker() {
+    if (!path_picker_job_) return;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(path_picker_job_->mu);
+        if (!path_picker_job_->done) return;
+        path = path_picker_job_->path;
+    }
+    path_picker_job_.reset();
+    PathPickedCallback done = std::move(path_picker_done_);
+    path_picker_done_ = nullptr;
+    if (done) done(path);
+}
+
+void App::pollAPRSConnect() {
+    if (!aprs_ || !aprs_->isConnecting()) return;
+    switch (aprs_->pollConnect()) {
+    case APRSConnectProgress::Connected:
+        if (aprs_->takeQueuedPositionSent()) {
+            shared_state_.addSystemMessage("APRS-IS position beacon sent");
+        }
+        break;
+    case APRSConnectProgress::Failed:
+        shared_state_.addSystemMessage("APRS-IS connect failed: " +
+                                       (aprs_->lastConnectError().empty()
+                                            ? std::string("no connection")
+                                            : aprs_->lastConnectError()));
+        break;
+    default:
+        break;
+    }
+}
+
+void App::pollModemConnect() {
+    if (!modem_ || !modem_->isConnecting()) return;
+    switch (modem_->pollConnect()) {
+    case ConnectProgress::Connected:
+        onModemConnected();
+        break;
+    case ConnectProgress::Failed:
+        shared_state_.addSystemMessage("Could not reach the modem at " + config_.modem.host + ":" +
+                                       std::to_string(config_.modem.command_port));
+        break;
+    default:
+        break;
+    }
+}
+
+void App::onModemConnected() {
+    // Set callsign
+    if (!config_.station.callsign.empty()) {
+        modem_->setCallsign(config_.station.callsign);
+    }
+    applyModemSettingsToModem();
+    applyVoiceSettingsToModem(false);
+    // Passive monitoring is opt-in on Skywave and is how this app hears
+    // CQ, beacons and broadcast traffic from stations it is not linked
+    // to (INTERFACES.md "MONITOR ON|OFF").
+    (void)modem_->setMonitorMode(true);
+    // STATUS replies are folded into the status snapshot by poll().
+    modem_->sendCommand("STATUS");
 }
 
 void App::disconnectFromModem() {
@@ -7460,6 +6405,8 @@ void App::stopEmailGateway() {
 
 void App::updateEmailGateway() {
     if (!email_gateway_active_) return;
+    // One network job at a time: skip this poll while one is running.
+    if (email_worker_.busy()) return;
 
     auto now = std::chrono::steady_clock::now();
     const int pop3_interval_sec = std::clamp(config_.email.pop3_poll_interval_sec, 30, 3600);
@@ -7482,8 +6429,7 @@ void App::updateEmailGateway() {
     }
 
     if (poll_pop3 || poll_winlink) {
-        checkPOP3Inbox(poll_pop3, poll_winlink);
-        sendQueuedEmails();
+        startEmailGatewayJob(poll_pop3, poll_winlink, true);
         last_email_check_ = now;
         if (poll_pop3) {
             last_pop3_check_ = now;
@@ -7491,6 +6437,76 @@ void App::updateEmailGateway() {
         if (poll_winlink) {
             last_winlink_check_ = now;
         }
+    }
+}
+
+// Snapshots the request data on the GUI thread and hands only the network
+// calls to the worker; pollEmailGatewayJob() applies the results here.
+bool App::startEmailGatewayJob(bool poll_pop3, bool poll_winlink, bool send_outbox) {
+    if (email_worker_.busy()) {
+        if (send_outbox) email_send_requested_ = true;
+        return false;
+    }
+
+    EmailGatewayJobInput input;
+
+    if (poll_pop3 && !trimSpaces(config_.email.pop3_host).empty()) {
+        input.poll_pop3 = true;
+        input.pop3.host = trimSpaces(config_.email.pop3_host);
+        input.pop3.port = config_.email.pop3_port;
+        input.pop3.use_tls = config_.email.pop3_use_tls;
+        input.pop3.username = config_.email.pop3_username;
+        input.pop3.password = config_.email.pop3_password;
+        input.pop3.delete_after_fetch = true;
+        input.pop3.max_messages = std::clamp(config_.email.pop3_max_messages, 1, 500);
+    }
+
+    const bool winlink_ready =
+        config_.email.winlink_telnet_enabled &&
+        !trimSpaces(config_.email.winlink_telnet_host).empty() &&
+        !normalizeCallsign(config_.email.winlink_telnet_callsign).empty() &&
+        !trimSpaces(config_.email.winlink_telnet_password).empty();
+    if (poll_winlink && winlink_ready) {
+        input.poll_winlink = true;
+        input.winlink_fetch.host = trimSpaces(config_.email.winlink_telnet_host);
+        input.winlink_fetch.port = config_.email.winlink_telnet_port;
+        input.winlink_fetch.use_tls = config_.email.winlink_telnet_use_tls;
+        input.winlink_fetch.callsign = normalizeCallsign(config_.email.winlink_telnet_callsign);
+        input.winlink_fetch.password = config_.email.winlink_telnet_password;
+        input.winlink_fetch.max_messages = std::clamp(config_.email.winlink_fetch_max_messages, 1, 500);
+        input.winlink_fetch.delete_after_fetch = true;
+    }
+
+    if (send_outbox) {
+        email_send_requested_ = false;
+        prepareQueuedEmails(input);
+    }
+
+    if (!input.poll_pop3 && !input.poll_winlink && input.outgoing.empty()) {
+        return false;
+    }
+    if (!email_worker_.start(std::move(input))) {
+        // Could not start a thread: put the messages back for the next try.
+        email_outbox_.insert(email_outbox_.begin(), email_inflight_.begin(), email_inflight_.end());
+        email_inflight_.clear();
+        return false;
+    }
+    return true;
+}
+
+void App::pollEmailGatewayJob() {
+    // Fetched mail is stored before the job may delete the server copies.
+    if (auto inbound = email_worker_.takeInbound()) {
+        applyInboundEmail(*inbound);
+        const bool stored = store_ && store_->isOpen() && radio_outbox_.empty();
+        email_worker_.ackInbound(stored);
+    }
+    auto output = email_worker_.poll();
+    if (!output) return;
+    applyInboundEmail(*output);
+    applyEmailSendResults(*output);
+    if (email_send_requested_ && !email_outbox_.empty()) {
+        startEmailGatewayJob(false, false, true);
     }
 }
 
@@ -7568,11 +6584,15 @@ void App::relayEmailToRadio(const Message& email) {
 }
 
 void App::relayRadioToEmail(const Message& msg) {
-    // Convert radio message to email and queue for SMTP
+    // Convert radio message to email and queue for SMTP. The store keeps it
+    // queued until a confirmed send, so a quit or crash never drops it.
+    if (store_ && store_->isOpen() && msg.id > 0) {
+        store_->queueInternetRelay(msg.id);
+    }
     email_outbox_.push_back(msg);
 }
 
-void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
+void App::applyInboundEmail(const EmailGatewayJobOutput& output) {
     auto queueInboundForRadio = [&](const std::string& from,
                                     const std::string& to,
                                     const std::string& subject,
@@ -7614,19 +6634,10 @@ void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
 
     int queued_for_radio = 0;
 
-    if (poll_pop3 && !trimSpaces(config_.email.pop3_host).empty()) {
-        POP3FetchRequest pop_req;
-        pop_req.host = trimSpaces(config_.email.pop3_host);
-        pop_req.port = config_.email.pop3_port;
-        pop_req.use_tls = config_.email.pop3_use_tls;
-        pop_req.username = config_.email.pop3_username;
-        pop_req.password = config_.email.pop3_password;
-        pop_req.delete_after_fetch = true;
-        pop_req.max_messages = std::clamp(config_.email.pop3_max_messages, 1, 500);
-
-        POP3FetchResult pop_result = fetchPOP3Messages(pop_req);
+    if (output.pop3_ran) {
+        const POP3FetchResult& pop_result = output.pop3;
         relay_diagnostics_.last_mode = "pop3-fetch";
-        relay_diagnostics_.last_target = pop_req.host + ":" + std::to_string(pop_req.port);
+        relay_diagnostics_.last_target = output.pop3_target;
         relay_diagnostics_.last_attempt_unix = unixNowSeconds();
         if (!pop_result.success) {
             relay_diagnostics_.last_result = "pop3-fail";
@@ -7646,7 +6657,7 @@ void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
                                          inbound.to,
                                          inbound.subject,
                                          inbound.body,
-                                         "")) {
+                                         inbound.message_id)) {
                     queued_for_radio++;
                 }
             }
@@ -7657,26 +6668,12 @@ void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
         }
     }
 
-    const bool winlink_fetch_ready =
-        config_.email.winlink_telnet_enabled &&
-        !trimSpaces(config_.email.winlink_telnet_host).empty() &&
-        !normalizeCallsign(config_.email.winlink_telnet_callsign).empty() &&
-        !trimSpaces(config_.email.winlink_telnet_password).empty();
-    if (poll_winlink && winlink_fetch_ready) {
-        WinlinkTelnetFetchRequest wl_req;
-        wl_req.host = trimSpaces(config_.email.winlink_telnet_host);
-        wl_req.port = config_.email.winlink_telnet_port;
-        wl_req.use_tls = config_.email.winlink_telnet_use_tls;
-        wl_req.callsign = normalizeCallsign(config_.email.winlink_telnet_callsign);
-        wl_req.password = config_.email.winlink_telnet_password;
-        wl_req.max_messages = std::clamp(config_.email.winlink_fetch_max_messages, 1, 500);
-        wl_req.delete_after_fetch = true;
-
-        WinlinkTelnetFetchResult wl_result = fetchWinlinkTelnetMessages(wl_req);
+    if (output.winlink_ran) {
+        const WinlinkTelnetFetchResult& wl_result = output.winlink;
         relay_diagnostics_.last_mode = wl_result.login_mode_used.empty()
             ? "winlink-fetch"
             : ("winlink-fetch/" + wl_result.login_mode_used);
-        relay_diagnostics_.last_target = wl_req.host + ":" + std::to_string(wl_req.port);
+        relay_diagnostics_.last_target = output.winlink_target;
         relay_diagnostics_.last_attempt_unix = unixNowSeconds();
         relay_diagnostics_.last_login_attempts = wl_result.login_attempts;
 
@@ -7723,6 +6720,17 @@ void App::checkPOP3Inbox(bool poll_pop3, bool poll_winlink) {
 }
 
 void App::sendQueuedEmails() {
+    // Delivery runs on the email worker; a send requested while a job is
+    // running starts as soon as that job's results are applied.
+    if (email_outbox_.empty()) {
+        return;
+    }
+    startEmailGatewayJob(false, false, true);
+}
+
+// GUI thread: moves the outbox into the in-flight list and describes the
+// deliveries for the worker.
+void App::prepareQueuedEmails(EmailGatewayJobInput& input) {
     if (email_outbox_.empty()) {
         return;
     }
@@ -7746,90 +6754,102 @@ void App::sendQueuedEmails() {
         return;
     }
 
+    input.winlink_send_ready = winlink_telnet_ready;
+    if (winlink_telnet_ready) {
+        input.winlink_send.host = trimSpaces(config_.email.winlink_telnet_host);
+        input.winlink_send.port = config_.email.winlink_telnet_port;
+        input.winlink_send.use_tls = config_.email.winlink_telnet_use_tls;
+        input.winlink_send.callsign = normalizeCallsign(config_.email.winlink_telnet_callsign);
+        input.winlink_send.password = config_.email.winlink_telnet_password;
+    }
+    input.smtp_ready = smtp_ready;
+    if (smtp_ready) {
+        input.smtp.host = config_.email.smtp_host;
+        input.smtp.port = config_.email.smtp_port;
+        input.smtp.use_tls = config_.email.smtp_use_tls;
+        input.smtp.username = config_.email.smtp_username;
+        input.smtp.password = config_.email.smtp_password;
+        input.smtp.from = config_.email.smtp_username;  // Use SMTP login as From
+    }
+
+    email_inflight_ = std::move(email_outbox_);
+    email_outbox_.clear();
+    for (const auto& msg : email_inflight_) {
+        EmailGatewayOutgoing out;
+        out.store_id = msg.id;
+        out.to = trimSpaces(msg.to_callsign);
+        out.subject = msg.subject.empty()
+            ? ("Radio message from " + msg.from_callsign)
+            : msg.subject;
+        out.body = msg.body;
+        input.outgoing.push_back(std::move(out));
+    }
+}
+
+// GUI thread: records each delivery outcome; failures go back to the
+// front of the outbox for the next cycle.
+void App::applyEmailSendResults(const EmailGatewayJobOutput& output) {
+    if (email_inflight_.empty()) {
+        return;
+    }
+
     std::vector<Message> failed;
-    for (auto& msg : email_outbox_) {
-        std::string error;
-        bool sent = false;
-        std::string relay_mode;
-        std::string winlink_login_mode;
-        int winlink_login_attempts = 0;
-        const std::string relay_target = trimSpaces(msg.to_callsign);
-        relay_diagnostics_.last_target = relay_target;
+    for (size_t i = 0; i < email_inflight_.size(); ++i) {
+        Message& msg = email_inflight_[i];
+        const EmailGatewaySendResult result =
+            i < output.sends.size() ? output.sends[i] : EmailGatewaySendResult{};
+        if (!result.attempted) {
+            // Skipped (job stopped): still queued in the store, retry later.
+            msg.status = MessageStatus::Pending;
+            failed.push_back(msg);
+            continue;
+        }
+        relay_diagnostics_.last_target = trimSpaces(msg.to_callsign);
         relay_diagnostics_.last_attempt_unix = unixNowSeconds();
         relay_diagnostics_.last_failover_reason.clear();
 
-        if (winlink_telnet_ready) {
-            WinlinkTelnetRequest winlink_req;
-            winlink_req.host = trimSpaces(config_.email.winlink_telnet_host);
-            winlink_req.port = config_.email.winlink_telnet_port;
-            winlink_req.use_tls = config_.email.winlink_telnet_use_tls;
-            winlink_req.callsign = normalizeCallsign(config_.email.winlink_telnet_callsign);
-            winlink_req.password = config_.email.winlink_telnet_password;
-            winlink_req.to = trimSpaces(msg.to_callsign);
-            winlink_req.subject = msg.subject.empty()
-                ? ("Radio message from " + msg.from_callsign)
-                : msg.subject;
-            winlink_req.body = msg.body;
-
-            sent = sendWinlinkTelnetDelivery(winlink_req,
-                                             &error,
-                                             &winlink_login_mode,
-                                             &winlink_login_attempts);
-            relay_diagnostics_.last_login_attempts = winlink_login_attempts;
-            if (sent) {
-                relay_mode = "Winlink Telnet";
-                relay_diagnostics_.last_mode = winlink_login_mode.empty()
+        if (result.winlink_tried) {
+            relay_diagnostics_.last_login_attempts = result.winlink_login_attempts;
+            if (result.sent && result.relay_mode == "Winlink Telnet") {
+                relay_diagnostics_.last_mode = result.winlink_login_mode.empty()
                     ? "winlink-telnet"
-                    : ("winlink-telnet/" + winlink_login_mode);
-            } else if (smtp_ready) {
+                    : ("winlink-telnet/" + result.winlink_login_mode);
+            } else if (result.smtp_tried) {
                 relay_diagnostics_.last_failover_reason =
                     "Winlink Telnet send failed, falling back to SMTP";
             }
         }
-
-        if (!sent && smtp_ready) {
-            SMTPDeliveryRequest req;
-            req.host = config_.email.smtp_host;
-            req.port = config_.email.smtp_port;
-            req.use_tls = config_.email.smtp_use_tls;
-            req.username = config_.email.smtp_username;
-            req.password = config_.email.smtp_password;
-            req.from = config_.email.smtp_username;  // Use SMTP login as From
-            req.to = msg.to_callsign;
-            req.subject = msg.subject.empty()
-                ? ("Radio message from " + msg.from_callsign)
-                : msg.subject;
-            req.body = msg.body;
-
-            error.clear();
-            sent = sendSMTPDelivery(req, &error);
-            if (sent) {
-                relay_mode = "SMTP";
-                if (winlink_telnet_ready) {
-                    relay_diagnostics_.smtp_fallback_count++;
-                    relay_diagnostics_.last_mode = "smtp-fallback";
-                } else {
-                    relay_diagnostics_.last_mode = "smtp";
-                }
+        if (result.sent && result.relay_mode == "SMTP") {
+            if (result.winlink_tried) {
+                relay_diagnostics_.smtp_fallback_count++;
+                relay_diagnostics_.last_mode = "smtp-fallback";
+            } else {
+                relay_diagnostics_.last_mode = "smtp";
             }
         }
 
-        if (sent) {
+        if (result.sent) {
             msg.status = MessageStatus::Sent;
             if (store_ && store_->isOpen()) {
-                store_->markAsSent(msg.id);
+                // Confirmed send: marked sent and leaves the relay queue in
+                // one transaction.
+                if (!store_->markRelayedAndDequeue(msg.id)) {
+                    store_->markAsSent(msg.id);
+                }
             }
             relay_diagnostics_.total_success++;
             relay_diagnostics_.consecutive_failures = 0;
             relay_diagnostics_.last_success_unix = unixNowSeconds();
-            relay_diagnostics_.last_result = relay_mode.empty() ? "relay-ok" : ("relay-ok/" + lowerAscii(relay_mode));
+            relay_diagnostics_.last_result = result.relay_mode.empty()
+                ? "relay-ok"
+                : ("relay-ok/" + lowerAscii(result.relay_mode));
             relay_diagnostics_.last_error.clear();
             relay_diagnostics_.gateway_health = "relay-ok";
         } else {
             relay_diagnostics_.total_fail++;
             relay_diagnostics_.consecutive_failures++;
             relay_diagnostics_.last_result = "relay-fail";
-            relay_diagnostics_.last_error = error;
+            relay_diagnostics_.last_error = result.error;
             relay_diagnostics_.gateway_health = "relay-fail";
             msg.status = MessageStatus::Failed;
             if (store_ && store_->isOpen()) {
@@ -7838,13 +6858,15 @@ void App::sendQueuedEmails() {
             failed.push_back(msg);
         }
     }
-    email_outbox_.clear();
+    email_inflight_.clear();
 
-    // Re-queue failures for retry on next cycle
+    // Re-queue failures for retry on next cycle, ahead of newer mail.
     for (auto& f : failed) {
         f.status = MessageStatus::Pending;
-        email_outbox_.push_back(std::move(f));
     }
+    email_outbox_.insert(email_outbox_.begin(),
+                         std::make_move_iterator(failed.begin()),
+                         std::make_move_iterator(failed.end()));
 }
 
 // ============================================================================
@@ -10001,17 +9023,10 @@ bool App::isStationLinkConnected(bool refresh) {
         return false;
     }
 
-    // Force a fresh state sample from modem before rejecting a request.
+    // Ask for a fresh state sample so a retry sees it, but do not wait for
+    // it on the GUI thread: STATUS is already polled every 500 ms and link
+    // changes arrive as events, so the cached state is at most that old.
     modem_->sendCommand("STATE");
-    for (int i = 0; i < 40; ++i) {
-        modem_->poll();
-        if (modem_->getStatus().link_state == LinkState::Connected ||
-            !current_chat_partner_.empty()) {
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
     return false;
 }
 
@@ -11808,6 +10823,28 @@ void skylink::App::runTestScript() {
         if (modem_) modem_->sendCommand(arg);
     } else if (cmd == "screenshot") {
         test_shot_path_ = arg;
+    } else if (cmd == "show") {
+        static const std::pair<const char*, AppTab> kTabs[] = {
+            {"chat", AppTab::Chat}, {"files", AppTab::Files}, {"bbs", AppTab::BBS},
+            {"frequency", AppTab::Frequency}, {"messages", AppTab::Messages},
+            {"mail", AppTab::Mail}, {"weather", AppTab::Weather},
+            {"position", AppTab::Position}, {"map", AppTab::StationMap},
+        };
+        if (arg == "settings") {
+            show_settings_ = true;
+        } else {
+            bool found = false;
+            for (const auto& [name, tab] : kTabs) {
+                if (arg == name) {
+                    current_tab_ = tab;
+                    found = true;
+                }
+            }
+            if (!found) testLog("unknown window: " + arg);
+        }
+    } else if (cmd == "theme") {
+        config_.ui.dark_mode = (arg != "light");
+        setupStyle();
     } else if (cmd == "dump") {
         dumpTestReport(arg);
     } else if (cmd == "quit") {

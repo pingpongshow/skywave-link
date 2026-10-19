@@ -174,6 +174,14 @@ using BroadcastCallback =
     std::function<void(const std::string& src, const std::vector<uint8_t>&)>;
 using EventCallback =
     std::function<void(const std::string& name, const std::string& args)>;
+// Outcome of a command sent with sendCommandAsync(): `ok` is false for an
+// `ERROR:` reply, a send failure, no reply before the deadline, or a
+// disconnect; `response` is the modem's line (empty when there was none).
+using CommandResultCallback =
+    std::function<void(bool ok, const std::string& response)>;
+
+// Outcome of a background connect started with beginConnect().
+enum class ConnectProgress { None, InProgress, Connected, Failed };
 
 class ModemClient {
 public:
@@ -191,6 +199,21 @@ public:
                  uint16_t voice_port = kDefaultVoicePort);
     void disconnect();
     bool isConnected() const;
+
+    // Background connect for UI threads: the TCP connects (and the DNS
+    // lookup) run on a helper thread with a timeout, so an unreachable host
+    // never blocks the caller. Call pollConnect() from the main loop: it
+    // adopts the sockets once the helper finishes and reports the outcome
+    // (Connected/Failed) exactly once.
+    bool beginConnect(const std::string& host,
+                      uint16_t cmd_port = kDefaultCommandPort,
+                      uint16_t data_port = kDefaultDataPort,
+                      uint16_t voice_port = kDefaultVoicePort);
+    bool isConnecting() const { return connect_job_ != nullptr; }
+    ConnectProgress pollConnect();
+    void cancelConnect();
+    // Per-socket TCP connect timeout used by connect() and beginConnect().
+    static constexpr int kConnectTimeoutMs = 3000;
     // False when the modem was built without ENABLE_VOICE (it never binds
     // the port) or the media socket dropped; the session is unaffected.
     bool hasVoiceMedia() const;
@@ -209,6 +232,22 @@ public:
     // Command interface
     bool sendCommand(const std::string& cmd);
     std::optional<std::string> getResponse(int timeout_ms = 100);
+    // Sends `cmd` and returns at once; `cb` (optional) runs from poll() when
+    // the verb echo / `ERROR:` arrives, or with ok=false on timeout or
+    // disconnect. Replies are matched in order. `ERROR:` replies are logged.
+    bool sendCommandAsync(const std::string& cmd,
+                          CommandResultCallback cb = {},
+                          int timeout_ms = 3000);
+    size_t pendingAsyncCommands() const { return async_commands_.size(); }
+    // (In non-blocking mode sendCommand() is tracked the same way, without
+    // a callback, so replies stay matched to the right command.)
+    // When enabled, the high-level action/setting commands below
+    // (connectToStation, abort, setVoicePtt, ...) go through
+    // sendCommandAsync() and return whether the command was sent instead of
+    // waiting for the modem's reply. Off by default; the GUI turns it on.
+    // Query commands (getVersion, refreshStatus, ...) always block.
+    void setNonBlockingCommands(bool enabled) { nonblocking_commands_ = enabled; }
+    bool nonBlockingCommands() const { return nonblocking_commands_; }
 
     // High-level commands
     bool setCallsign(const std::string& callsign);
@@ -340,10 +379,34 @@ private:
     BroadcastCallback broadcast_callback_;
     EventCallback event_callback_;
 
+    // Commands sent with sendCommandAsync() awaiting their reply, in send
+    // order (the modem answers control commands in order).
+    struct PendingCommand {
+        std::string cmd;
+        std::string verb;
+        CommandResultCallback cb;
+        std::chrono::steady_clock::time_point deadline;
+        bool silent = false;   // fire-and-forget sendCommand(): never logged
+    };
+    std::deque<PendingCommand> async_commands_;
+    bool nonblocking_commands_ = false;
+    bool writeCommandLine(const std::string& cmd);
+    void trackAsyncCommand(const std::string& cmd, CommandResultCallback cb,
+                           int timeout_ms, bool silent);
+    bool takeAsyncReply(const std::string& line);
+    void expireAsyncCommands();
+    void failAsyncCommands(const char* reason);
+
+    // Background connect state shared with the helper thread.
+    struct ConnectJob;
+    std::shared_ptr<ConnectJob> connect_job_;
+    void resetSessionState();
+
     // Internal helpers
-    bool connectSocket(socket_t& sock, const std::string& host, uint16_t port);
-    void closeSocket(socket_t& sock);
-    bool setNonBlocking(socket_t sock);
+    static bool connectSocket(socket_t& sock, const std::string& host, uint16_t port,
+                              int timeout_ms = kConnectTimeoutMs);
+    static void closeSocket(socket_t& sock);
+    static bool setNonBlocking(socket_t sock);
     // A Skywave command succeeded when its response is not `ERROR:...`.
     bool sendCommandOk(const std::string& cmd, int timeout_ms = 500);
     std::optional<std::string> sendCommandForResponse(const std::string& cmd,

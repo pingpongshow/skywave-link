@@ -183,12 +183,12 @@ void AppConfig::setDefaults() {
 
     // UI defaults
     ui.dark_mode = true;
-    ui.font_size = 14;
+    ui.font_size = 15;
     ui.show_timestamps = true;
     ui.sound_notifications = true;
     ui.notification_sound = "";
-    ui.window_width = 1024;
-    ui.window_height = 768;
+    ui.window_width = 0;   // 0 = ~80% of the display on first run
+    ui.window_height = 0;
 }
 
 std::vector<std::string> parseCallsignList(const std::string& text) {
@@ -622,11 +622,11 @@ bool AppConfig::load(const std::string& path) {
         }
         else if (current_section == "ui") {
             if (key == "dark_mode") ui.dark_mode = (value == "true");
-            else if (key == "font_size") ui.font_size = safeStoi(value, 14);
+            else if (key == "font_size") ui.font_size = safeStoi(value, 15);
             else if (key == "show_timestamps") ui.show_timestamps = (value == "true");
             else if (key == "sound_notifications") ui.sound_notifications = (value == "true");
-            else if (key == "window_width") ui.window_width = safeStoi(value, 1024);
-            else if (key == "window_height") ui.window_height = safeStoi(value, 768);
+            else if (key == "window_width") ui.window_width = safeStoi(value, 0);
+            else if (key == "window_height") ui.window_height = safeStoi(value, 0);
         }
     }
 

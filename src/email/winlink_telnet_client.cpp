@@ -1,6 +1,7 @@
 // Winlink CMS Telnet client for internet email relay
 
 #include "skywave_link/winlink_telnet_client.hpp"
+#include "net_timeouts.hpp"
 
 #include <algorithm>
 #include <array>
@@ -186,39 +187,14 @@ public:
 #endif
     }
 
-    bool connectTo(const std::string& host, uint16_t port, bool use_tls, std::string* error) {
-        struct addrinfo hints {};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-
-        struct addrinfo* result = nullptr;
-        const std::string port_text = std::to_string(port);
-        if (getaddrinfo(host.c_str(), port_text.c_str(), &hints, &result) != 0) {
-            if (error) *error = "DNS resolution failed for " + host;
-            return false;
-        }
-
-        bool connected = false;
-        for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
-            socket_ = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-            if (socket_ == kInvalidSocket) {
-                continue;
-            }
-#ifdef SO_NOSIGPIPE
-            const int no_sigpipe = 1;
-            (void)setsockopt(socket_, SOL_SOCKET, SO_NOSIGPIPE,
-                             &no_sigpipe, sizeof(no_sigpipe));
-#endif
-            if (::connect(socket_, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
-                connected = true;
-                break;
-            }
-            closeSocket();
-        }
-        freeaddrinfo(result);
-
-        if (!connected) {
-            if (error) *error = "Failed to connect to " + host + ":" + port_text;
+    bool connectTo(const std::string& host, uint16_t port, bool use_tls, int io_timeout_ms,
+                   std::string* error) {
+        // Bounded connect (5 s) and 15 s socket timeouts: reads use select()
+        // with their own deadline, writes and the TLS handshake rely on
+        // SO_SNDTIMEO/SO_RCVTIMEO (see net_timeouts.hpp).
+        socket_ = netio::connectTcp(host, port, netio::kConnectTimeoutMs,
+                                    io_timeout_ms > 0 ? io_timeout_ms : netio::kIoTimeoutMs, error);
+        if (socket_ == kInvalidSocket) {
             return false;
         }
 
@@ -910,9 +886,11 @@ bool runWithLoginFallbacks(const RequestLike& req,
         attempts++;
         TelnetSession session;
         std::string mode_error;
-        if (!session.connectTo(host, port, req.use_tls, &mode_error)) {
+        if (!session.connectTo(host, port, req.use_tls, timeout_ms, &mode_error)) {
+            // The login mode does not affect the TCP connect: an unreachable
+            // server is not retried once per mode.
             last_error = mode_error;
-            continue;
+            break;
         }
         if (!loginWithMode(session, callsign, password, timeout_ms, mode, &mode_error)) {
             last_error = std::string("Mode ") + loginModeName(mode) + ": " + mode_error;
@@ -1094,6 +1072,11 @@ bool sendWinlinkTelnetDelivery(const WinlinkTelnetRequest& req,
 }
 
 WinlinkTelnetFetchResult fetchWinlinkTelnetMessages(const WinlinkTelnetFetchRequest& req) {
+    return fetchWinlinkTelnetMessages(req, [](const WinlinkTelnetFetchResult&) { return true; });
+}
+
+WinlinkTelnetFetchResult fetchWinlinkTelnetMessages(const WinlinkTelnetFetchRequest& req,
+                                                    const WinlinkCommitGate& commit) {
     WinlinkTelnetFetchResult result;
 
     if (req.max_messages <= 0) {
@@ -1122,9 +1105,16 @@ WinlinkTelnetFetchResult fetchWinlinkTelnetMessages(const WinlinkTelnetFetchRequ
                                                   return false;
                                               }
 
-                                              int fetched = 0;
+                                              // Read everything first; a kill is
+                                              // immediate on the server, so it waits
+                                              // until the caller holds the messages.
+                                              result.messages.clear();
+                                              std::vector<int> fetched_ids;
                                               for (int id : ids) {
-                                                if (fetched >= req.max_messages) {
+                                                if (static_cast<int>(fetched_ids.size()) >= req.max_messages) {
+                                                    break;
+                                                }
+                                                if (req.stop && req.stop->load()) {
                                                     break;
                                                 }
                                                 std::string raw_msg;
@@ -1136,12 +1126,18 @@ WinlinkTelnetFetchResult fetchWinlinkTelnetMessages(const WinlinkTelnetFetchRequ
                                                     parsed.message_id = std::to_string(id);
                                                 }
                                                 result.messages.push_back(std::move(parsed));
-                                                fetched++;
-                                                if (req.delete_after_fetch) {
-                                                    deleteWinlinkMessageById(session, id);
-                                                }
+                                                fetched_ids.push_back(id);
                                               }
 
+                                              result.success = true;
+                                              if (commit && commit(result)) {
+                                                if (req.delete_after_fetch) {
+                                                    for (int id : fetched_ids) {
+                                                        deleteWinlinkMessageById(session, id);
+                                                    }
+                                                }
+                                                result.committed = true;
+                                              }
                                               (void)session.sendLine("BYE", nullptr);
                                               return true;
                                           },

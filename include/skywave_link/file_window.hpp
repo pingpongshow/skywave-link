@@ -16,7 +16,7 @@ public:
 
     // Action callbacks
     std::function<void(const std::string&)> onSendFile;
-    std::function<std::string()> onOpenFileDialog;
+    PathPicker onOpenFileDialog;
 };
 
 } // namespace skylink

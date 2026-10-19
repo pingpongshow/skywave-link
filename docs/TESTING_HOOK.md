@@ -28,7 +28,7 @@ SKYLINK_TEST_LOG=scriptA.log \
 | `wait <sec>` | pause |
 | `wait_modem [timeout]` | until the modem TCP connection is up (default 60 s) |
 | `wait_connected [timeout]` / `wait_disconnected [timeout]` | until the radio link is up / down |
-| `connect_modem`, `disconnect_modem` | `connectToModem()`, `disconnectFromModem()` |
+| `connect_modem`, `disconnect_modem` | `connectToModem()` (connects in the background; follow with `wait_modem`), `disconnectFromModem()` |
 | `connect <CALL>`, `disconnect` | `connectToStation()`, modem `DISCONNECT` |
 | `chat <text>` | `sendChatMessage()` (long text is fragmented) |
 | `file <path>` | `sendFile()` |
@@ -49,6 +49,8 @@ SKYLINK_TEST_LOG=scriptA.log \
 | `modem <command>` | a raw modem control command |
 | `screenshot <path.ppm>` | the next rendered frame, read back from GL (works with the display asleep) |
 | `dump <path.json>` | report: chat, transfers, mail in/out, heard stations and beacons, ping results, weather, BBS files, modem/link state |
+| `show <window>` | open a window: `settings`, `files`, `bbs`, `frequency`, `messages`, `mail`, `weather`, `position`, `map` (`chat` returns to the main view) |
+| `theme dark\|light` | switch the colour theme (as Settings -> UI -> Dark Mode) |
 | `quit` | normal shutdown (graceful link teardown, config save) |
 
 ## Two-station runs

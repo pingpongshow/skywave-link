@@ -148,7 +148,8 @@ void MessageWindow::renderEmailTab() {
 
     ImGui::InputText("To", to_addr, sizeof(to_addr));
     ImGui::InputText("Subject", subject, sizeof(subject));
-    ImGui::InputTextMultiline("Body", body, sizeof(body), ImVec2(-1, 200));
+    ImGui::InputTextMultiline("Body", body, sizeof(body),
+                              ImVec2(ImGui::CalcItemWidth(), ImGui::GetTextLineHeight() * 13.0f));
 
     if (ImGui::Button("Send Email")) {
         if (std::strlen(to_addr) > 0 && std::strlen(subject) > 0) {

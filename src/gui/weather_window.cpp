@@ -2,6 +2,7 @@
 #include "skywave_link/config.hpp"
 
 #include "imgui.h"
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <chrono>
@@ -157,6 +158,19 @@ void WeatherWindow::render() {
             ImGui::Text("Location-Based Weather Forecast");
             ImGui::Separator();
 
+            {
+                // Leave room on the row for the label and the buttons.
+                const ImGuiStyle& style = ImGui::GetStyle();
+                float trailing = ImGui::CalcTextSize("Location/Grid").x + style.ItemInnerSpacing.x +
+                                 ImGui::CalcTextSize("Get Forecast").x + style.FramePadding.x * 2.0f +
+                                 style.ItemSpacing.x;
+                if (!state_.config->station.grid_square.empty()) {
+                    trailing += ImGui::CalcTextSize("Use My Grid").x + style.FramePadding.x * 2.0f +
+                                style.ItemSpacing.x;
+                }
+                ImGui::SetNextItemWidth(std::max(ImGui::GetFontSize() * 6.0f,
+                                                 ImGui::GetContentRegionAvail().x - trailing));
+            }
             ImGui::InputText("Location/Grid", state_.weather_location_input, state_.weather_location_input_size);
             ImGui::SameLine();
             bool disabled = is_pending;
@@ -214,6 +228,14 @@ void WeatherWindow::render() {
             ImGui::Text("Marine Weather Forecasts");
             ImGui::Separator();
 
+            {
+                const ImGuiStyle& style = ImGui::GetStyle();
+                const float trailing = ImGui::CalcTextSize("Zone Code").x + style.ItemInnerSpacing.x +
+                                       ImGui::CalcTextSize("Get Marine Wx").x +
+                                       style.FramePadding.x * 2.0f + style.ItemSpacing.x;
+                ImGui::SetNextItemWidth(std::max(ImGui::GetFontSize() * 6.0f,
+                                                 ImGui::GetContentRegionAvail().x - trailing));
+            }
             ImGui::InputText("Zone Code", state_.weather_zone_input, state_.weather_zone_input_size);
             ImGui::SameLine();
             bool disabled = is_pending;
