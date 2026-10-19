@@ -370,6 +370,59 @@ TEST(voice_status_fields_parse) {
     PASS();
 }
 
+// Voice commands hand the modem's answer to the caller (the app explains
+// ERROR:STATE / ERROR:UNSUPPORTED instead of swallowing them), EVT:VOICE
+// TALKING/STOPPED drive the PTT flag, and downlink audio nobody plays is
+// counted and bounded.
+TEST(voice_command_answers_and_events) {
+    FakeModem m;
+    ASSERT_TRUE(m.listen());
+    ModemClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", m.pcmd, m.pdata, m.pvoice));
+    m.acceptAll();
+    m.reply("VOICESTART", 0, "ERROR:UNSUPPORTED");
+    bool called = false, ok = true;
+    std::string answer;
+    c.voiceStart([&](bool k, const std::string& r) { called = true; ok = k; answer = r; });
+    ASSERT_TRUE(called);
+    ASSERT_FALSE(ok);
+    ASSERT_EQ(answer, std::string("ERROR:UNSUPPORTED"));
+    m.reply("VOICEPTT", 0, "VOICEPTT ON");
+    called = false;
+    c.setVoicePtt(true, [&](bool k, const std::string&) { called = true; ok = k; });
+    ASSERT_TRUE(called);
+    ASSERT_TRUE(ok);
+
+    m.event("EVT:VOICE OPEN");
+    m.event("EVT:VOICE TALKING");
+    pump(c, 80);
+    ASSERT_TRUE(c.getVoiceStatus().ptt);
+    ASSERT_TRUE(c.getVoiceStatus().state == VoiceState::TxActive);
+    m.event("EVT:VOICE STOPPED");
+    pump(c, 80);
+    ASSERT_FALSE(c.getVoiceStatus().ptt);
+    ASSERT_TRUE(c.getVoiceStatus().state == VoiceState::Ready);
+
+    // 12 s of downlink, never played: counted, buffer capped at 10 s.
+    std::string blob;
+    std::vector<int16_t> pcm(8000, 100);
+    for (uint32_t seq = 0; seq < 12; ++seq) {
+        blob += char(1); blob += char(2);
+        const size_t n = pcm.size() * 2;
+        blob += char(n >> 8); blob += char(n & 0xFF);
+        for (int k = 3; k >= 0; --k) blob += char((seq >> (8 * k)) & 0xFF);
+        for (int k = 0; k < 8; ++k) blob += char(0);
+        for (int16_t v : pcm) { blob += char(uint16_t(v) & 0xFF); blob += char(uint16_t(v) >> 8); }
+    }
+    sendAll(m.voice, blob);
+    for (int i = 0; i < 100 && c.voiceSamplesReceived() < 96000; ++i) pump(c, 20);
+    ASSERT_EQ(c.voiceSamplesReceived(), uint64_t(96000));
+    ASSERT_EQ(c.voiceSamplesBuffered(), ModemClient::kMaxVoiceRxSamples);
+    c.discardVoicePcm();
+    ASSERT_EQ(c.voiceSamplesBuffered(), size_t(0));
+    PASS();
+}
+
 // Non-blocking commands: replies are matched in order without the caller
 // waiting, ERROR: fails the oldest pending command, and a command whose
 // reply never comes is reported once the deadline passes.

@@ -16,6 +16,7 @@
 #include "shared_state.hpp"
 #include "window_base.hpp"
 #include "email_gateway_job.hpp"
+#include "voice_control.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -720,20 +721,60 @@ private:
     std::string last_logged_fsm_state_;
     int modem_port_input_ = kDefaultCommandPort;
 
-    // Live voice state
-    bool voice_auto_started_ = false;
-    bool voice_start_pending_ = false;
-    bool voice_start_inflight_ = false;
-    bool voice_local_ptt_ = false;
-    bool voice_ptt_after_start_ = false;
-    bool voice_ui_ptt_active_ = false;
+    // Live voice state. PTT is level-triggered: the held sources below are
+    // the operator's intent, and updateVoiceControl() keeps the modem's
+    // VOICEPTT in line with it once a session is open.
+    bool voice_session_wanted_ = false;   // VOICE button / Start / PTT asked for a session
+    VoiceUiSource voice_session_source_ = VoiceUiSource::Auto;
+    bool voice_auto_done_ = false;        // auto_start tried for this opportunity
+    bool voice_start_inflight_ = false;   // VOICESTART sent, no answer yet
+    std::chrono::steady_clock::time_point voice_start_retry_at_{};
+    bool voice_ptt_inflight_ = false;     // VOICEPTT sent, no answer yet
+    bool voice_ptt_sent_on_ = false;      // the modem accepted VOICEPTT ON
+    std::chrono::steady_clock::time_point voice_ptt_retry_at_{};
+    bool voice_ui_ptt_active_ = false;        // main panel PTT held
+    bool voice_settings_ptt_active_ = false;  // Settings > Voice PTT held
+    bool voice_hotkey_ptt_active_ = false;    // configured PTT key held
+    bool voice_test_ptt_active_ = false;      // test hook `voice_ptt on`
     bool voice_hotkey_capture_active_ = false;
-    bool voice_hotkey_ptt_active_ = false;
+    bool voice_unsupported_ = false;      // modem answered ERROR:UNSUPPORTED
+    bool voice_probe_sent_ = false;
+    std::string voice_last_error_;
+    VoiceNoticeLimiter voice_notice_limiter_;
+    VoiceUiState voice_ui_;
+    // Uplink pacing / counters.
+    bool voice_tx_was_active_ = false;
+    std::chrono::steady_clock::time_point voice_spurt_started_at_{};
+    std::chrono::steady_clock::time_point voice_last_capture_at_{};
+    uint64_t voice_spurt_samples_ = 0;
+    int voice_spurt_peak_ = 0;
+    bool voice_silent_mic_reported_ = false;
+    uint64_t voice_frames_sent_ = 0;
+    uint64_t voice_samples_sent_ = 0;
+    uint64_t voice_samples_played_ = 0;
+    std::string voice_audio_error_;
+    bool voicePttWanted() const {
+        return voice_ui_ptt_active_ || voice_settings_ptt_active_ || voice_hotkey_ptt_active_ ||
+               voice_test_ptt_active_;
+    }
+    VoiceContext voiceContext() const;
+    // Starts a voice session for the configured mode; "" when VOICESTART
+    // was sent (or is already on its way / open), else why not.
+    std::string requestVoiceStart(VoiceUiSource source);
+    void requestVoiceStop(VoiceUiSource source);
+    void onVoiceButtonClicked();
+    void sendVoiceStart(VoiceUiSource source);
+    void sendVoicePtt(bool on);
+    void updateVoiceControl(std::chrono::steady_clock::time_point now);
+    void updateVoiceUi();
+    void resetVoiceControlState();
+    // Status line of the window `source` names (main panel for the hotkey,
+    // the auto-start and the test hook) and the log; repeats rate-limited.
+    void reportVoice(const std::string& text, StatusKind kind, VoiceUiSource source);
     uint32_t voice_playback_samples_queued_ = 0;
     bool voice_playback_started_ = false;
     std::deque<int16_t> voice_playback_buffer_;
     std::chrono::steady_clock::time_point last_voice_status_poll_;
-    std::chrono::steady_clock::time_point voice_start_attempted_at_{};
     uint32_t voice_capture_device_id_ = 0;
     uint32_t voice_playback_device_id_ = 0;
     bool voice_audio_ready_ = false;
@@ -956,7 +997,10 @@ private:
     // Log a refused/unanswered modem command in plain words.
     void logCommandFailure(const std::string& what, const std::string& cmd,
                            const std::string& response);
-    bool setVoicePttState(bool enabled);
+    // Sets one PTT source (`source`) held or released; "" when accepted,
+    // else why voice cannot key (also reported on that window's status
+    // line and in the log).
+    std::string setVoicePttState(bool enabled, VoiceUiSource source);
     bool handleVoiceHotkeyEvent(const SDL_KeyboardEvent& key, bool pressed);
     bool handleShortcutKey(const SDL_KeyboardEvent& key);
     bool openVoiceAudioDevices();
@@ -1121,8 +1165,12 @@ private:
     void stopEmailGateway();
     void updateEmailGateway();
     void processIncomingEmail();
+    // Internet mail for this station (or not addressed to any radio
+    // station): stored in the Mail window's Inbox. `for_this_station`
+    // picks the log wording.
     void keepInboundLocally(const std::string& from, const std::string& to, const std::string& subject,
-                            const std::string& body, const std::string& message_id);
+                            const std::string& body, const std::string& message_id,
+                            bool for_this_station = false);
     void relayRadioToEmail(const Message& msg);
     // Queue an internet email from this station (Messages window). Returns
     // true only when it was validated and queued; otherwise false with the

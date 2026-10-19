@@ -287,10 +287,96 @@ void SettingsWindow::render() {
     ImGui::TextDisabled("Apply buttons also save.");
     ui::StatusLine(status_);
 
-    // Eleven tabs do not fit the window side by side; scroll instead of
-    // squeezing every label down to "Away M...".
+    // Email and Winlink tabs share the Apply-gated working copies.
+        // Working copies of the Apply-gated fields. They persist across
+        // frames and are reloaded from config only when config changes
+        // (load or Apply), so edits are not reverted every frame.
+        struct EmailEdit {
+            char smtp_host[256] = "";
+            int smtp_port = 0;
+            char smtp_user[128] = "";
+            bool smtp_tls = true;
+            char pop3_host[256] = "";
+            int pop3_port = 0;
+            char pop3_user[128] = "";
+            bool pop3_tls = true;
+            char allowed_relays[512] = "";
+            char winlink_host[256] = "";
+            int winlink_port = 0;
+            char winlink_call[32] = "";
+            int sf_ttl = 0;
+            int sf_hop_limit = 0;
+            int sf_dedup_window = 0;
+            int pop3_poll_interval_sec = 0;
+            int pop3_max_messages = 0;
+            int winlink_fetch_interval_sec = 0;
+            int winlink_fetch_max_messages = 0;
+        };
+        static EmailEdit email_edit;
+        static std::string email_loaded_key;
+        {
+            const auto& e = config_.email;
+            const char sep = '\x1f';
+            const std::string key =
+                e.smtp_host + sep + std::to_string(e.smtp_port) + sep + e.smtp_username + sep +
+                (e.smtp_use_tls ? "1" : "0") + sep +
+                e.pop3_host + sep + std::to_string(e.pop3_port) + sep + e.pop3_username + sep +
+                (e.pop3_use_tls ? "1" : "0") + sep + joinCallsignList(e.allowed_relays) + sep +
+                e.winlink_telnet_host + sep + std::to_string(e.winlink_telnet_port) + sep +
+                e.winlink_telnet_callsign + sep + std::to_string(e.hf_store_forward_ttl) + sep +
+                std::to_string(e.hf_store_forward_hop_limit) + sep +
+                std::to_string(e.hf_store_forward_dedup_window_sec) + sep +
+                std::to_string(e.pop3_poll_interval_sec) + sep +
+                std::to_string(e.pop3_max_messages) + sep +
+                std::to_string(e.winlink_fetch_interval_sec) + sep +
+                std::to_string(e.winlink_fetch_max_messages);
+            if (key != email_loaded_key) {
+                auto copyField = [](char* dst, size_t size, const std::string& src) {
+                    std::strncpy(dst, src.c_str(), size - 1);
+                    dst[size - 1] = '\0';
+                };
+                copyField(email_edit.smtp_host, sizeof(email_edit.smtp_host), e.smtp_host);
+                email_edit.smtp_port = e.smtp_port;
+                copyField(email_edit.smtp_user, sizeof(email_edit.smtp_user), e.smtp_username);
+                email_edit.smtp_tls = e.smtp_use_tls;
+                copyField(email_edit.pop3_host, sizeof(email_edit.pop3_host), e.pop3_host);
+                email_edit.pop3_port = e.pop3_port;
+                copyField(email_edit.pop3_user, sizeof(email_edit.pop3_user), e.pop3_username);
+                email_edit.pop3_tls = e.pop3_use_tls;
+                copyField(email_edit.allowed_relays, sizeof(email_edit.allowed_relays),
+                          joinCallsignList(e.allowed_relays));
+                copyField(email_edit.winlink_host, sizeof(email_edit.winlink_host), e.winlink_telnet_host);
+                email_edit.winlink_port = e.winlink_telnet_port;
+                copyField(email_edit.winlink_call, sizeof(email_edit.winlink_call), e.winlink_telnet_callsign);
+                email_edit.sf_ttl = e.hf_store_forward_ttl;
+                email_edit.sf_hop_limit = e.hf_store_forward_hop_limit;
+                email_edit.sf_dedup_window = e.hf_store_forward_dedup_window_sec;
+                email_edit.pop3_poll_interval_sec = e.pop3_poll_interval_sec;
+                email_edit.pop3_max_messages = e.pop3_max_messages;
+                email_edit.winlink_fetch_interval_sec = e.winlink_fetch_interval_sec;
+                email_edit.winlink_fetch_max_messages = e.winlink_fetch_max_messages;
+                email_loaded_key = key;
+            }
+        }
+        EmailEdit& ed = email_edit;
+
+        // Passwords are never shown or reloaded into the field: an empty
+        // field on Apply keeps the stored one.
+        static char smtp_pass[128] = "";
+        static char pop3_pass[128] = "";
+        static char winlink_pass[128] = "";
+        auto password_hint = [](const std::string& stored) {
+            return stored.empty() ? "not set" : "stored; leave blank to keep";
+        };
+
+    // The default window size fits every tab label; a narrower window
+    // scrolls the tab bar rather than squeezing labels to "Away M...".
+    const std::string requested_tab = select_tab_;
+    auto tabFlags = [&requested_tab](const char* name) {
+        return requested_tab == name ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+    };
     if (ImGui::BeginTabBar("SettingsTabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
-        if (ImGui::BeginTabItem("Station")) {
+        if (ImGui::BeginTabItem("Station", nullptr, tabFlags("Station"))) {
             ImGui::InputText("Callsign", callsign_input_, state_.callsign_input_size);
 
             static char grid[16] = "";
@@ -323,7 +409,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Modem")) {
+        if (ImGui::BeginTabItem("Modem", nullptr, tabFlags("Modem"))) {
             struct ModemFamilyChoice {
                 const char* value;
                 const char* display;
@@ -476,7 +562,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Radio")) {
+        if (ImGui::BeginTabItem("Radio", nullptr, tabFlags("Radio"))) {
             struct RadioBackendChoice {
                 const char* value;
                 const char* label;
@@ -770,7 +856,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Voice")) {
+        if (ImGui::BeginTabItem("Voice", nullptr, tabFlags("Voice"))) {
             const VoiceStatus voice_status =
                 modem_ ? modem_->getVoiceStatus() : VoiceStatus{};
 
@@ -835,7 +921,12 @@ void SettingsWindow::render() {
                 if (ImGui::Button("Clear PTT Hotkey")) {
                     if (onClearVoiceHotkey) onClearVoiceHotkey();
                 }
-                ImGui::TextDisabled("Hotkey works whenever the Skywave Link window has focus.");
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::TextWrapped("The hotkey works only while the Skywave Link window is the "
+                                   "active (focused) window; it is not a system-wide key. It "
+                                   "also works while typing in a text field (the key is not "
+                                   "typed).");
+                ImGui::PopStyleColor();
             }
 
             const std::vector<std::string> capture_devices = enumerateAudioDevices(true);
@@ -918,6 +1009,8 @@ void SettingsWindow::render() {
             }
 
             static bool ptt_button_held = false;
+            static const VoiceUiState kNoVoiceUi;
+            const VoiceUiState& vui = state_.voice_ui ? *state_.voice_ui : kNoVoiceUi;
             if (modem_ && modem_->isConnected()) {
                 if (ImGui::Button("Start Voice")) {
                     if (onVoiceStart) onVoiceStart();
@@ -934,13 +1027,20 @@ void SettingsWindow::render() {
                 ImGui::Button("PTT");
                 const bool button_held_now = ImGui::IsItemActive();
                 if (ptt_lit) ui::PopButtonColor();
+                if (!vui.ptt_tooltip.empty()) ImGui::SetItemTooltip("%s", vui.ptt_tooltip.c_str());
                 if (button_held_now != ptt_button_held) {
                     ptt_button_held = button_held_now;
                     if (onVoicePtt) onVoicePtt(ptt_button_held);
                 }
-            } else if (ptt_button_held) {
-                ptt_button_held = false;
-                if (onVoicePtt) onVoicePtt(false);
+            } else {
+                if (ptt_button_held) {
+                    ptt_button_held = false;
+                    if (onVoicePtt) onVoicePtt(false);
+                }
+                ImGui::TextDisabled("Connect the modem to start voice or use PTT.");
+            }
+            if (!vui.button.tooltip.empty()) {
+                ImGui::TextWrapped("%s: %s", vui.button.label.c_str(), vui.button.tooltip.c_str());
             }
 
             ImGui::Separator();
@@ -958,7 +1058,7 @@ void SettingsWindow::render() {
                         voice_status.mode == VoiceMode::Broadcast ? "BROADCAST" : "OFF");
             ImGui::Text("State: %s",
                         voice_status.state == VoiceState::Opening ? "OPENING" :
-                        voice_status.state == VoiceState::Ready ? "READY" :
+                        voice_status.state == VoiceState::Ready ? "OPEN" :
                         voice_status.state == VoiceState::TxRequested ? "TX_REQUESTED" :
                         voice_status.state == VoiceState::TxActive ? "TX_ACTIVE" :
                         voice_status.state == VoiceState::RxActive ? "RX_ACTIVE" :
@@ -976,11 +1076,28 @@ void SettingsWindow::render() {
             ImGui::Text("Queued TX: %d  Queued RX: %d samples",
                         voice_status.tx_queued,
                         voice_status.rx_queued);
+            if (vui.audio_ready) {
+                ImGui::TextColored(pal.success, "Audio devices: open (mic peak %d)", vui.capture_peak);
+            } else if (vui.audio_opening) {
+                ImGui::Text("Audio devices: opening...");
+            } else if (!vui.audio_error.empty()) {
+                ui::WarningText(("Audio devices failed: " + vui.audio_error).c_str());
+            } else {
+                ImGui::TextDisabled("Audio devices: closed (opened while voice can be used)");
+            }
+            ImGui::Text("Sent: %llu frames, %.1f s   Received: %.1f s   Played: %.1f s",
+                        static_cast<unsigned long long>(vui.frames_sent),
+                        static_cast<double>(vui.samples_sent) / 8000.0,
+                        static_cast<double>(vui.samples_received) / 8000.0,
+                        static_cast<double>(vui.samples_played) / 8000.0);
+            if (!vui.last_error.empty()) {
+                ImGui::TextWrapped("Last problem: %s", vui.last_error.c_str());
+            }
 
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Files")) {
+        if (ImGui::BeginTabItem("Files", nullptr, tabFlags("Files"))) {
             ImGui::Text("Received File Storage");
             ImGui::Separator();
 
@@ -1104,7 +1221,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("APRS")) {
+        if (ImGui::BeginTabItem("APRS", nullptr, tabFlags("APRS"))) {
             bool aprs_enabled = config_.aprs.enabled;
             if (ImGui::Checkbox("Enable APRS", &aprs_enabled)) {
                 config_.aprs.enabled = aprs_enabled;
@@ -1283,88 +1400,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Email")) {
-            // Working copies of the Apply-gated fields. They persist across
-            // frames and are reloaded from config only when config changes
-            // (load or Apply), so edits are not reverted every frame.
-            struct EmailEdit {
-                char smtp_host[256] = "";
-                int smtp_port = 0;
-                char smtp_user[128] = "";
-                bool smtp_tls = true;
-                char pop3_host[256] = "";
-                int pop3_port = 0;
-                char pop3_user[128] = "";
-                bool pop3_tls = true;
-                char allowed_relays[512] = "";
-                char winlink_host[256] = "";
-                int winlink_port = 0;
-                char winlink_call[32] = "";
-                int sf_ttl = 0;
-                int sf_hop_limit = 0;
-                int sf_dedup_window = 0;
-                int pop3_poll_interval_sec = 0;
-                int pop3_max_messages = 0;
-                int winlink_fetch_interval_sec = 0;
-                int winlink_fetch_max_messages = 0;
-            };
-            static EmailEdit email_edit;
-            static std::string email_loaded_key;
-            {
-                const auto& e = config_.email;
-                const char sep = '\x1f';
-                const std::string key =
-                    e.smtp_host + sep + std::to_string(e.smtp_port) + sep + e.smtp_username + sep +
-                    (e.smtp_use_tls ? "1" : "0") + sep +
-                    e.pop3_host + sep + std::to_string(e.pop3_port) + sep + e.pop3_username + sep +
-                    (e.pop3_use_tls ? "1" : "0") + sep + joinCallsignList(e.allowed_relays) + sep +
-                    e.winlink_telnet_host + sep + std::to_string(e.winlink_telnet_port) + sep +
-                    e.winlink_telnet_callsign + sep + std::to_string(e.hf_store_forward_ttl) + sep +
-                    std::to_string(e.hf_store_forward_hop_limit) + sep +
-                    std::to_string(e.hf_store_forward_dedup_window_sec) + sep +
-                    std::to_string(e.pop3_poll_interval_sec) + sep +
-                    std::to_string(e.pop3_max_messages) + sep +
-                    std::to_string(e.winlink_fetch_interval_sec) + sep +
-                    std::to_string(e.winlink_fetch_max_messages);
-                if (key != email_loaded_key) {
-                    auto copyField = [](char* dst, size_t size, const std::string& src) {
-                        std::strncpy(dst, src.c_str(), size - 1);
-                        dst[size - 1] = '\0';
-                    };
-                    copyField(email_edit.smtp_host, sizeof(email_edit.smtp_host), e.smtp_host);
-                    email_edit.smtp_port = e.smtp_port;
-                    copyField(email_edit.smtp_user, sizeof(email_edit.smtp_user), e.smtp_username);
-                    email_edit.smtp_tls = e.smtp_use_tls;
-                    copyField(email_edit.pop3_host, sizeof(email_edit.pop3_host), e.pop3_host);
-                    email_edit.pop3_port = e.pop3_port;
-                    copyField(email_edit.pop3_user, sizeof(email_edit.pop3_user), e.pop3_username);
-                    email_edit.pop3_tls = e.pop3_use_tls;
-                    copyField(email_edit.allowed_relays, sizeof(email_edit.allowed_relays),
-                              joinCallsignList(e.allowed_relays));
-                    copyField(email_edit.winlink_host, sizeof(email_edit.winlink_host), e.winlink_telnet_host);
-                    email_edit.winlink_port = e.winlink_telnet_port;
-                    copyField(email_edit.winlink_call, sizeof(email_edit.winlink_call), e.winlink_telnet_callsign);
-                    email_edit.sf_ttl = e.hf_store_forward_ttl;
-                    email_edit.sf_hop_limit = e.hf_store_forward_hop_limit;
-                    email_edit.sf_dedup_window = e.hf_store_forward_dedup_window_sec;
-                    email_edit.pop3_poll_interval_sec = e.pop3_poll_interval_sec;
-                    email_edit.pop3_max_messages = e.pop3_max_messages;
-                    email_edit.winlink_fetch_interval_sec = e.winlink_fetch_interval_sec;
-                    email_edit.winlink_fetch_max_messages = e.winlink_fetch_max_messages;
-                    email_loaded_key = key;
-                }
-            }
-            EmailEdit& ed = email_edit;
-
-            // Passwords are never shown or reloaded into the field: an empty
-            // field on Apply keeps the stored one.
-            static char smtp_pass[128] = "";
-            static char pop3_pass[128] = "";
-            static char winlink_pass[128] = "";
-            auto password_hint = [](const std::string& stored) {
-                return stored.empty() ? "not set" : "stored; leave blank to keep";
-            };
-
+        if (ImGui::BeginTabItem("Email", nullptr, tabFlags("Email"))) {
             ImGui::SeparatorText("Outgoing mail (SMTP)");
             ImGui::InputText("SMTP Host", ed.smtp_host, sizeof(ed.smtp_host));
             ImGui::InputInt("SMTP Port", &ed.smtp_port);
@@ -1399,37 +1435,7 @@ void SettingsWindow::render() {
                 ImGui::TextDisabled("Empty list: no station may relay through this gateway.");
             }
 
-            ImGui::SeparatorText("Winlink");
-            bool winlink_telnet_enabled = config_.email.winlink_telnet_enabled;
-            if (ImGui::Checkbox("Use Winlink Telnet (internet)", &winlink_telnet_enabled)) {
-                config_.email.winlink_telnet_enabled = winlink_telnet_enabled;
-            }
-
-            if (!winlink_telnet_enabled) ImGui::BeginDisabled();
-            ImGui::InputText("Winlink Host", ed.winlink_host, sizeof(ed.winlink_host));
-            ImGui::InputInt("Winlink Port", &ed.winlink_port);
-            ImGui::InputText("Winlink Callsign", ed.winlink_call, sizeof(ed.winlink_call));
-            ImGui::InputTextWithHint("Winlink Password",
-                                     password_hint(config_.email.winlink_telnet_password),
-                                     winlink_pass, sizeof(winlink_pass), ImGuiInputTextFlags_Password);
-            ImGui::TextWrapped("The password is only used to answer the CMS secure-login "
-                               "challenge (;PQ/;PR); it is never sent to the server. It is stored "
-                               "in the system keychain where one is available.");
-
-            bool winlink_tls = config_.email.winlink_telnet_use_tls;
-            if (ImGui::Checkbox("Winlink Telnet TLS", &winlink_tls)) {
-                config_.email.winlink_telnet_use_tls = winlink_tls;
-            }
-            if (!winlink_tls) {
-                ImGui::TextColored(pal.warning, "Without TLS the session (not the password) is cleartext.");
-            }
-            ImGui::TextDisabled("Default CMS server: cms.winlink.org:8773 (TLS)");
-            if (!winlink_telnet_enabled) ImGui::EndDisabled();
-
-            bool winlink_compat = config_.email.winlink_compat_mode;
-            if (ImGui::Checkbox("Winlink-compatible B2F envelope", &winlink_compat)) {
-                config_.email.winlink_compat_mode = winlink_compat;
-            }
+            ImGui::TextDisabled("Winlink CMS settings are on the Winlink tab.");
 
             ImGui::SeparatorText("Weak-Signal Profile");
             bool weak_profile = config_.email.weak_signal_profile_enabled;
@@ -1511,8 +1517,6 @@ void SettingsWindow::render() {
             ImGui::SeparatorText("Inbound Polling");
             ImGui::InputInt("POP3 Poll Interval (sec)", &ed.pop3_poll_interval_sec);
             ImGui::InputInt("POP3 Max Messages", &ed.pop3_max_messages);
-            ImGui::InputInt("Winlink Fetch Interval (sec)", &ed.winlink_fetch_interval_sec);
-            ImGui::InputInt("Winlink Max Messages", &ed.winlink_fetch_max_messages);
 
             if (ImGui::Button("Apply Email Settings")) {
                 auto& e = config_.email;
@@ -1616,7 +1620,95 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Beacon")) {
+        if (ImGui::BeginTabItem("Winlink", nullptr, tabFlags("Winlink"))) {
+            ImGui::TextWrapped("Winlink CMS over the internet (telnet/TLS): fetches mail "
+                               "addressed to your Winlink callsign into Mail > Inbox and sends "
+                               "queued email through the CMS.");
+            bool winlink_telnet_enabled = config_.email.winlink_telnet_enabled;
+            if (ImGui::Checkbox("Use Winlink CMS (internet)", &winlink_telnet_enabled)) {
+                config_.email.winlink_telnet_enabled = winlink_telnet_enabled;
+            }
+
+            if (!winlink_telnet_enabled) ImGui::BeginDisabled();
+            ImGui::InputText("Winlink Host", ed.winlink_host, sizeof(ed.winlink_host));
+            ImGui::InputInt("Winlink Port", &ed.winlink_port);
+            bool winlink_tls = config_.email.winlink_telnet_use_tls;
+            if (ImGui::Checkbox("Use TLS", &winlink_tls)) {
+                config_.email.winlink_telnet_use_tls = winlink_tls;
+            }
+            if (!winlink_tls) {
+                ImGui::TextColored(pal.warning, "Without TLS the session (not the password) is cleartext.");
+            }
+            ImGui::TextDisabled("Default CMS server: cms.winlink.org:8773 (TLS)");
+            ImGui::InputText("Winlink Callsign", ed.winlink_call, sizeof(ed.winlink_call));
+            ImGui::InputTextWithHint("Winlink Password",
+                                     password_hint(config_.email.winlink_telnet_password),
+                                     winlink_pass, sizeof(winlink_pass), ImGuiInputTextFlags_Password);
+            ImGui::TextWrapped("The password is only used to answer the CMS secure-login "
+                               "challenge (;PQ/;PR); it is never sent to the server. It is stored "
+                               "in the system keychain where one is available.");
+            ImGui::InputInt("Fetch Interval (sec)", &ed.winlink_fetch_interval_sec);
+            ImGui::InputInt("Max Messages per Fetch", &ed.winlink_fetch_max_messages);
+            if (!winlink_telnet_enabled) ImGui::EndDisabled();
+
+            bool winlink_compat = config_.email.winlink_compat_mode;
+            if (ImGui::Checkbox("Winlink-compatible B2F envelope", &winlink_compat)) {
+                config_.email.winlink_compat_mode = winlink_compat;
+            }
+            ImGui::SetItemTooltip("Mail relayed over radio uses the Winlink B2F message format.");
+
+            if (ImGui::Button("Apply Winlink Settings")) {
+                auto& e = config_.email;
+                e.winlink_telnet_host = gui::trimCopy(ed.winlink_host);
+                e.winlink_telnet_port = static_cast<uint16_t>(std::clamp(ed.winlink_port, 1, 65535));
+                e.winlink_telnet_callsign = gui::normalizeCallsign(ed.winlink_call);
+                if (winlink_pass[0] != '\0') {
+                    e.winlink_telnet_password = winlink_pass;
+                }
+                e.winlink_fetch_interval_sec = std::clamp(ed.winlink_fetch_interval_sec, 30, 3600);
+                e.winlink_fetch_max_messages = std::clamp(ed.winlink_fetch_max_messages, 1, 500);
+                std::memset(winlink_pass, 0, sizeof(winlink_pass));
+                saveSettings("Winlink settings");
+            }
+
+            ImGui::SeparatorText("Status");
+            if (email_gateway_active_) {
+                ImGui::TextColored(pal.success, "Mail service running: Winlink is fetched every %d s.",
+                                   std::clamp(config_.email.winlink_fetch_interval_sec, 30, 3600));
+            } else {
+                ImGui::TextColored(pal.warning, "Mail service stopped: nothing is fetched.");
+                ImGui::TextWrapped("Fetching and sending run while the email gateway runs: "
+                                   "Email tab > Enable Email Gateway Relay, then Apply Email "
+                                   "Settings.");
+            }
+            if (state_.relay_diagnostics) {
+                const RelayDiagnostics& diag = *state_.relay_diagnostics;
+                if (diag.winlink_last_unix <= 0) {
+                    ImGui::TextDisabled("No Winlink exchange yet this session.");
+                } else {
+                    const std::time_t t = static_cast<std::time_t>(diag.winlink_last_unix);
+                    char when[32];
+                    std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+                    if (diag.winlink_last_error.empty()) {
+                        ImGui::TextColored(pal.success, "Last exchange %s with %s: OK, %d message(s)",
+                                           when, diag.winlink_last_target.c_str(),
+                                           diag.winlink_last_messages);
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text, pal.danger);
+                        ImGui::TextWrapped("Last exchange %s with %s failed: %s", when,
+                                           diag.winlink_last_target.c_str(),
+                                           diag.winlink_last_error.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                }
+                ImGui::Text("Fetches OK/failed: %d / %d   Login attempts (last): %d",
+                            diag.winlink_fetch_success, diag.winlink_fetch_fail,
+                            diag.last_login_attempts);
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Beacon", nullptr, tabFlags("Beacon"))) {
             bool beacon_enabled = state_.beacon_enabled ? *state_.beacon_enabled : false;
 
             if (ImGui::Checkbox("Enable Beacon", &beacon_enabled)) {
@@ -1662,7 +1754,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Away Mode")) {
+        if (ImGui::BeginTabItem("Away Mode", nullptr, tabFlags("Away Mode"))) {
             static char away_msg[512] = "";
             std::strncpy(away_msg, config_.away.away_message.c_str(), sizeof(away_msg) - 1);
             if (ImGui::InputTextMultiline("Away Message", away_msg, sizeof(away_msg),
@@ -1716,7 +1808,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("PSK Reporter")) {
+        if (ImGui::BeginTabItem("PSK Reporter", nullptr, tabFlags("PSK Reporter"))) {
             bool psk_enabled = config_.psk_reporter.enabled;
             if (ImGui::Checkbox("Enable PSK Reporter", &psk_enabled)) {
                 config_.psk_reporter.enabled = psk_enabled;
@@ -1788,7 +1880,7 @@ void SettingsWindow::render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("UI")) {
+        if (ImGui::BeginTabItem("UI", nullptr, tabFlags("UI"))) {
             bool dark_mode = config_.ui.dark_mode;
             auto apply_style = [&]() {
                 if (onSetupStyle) {
@@ -1822,6 +1914,7 @@ void SettingsWindow::render() {
         }
 
         ImGui::EndTabBar();
+        if (select_tab_ == requested_tab) select_tab_.clear();
     }
 }
 

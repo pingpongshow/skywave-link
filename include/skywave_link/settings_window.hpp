@@ -56,7 +56,12 @@ public:
     // Beacon timer reference (set by App so the countdown can be displayed)
     const std::chrono::steady_clock::time_point* last_beacon_sent = nullptr;
 
+    // Brings the tab labelled `name` ("Voice", "Winlink", ...) to the
+    // front on the next frame.
+    void selectTab(const std::string& name) { select_tab_ = name; }
+
 private:
+    std::string select_tab_;
     // Writes the config file; reports the outcome on the status line.
     // `what` names the applied section ("" for the Save button).
     bool saveSettings(const std::string& what);

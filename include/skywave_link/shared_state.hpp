@@ -3,6 +3,7 @@
 
 #include "config.hpp"
 #include "modem_client.hpp"
+#include "voice_control.hpp"
 #include "message_store.hpp"
 #include "freq_manager.hpp"
 #include "aprs_client.hpp"
@@ -137,6 +138,11 @@ struct RelayDiagnostics {
     int winlink_fetch_success = 0;
     int winlink_fetch_fail = 0;
     int last_login_attempts = 0;
+    // Last Winlink CMS exchange (Settings > Winlink status).
+    int64_t winlink_last_unix = 0;
+    std::string winlink_last_target;
+    std::string winlink_last_error;
+    int winlink_last_messages = 0;
     float last_gateway_score = 0.0f;
     int last_burst_sent = 0;
 };
@@ -346,6 +352,8 @@ struct SharedAppState {
 
     // PSK Reporter
     const PskReporterStatus* psk_status = nullptr;
+    // Live voice controls and counters (App::updateVoiceUi).
+    const VoiceUiState* voice_ui = nullptr;
     uint32_t* current_frequency_hz = nullptr;
 
     // ---- Helper methods ----

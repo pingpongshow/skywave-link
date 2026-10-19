@@ -39,3 +39,4 @@ target_compile_definitions(test_emulator PRIVATE
     SKYWAVE_LINK_EMULATOR_PATH="$<TARGET_FILE:skywave_link_emulator>")
 add_skywave_link_test(test_psk_reporter)
 add_skywave_link_test(test_gui_util)
+add_skywave_link_test(test_voice_control)

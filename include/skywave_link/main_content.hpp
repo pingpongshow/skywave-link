@@ -26,6 +26,10 @@ public:
     std::function<void()> onStopCQ;
     std::function<void()> onSendBeacon;
     std::function<void(bool)> onVoicePtt;
+    // VOICE button: open a voice session (configured mode) or close it.
+    std::function<void()> onVoiceButton;
+    // MAIL / "N NEW MAIL": bring the Mail window's Inbox to the front.
+    std::function<void()> onOpenMailInbox;
     // Sends a chat line. The input is cleared only when the line was sent
     // (an outgoing chat entry appeared); otherwise it stays for a retry.
     std::function<void(const std::string&)> onSendChatMessage;

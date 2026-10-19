@@ -16,33 +16,47 @@ namespace skylink {
 
 namespace {
 
-void renderVoiceActivityIndicator(const VoiceStatus& voice) {
+// The VOICE button: shows the voice state and opens / closes a session.
+// Returns true when clicked.
+bool renderVoiceButton(const VoiceButtonView& view) {
     const ImVec4 base_button = ImGui::GetStyleColorVec4(ImGuiCol_Button);
-
-    const bool tx_active = (voice.state == VoiceState::TxActive);
-    const bool rx_active = (voice.state == VoiceState::RxActive);
     const bool flash_on = (static_cast<int>(ImGui::GetTime() * 4.0) % 2) == 0;
-
     ImVec4 button_color = base_button;
-    const char* label = "VOICE";
-
-    if (tx_active) {
-        label = "VOICE TX";
-        if (flash_on) {
-            button_color = ui::palette().danger;
-        }
-    } else if (rx_active) {
-        label = "VOICE RX";
-        if (flash_on) {
+    switch (view.kind) {
+        case VoiceIndicator::Tx:
+            if (flash_on) button_color = ui::palette().danger;
+            break;
+        case VoiceIndicator::Requesting:
+            button_color = ui::palette().warning;
+            break;
+        case VoiceIndicator::Rx:
+            if (flash_on) button_color = ui::palette().success;
+            break;
+        case VoiceIndicator::On:
             button_color = ui::palette().success;
-        }
+            break;
+        case VoiceIndicator::Starting:
+            if (flash_on) button_color = ui::palette().warning;
+            break;
+        case VoiceIndicator::Unavailable:
+        case VoiceIndicator::Idle:
+        default:
+            break;
     }
-
     ImGui::PushStyleColor(ImGuiCol_Button, button_color);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, button_color);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, button_color);
-    ImGui::Button(label, ImVec2(-1, 0));
-    ImGui::PopStyleColor(3);
+    if (view.kind != VoiceIndicator::Idle && view.kind != VoiceIndicator::Unavailable) {
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, button_color);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+    }
+    const std::string label = view.label + "##voice_button";
+    const bool clicked = ImGui::Button(label.c_str(), ImVec2(-1, 0));
+    ImGui::PopStyleColor(2);
+    if (!view.tooltip.empty()) {
+        ImGui::SetItemTooltip("%s", view.tooltip.c_str());
+    }
+    return clicked;
 }
 
 std::string formatClock(int64_t unix_seconds, bool with_seconds) {
@@ -416,6 +430,7 @@ void MainContentRenderer::renderControlPanel(bool station_connected) {
     if (mail_btn[0]) {
         ui::PushButtonColor(pal.success);
         if (ImGui::Button(mail_btn)) {
+            if (onOpenMailInbox) onOpenMailInbox();
             if (state_.current_tab) *state_.current_tab = AppTab::Mail;
         }
         ui::PopButtonColor();
@@ -733,8 +748,26 @@ void MainContentRenderer::renderRightPanel(float width, float height) {
     if (ImGui::Button("SEND FILE", ImVec2(-1, 0))) {
         if (state_.current_tab) *state_.current_tab = AppTab::Files;
     }
-    if (ImGui::Button("SEND MAIL", ImVec2(-1, 0))) {
-        if (state_.current_tab) *state_.current_tab = AppTab::Mail;
+    {
+        // Opens the Mail window on its Inbox (Compose is a tab there).
+        int unread = 0;
+        if (state_.mail_inbox) {
+            for (const auto& m : *state_.mail_inbox) unread += m.read ? 0 : 1;
+        }
+        char mail_label[40];
+        if (unread > 0) {
+            std::snprintf(mail_label, sizeof(mail_label), "MAIL (%d new)###MailButton", unread);
+        } else {
+            std::snprintf(mail_label, sizeof(mail_label), "MAIL###MailButton");
+        }
+        if (unread > 0) ui::PushButtonColor(pal.accent);
+        const bool open_mail = ImGui::Button(mail_label, ImVec2(-1, 0));
+        if (unread > 0) ui::PopButtonColor();
+        ImGui::SetItemTooltip("Mail: Inbox, Sent and Compose");
+        if (open_mail) {
+            if (onOpenMailInbox) onOpenMailInbox();
+            if (state_.current_tab) *state_.current_tab = AppTab::Mail;
+        }
     }
     ui::PushButtonColor(pal.danger);
     if (ImGui::Button("BROADCAST", ImVec2(-1, 0))) {
@@ -743,22 +776,19 @@ void MainContentRenderer::renderRightPanel(float width, float height) {
     ui::PopButtonColor();
 
     const VoiceStatus voice = state_.modem->getVoiceStatus();
-    const VoiceMode desired_voice_mode = gui::parseVoiceMode(state_.config->voice.mode);
-    const bool can_start_voice =
-        desired_voice_mode != VoiceMode::Off &&
-        ((desired_voice_mode == VoiceMode::Connected &&
-          status.link_state == LinkState::Connected) ||
-         (desired_voice_mode == VoiceMode::Broadcast &&
-          status.link_state == LinkState::Idle));
-    const bool ptt_available =
-        state_.modem->isConnected() &&
-        (voice.ptt ||
-         voice.state == VoiceState::Opening ||
-         voice.state == VoiceState::Ready ||
-         voice.state == VoiceState::TxRequested ||
-         voice.state == VoiceState::TxActive ||
-         voice.state == VoiceState::RxActive ||
-         can_start_voice);
+    static const VoiceUiState kNoVoiceUi;
+    const VoiceUiState& vui = state_.voice_ui ? *state_.voice_ui : kNoVoiceUi;
+    // PTT is clickable whenever the modem is up and voice is not OFF: a
+    // press that cannot key says why on the status line (App).
+    // PTT and VOICE share the bottom row (one row fits short windows).
+    const float indicator_height = ImGui::GetFrameHeight();
+    const float remaining_height = ImGui::GetContentRegionAvail().y;
+    if (remaining_height > indicator_height + style.ItemSpacing.y) {
+        ImGui::Dummy(ImVec2(0.0f, remaining_height - indicator_height - style.ItemSpacing.y));
+    }
+    const float half_width =
+        std::max(1.0f, (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x) * 0.5f);
+    const bool ptt_available = vui.ptt_available;
     if (!ptt_available && ptt_button_held_) {
         ptt_button_held_ = false;
         if (onVoicePtt) onVoicePtt(false);
@@ -766,14 +796,17 @@ void MainContentRenderer::renderRightPanel(float width, float height) {
     if (!ptt_available) {
         ImGui::BeginDisabled();
     }
-    const bool ptt_lit = voice.ptt || ptt_button_held_;
+    const bool ptt_lit = voice.ptt || (ptt_button_held_ && vui.ptt_wanted);
     if (ptt_lit) {
         ui::PushButtonColor(pal.danger);
     }
-    ImGui::Button("PTT", ImVec2(-1, 0));
+    ImGui::Button("PTT", ImVec2(half_width, 0));
     const bool button_held_now = ptt_available && ImGui::IsItemActive();
     if (ptt_lit) {
         ui::PopButtonColor();
+    }
+    if (!vui.ptt_tooltip.empty()) {
+        ImGui::SetItemTooltip("%s", vui.ptt_tooltip.c_str());
     }
     if (button_held_now != ptt_button_held_) {
         ptt_button_held_ = button_held_now;
@@ -782,15 +815,9 @@ void MainContentRenderer::renderRightPanel(float width, float height) {
     if (!ptt_available) {
         ImGui::EndDisabled();
     }
-    const float indicator_height = ImGui::GetFrameHeight();
-    const float remaining_height = ImGui::GetContentRegionAvail().y;
-    if (remaining_height > indicator_height + style.ItemSpacing.y) {
-        ImGui::Dummy(ImVec2(0.0f, remaining_height - indicator_height - style.ItemSpacing.y));
-    }
-    renderVoiceActivityIndicator(voice);
-    if (state_.modem->isConnected() && !state_.modem->hasVoiceMedia() &&
-        desired_voice_mode != VoiceMode::Off) {
-        ImGui::SetItemTooltip("The modem's voice media socket is closed: no voice audio.");
+    ImGui::SameLine();
+    if (renderVoiceButton(vui.button) && onVoiceButton) {
+        onVoiceButton();
     }
 
     ImGui::EndChild();

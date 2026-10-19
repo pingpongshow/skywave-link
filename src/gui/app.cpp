@@ -27,6 +27,7 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <cfloat>
 #include <cctype>
 #include <ctime>
 #include <cstdio>
@@ -225,25 +226,6 @@ std::string serializeVoiceHotkey(SDL_Scancode scancode) {
         return "";
     }
     return "SCANCODE:" + std::to_string(static_cast<int>(scancode));
-}
-
-bool voiceSessionReadyForPtt(const VoiceStatus& voice) {
-    return voice.state == VoiceState::Ready ||
-           voice.state == VoiceState::TxRequested ||
-           voice.state == VoiceState::TxActive ||
-           voice.state == VoiceState::RxActive;
-}
-
-bool voiceStartReady(VoiceMode mode, LinkState link_state) {
-    switch (mode) {
-        case VoiceMode::Connected:
-            return link_state == LinkState::Connected;
-        case VoiceMode::Broadcast:
-            return link_state == LinkState::Idle;
-        case VoiceMode::Off:
-        default:
-            return false;
-    }
 }
 
 constexpr uint8_t kPositionRelayAckMarker = 0xF3;
@@ -1126,12 +1108,12 @@ bool App::initialize() {
         onModemEvent(name, args);
     });
     modem_->onVoiceStatus([this](const VoiceStatus& status) {
-        if (status.mode != VoiceMode::Off && status.state != VoiceState::Idle) {
-            voice_start_pending_ = false;
-            voice_start_inflight_ = false;
-        }
-        if (!status.ptt) {
-            voice_local_ptt_ = false;
+        // Only a closed session ends the PTT handshake; a PTT=OFF status
+        // can be a stale answer to a VOICESTATUS sent before VOICEPTT ON,
+        // and clearing the local key on it kept the microphone off the air
+        // for the whole talkspurt.
+        if (status.state == VoiceState::Idle) {
+            voice_ptt_sent_on_ = false;
         }
     });
 
@@ -1294,8 +1276,11 @@ bool App::voiceAudioWanted() {
     const VoiceStatus v = modem_->getVoiceStatus();
     // A session that can carry voice, voice already moving, or broadcast
     // voice that may arrive at any time while listening.
+    // A start request or a held PTT counts: the devices must be open by
+    // the time the grant arrives.
     return modem_->getStatus().link_state == LinkState::Connected ||
-           v.state != VoiceState::Idle || voice_start_pending_ ||
+           v.state != VoiceState::Idle || v.broadcast_rx || voice_session_wanted_ ||
+           voicePttWanted() ||
            gui::parseVoiceMode(config_.voice.mode) == VoiceMode::Broadcast;
 }
 
@@ -1310,10 +1295,12 @@ void App::updateVoiceAudioDevices() {
             SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(voice_capture_device_id_), 0);
             SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(voice_playback_device_id_), 0);
             voice_audio_ready_ = true;
+            voice_audio_error_.clear();
         } else {
             if (job->capture != 0) SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(job->capture));
             if (job->playback != 0) SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(job->playback));
             if (!job->error.empty()) {
+                voice_audio_error_ = job->error;
                 appendSystemChat("Voice audio unavailable (" + job->error +
                                                "); retrying in 30 s");
                 voice_open_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -1370,12 +1357,19 @@ void App::applyVoiceSettingsToModem(bool restart_if_open) {
         });
         changed = true;
     }
-    if (mode_changed && modem_->setVoiceMode(desired_mode)) {
+    if (mode_changed) {
+        modem_->setVoiceMode(desired_mode, [this](bool ok, const std::string& response) {
+            if (!ok) {
+                if (response == "ERROR:UNSUPPORTED") voice_unsupported_ = true;
+                logCommandFailure("Could not set the voice mode", "VOICE", response);
+            }
+        });
         changed = true;
     }
 
-    if (restart_if_open && was_open && mode_changed) {
-        voice_start_pending_ = true;
+    if (restart_if_open && was_open && mode_changed && desired_mode != VoiceMode::Off) {
+        voice_session_wanted_ = true;
+        voice_session_source_ = VoiceUiSource::Settings;
         voice_start_inflight_ = false;
     }
     if (changed) {
@@ -1498,45 +1492,86 @@ void App::pumpVoiceAudio() {
         return;
     }
 
+    const auto now = std::chrono::steady_clock::now();
     const VoiceStatus voice = modem_->getVoiceStatus();
+    // Microphone audio goes up while the operator holds PTT and the modem
+    // has taken VOICEPTT ON (its own PTT=ON, or our accepted command until
+    // the next VOICESTATUS shows it), in a state that captures.
     const bool local_voice_tx =
-        voice_local_ptt_ &&
-        voice.ptt &&
+        voicePttWanted() &&
+        (voice.ptt || voice_ptt_sent_on_) &&
         (voice.state == VoiceState::Ready ||
          voice.state == VoiceState::TxRequested ||
          voice.state == VoiceState::TxActive);
-    bool queued_local_pcm = false;
+    if (local_voice_tx && !voice_tx_was_active_) {
+        voice_spurt_started_at_ = now;
+        voice_last_capture_at_ = now;
+        voice_spurt_samples_ = 0;
+        voice_spurt_peak_ = 0;
+        voice_silent_mic_reported_ = false;
+    }
+    voice_tx_was_active_ = local_voice_tx;
+
+    auto send_pcm = [this](const int16_t* pcm, size_t count) {
+        const bool queued = modem_->sendVoicePcm(pcm, count);
+        if (queued) {
+            ++voice_frames_sent_;
+            voice_samples_sent_ += count;
+            voice_spurt_samples_ += count;
+        }
+        noteVoiceSendResult(queued);
+    };
 
     if (local_voice_tx &&
         voice_audio_ready_ &&
         voice_capture_device_id_ != 0) {
         uint8_t capture_buf[4096];
-        const Uint32 got = SDL_DequeueAudio(
-            static_cast<SDL_AudioDeviceID>(voice_capture_device_id_),
-            capture_buf,
-            sizeof(capture_buf));
-        if (got > 0) {
+        Uint32 got = 0;
+        while ((got = SDL_DequeueAudio(static_cast<SDL_AudioDeviceID>(voice_capture_device_id_),
+                                       capture_buf, sizeof(capture_buf))) > 0) {
             const size_t sample_count = static_cast<size_t>(got / sizeof(int16_t));
             std::vector<int16_t> pcm(sample_count);
             const float gain = std::clamp(config_.voice.capture_gain_percent, 0, 400) / 100.0f;
             const int16_t* src = reinterpret_cast<const int16_t*>(capture_buf);
+            int peak = 0;
             for (size_t i = 0; i < sample_count; ++i) {
+                peak = std::max(peak, std::abs(static_cast<int>(src[i])));
                 float scaled = static_cast<float>(src[i]) * gain;
                 scaled = std::clamp(scaled, -32768.0f, 32767.0f);
                 pcm[i] = static_cast<int16_t>(scaled);
             }
-            noteVoiceSendResult(modem_->sendVoicePcm(pcm.data(), pcm.size()));
-            queued_local_pcm = true;
+            voice_ui_.capture_peak = peak;
+            voice_spurt_peak_ = std::max(voice_spurt_peak_, peak);
+            voice_last_capture_at_ = now;
+            send_pcm(pcm.data(), pcm.size());
+        }
+        // A denied microphone (macOS privacy settings) still opens and
+        // delivers zeros: say so instead of sending silence unexplained.
+        if (!voice_silent_mic_reported_ && voice_spurt_peak_ == 0 &&
+            now - voice_spurt_started_at_ > std::chrono::seconds(3)) {
+            voice_silent_mic_reported_ = true;
+            reportVoice("Voice: the microphone delivers only silence. Check the capture "
+                        "device in Settings > Voice and, on macOS, System Settings > "
+                        "Privacy & Security > Microphone",
+                        StatusKind::Warning, VoiceUiSource::MainPanel);
         }
     } else if (voice_audio_ready_ && voice_capture_device_id_ != 0) {
         SDL_ClearQueuedAudio(static_cast<SDL_AudioDeviceID>(voice_capture_device_id_));
     }
 
-    if (local_voice_tx &&
-        !queued_local_pcm &&
-        voice.tx_queued < 320) {
-        static const int16_t silence_frame[320] = { 0 };
-        noteVoiceSendResult(modem_->sendVoicePcm(silence_frame, 320));
+    // No capture (device still opening or failed, or it stalled): keep the
+    // talkspurt flowing in real time with silence, paced to 8 kHz. (This
+    // used to add 40 ms of silence on every frame the capture device had
+    // nothing new, chopping real speech apart.)
+    if (local_voice_tx && now - voice_last_capture_at_ > std::chrono::milliseconds(200)) {
+        uint64_t owed = voiceSamplesOwed(now - voice_spurt_started_at_, voice_spurt_samples_);
+        static const int16_t silence_frame[160] = {0};
+        while (owed >= 160) {
+            const uint64_t before = voice_spurt_samples_;
+            send_pcm(silence_frame, 160);
+            if (voice_spurt_samples_ == before) break;  // refused; reported above
+            owed -= 160;
+        }
     }
 
     if (voice_audio_ready_ && voice_playback_device_id_ != 0) {
@@ -1556,6 +1591,7 @@ void App::pumpVoiceAudio() {
         const bool remote_voice_active =
             voice.state == VoiceState::RxActive ||
             (voice.active && !voice.local) ||
+            voice.broadcast_rx ||
             voice.rx_queued > 0;
         Uint32 queued_bytes = SDL_GetQueuedAudioSize(playback_device);
         voice_playback_samples_queued_ = queued_bytes / sizeof(int16_t);
@@ -1586,9 +1622,11 @@ void App::pumpVoiceAudio() {
                 if (should_queue) {
                     std::vector<int16_t> chunk(voice_playback_buffer_.begin(),
                                                voice_playback_buffer_.end());
-                    SDL_QueueAudio(playback_device,
-                                   chunk.data(),
-                                   static_cast<Uint32>(chunk.size() * sizeof(int16_t)));
+                    if (SDL_QueueAudio(playback_device,
+                                       chunk.data(),
+                                       static_cast<Uint32>(chunk.size() * sizeof(int16_t))) == 0) {
+                        voice_samples_played_ += chunk.size();
+                    }
                     voice_playback_buffer_.clear();
                     queued_bytes = SDL_GetQueuedAudioSize(playback_device);
                     voice_playback_samples_queued_ = queued_bytes / sizeof(int16_t);
@@ -1601,6 +1639,10 @@ void App::pumpVoiceAudio() {
             voice_playback_started_ = false;
             voice_playback_samples_queued_ = 0;
         }
+    } else if (!voice_open_job_) {
+        // No speaker and none opening: received voice cannot be played;
+        // do not keep it to replay later.
+        modem_->discardVoicePcm();
     }
 }
 
@@ -1746,6 +1788,7 @@ void App::initializeSharedState() {
     shared_state_.weather_request_time = &weather_request_time_;
 
     shared_state_.psk_status = &psk_status_;
+    shared_state_.voice_ui = &voice_ui_;
     shared_state_.current_frequency_hz = &current_frequency_hz_;
 }
 
@@ -1861,24 +1904,13 @@ void App::initializeWindows() {
         applyVoiceSettingsToModem(true);
     };
     settings_window_->onVoiceStart = [this]() {
-        applyVoiceSettingsToModem(false);
-        voice_start_pending_ = true;
-        voice_start_inflight_ = false;
+        (void)requestVoiceStart(VoiceUiSource::Settings);
     };
     settings_window_->onVoiceStop = [this]() {
-        voice_start_pending_ = false;
-        voice_start_inflight_ = false;
-        voice_ptt_after_start_ = false;
-        voice_ui_ptt_active_ = false;
-        if (modem_ && modem_->isConnected()) {
-            (void)modem_->voiceStop();
-        }
-        voice_local_ptt_ = false;
-        voice_hotkey_ptt_active_ = false;
+        requestVoiceStop(VoiceUiSource::Settings);
     };
     settings_window_->onVoicePtt = [this](bool enabled) {
-        voice_ui_ptt_active_ = enabled;
-        (void)setVoicePttState(voice_ui_ptt_active_ || voice_hotkey_ptt_active_);
+        (void)setVoicePttState(enabled, VoiceUiSource::Settings);
     };
     settings_window_->onBeginVoiceHotkeyCapture = [this]() {
         voice_hotkey_capture_active_ = true;
@@ -2006,8 +2038,11 @@ void App::initializeWindows() {
     main_content_->onStopCQ = [this]() { stopCQ(); };
     main_content_->onSendBeacon = [this]() { sendBeacon(); };
     main_content_->onVoicePtt = [this](bool enabled) {
-        voice_ui_ptt_active_ = enabled;
-        (void)setVoicePttState(voice_ui_ptt_active_ || voice_hotkey_ptt_active_);
+        (void)setVoicePttState(enabled, VoiceUiSource::MainPanel);
+    };
+    main_content_->onVoiceButton = [this]() { onVoiceButtonClicked(); };
+    main_content_->onOpenMailInbox = [this]() {
+        if (mail_window_) mail_window_->selectTab(MailWindow::Tab::Inbox);
     };
     // Returns false (and says why in the log) when the line was not sent,
     // so the input can be kept.
@@ -2185,6 +2220,11 @@ void App::gracefulDisconnectModem() {
 void App::processEvents() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        // The PTT hotkey (e.g. the ` key) must not also type into a focused
+        // text field: drop the text it produces while it is held.
+        if (event.type == SDL_TEXTINPUT && voice_hotkey_ptt_active_) {
+            continue;
+        }
         ImGui_ImplSDL2_ProcessEvent(&event);
 
         if (event.type == SDL_KEYDOWN && handleShortcutKey(event.key)) {
@@ -2206,88 +2246,315 @@ void App::processEvents() {
         }
         if (event.type == SDL_WINDOWEVENT &&
             event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+            // Key-up events stop arriving once the window loses focus: a
+            // held PTT is released rather than left keyed.
             voice_hotkey_capture_active_ = false;
-            if (voice_hotkey_ptt_active_ || voice_ui_ptt_active_) {
-                voice_hotkey_ptt_active_ = false;
-                voice_ui_ptt_active_ = false;
-                (void)setVoicePttState(false);
-            }
+            voice_hotkey_ptt_active_ = false;
+            voice_ui_ptt_active_ = false;
+            voice_settings_ptt_active_ = false;
         }
     }
 }
 
-bool App::setVoicePttState(bool enabled) {
-    if (!modem_ || !modem_->isConnected()) {
-        if (!enabled) {
-            voice_local_ptt_ = false;
-            voice_ptt_after_start_ = false;
-            voice_ui_ptt_active_ = false;
-            voice_hotkey_ptt_active_ = false;
-        }
-        return false;
+std::string App::setVoicePttState(bool enabled, VoiceUiSource source) {
+    bool* held = &voice_ui_ptt_active_;
+    switch (source) {
+        case VoiceUiSource::Settings: held = &voice_settings_ptt_active_; break;
+        case VoiceUiSource::Hotkey: held = &voice_hotkey_ptt_active_; break;
+        case VoiceUiSource::Script: held = &voice_test_ptt_active_; break;
+        case VoiceUiSource::MainPanel:
+        case VoiceUiSource::Auto:
+        default: break;
     }
-
-    const VoiceStatus voice = modem_->getVoiceStatus();
-    const VoiceMode desired_mode = gui::parseVoiceMode(config_.voice.mode);
-    const LinkState link_state = modem_->getStatus().link_state;
-
     if (!enabled) {
-        voice_ptt_after_start_ = false;
-        if (!voiceSessionReadyForPtt(voice) && !voice.ptt) {
-            voice_local_ptt_ = false;
-            return true;
+        *held = false;  // updateVoiceControl() sends VOICEPTT OFF
+        return "";
+    }
+
+    const VoiceContext ctx = voiceContext();
+    std::string reason;
+    if (!voiceSessionOpen(ctx.voice)) {
+        // PTT with no session opens one first (the key is sent once the
+        // session is open), or says why it cannot.
+        reason = requestVoiceStart(source);
+        if (!reason.empty()) {
+            *held = false;
+            return reason;  // already reported
         }
-        if (!modem_->setVoicePtt(false)) {
-            return false;
-        }
-        voice_local_ptt_ = false;
-        return true;
+    } else if (ctx.configured_mode == VoiceMode::Off) {
+        reason = voiceStartBlocker(ctx);
+    } else if (!ctx.voice_media) {
+        reason = "Voice: the modem's voice port is closed, so no audio can flow";
     }
-
-    if (desired_mode == VoiceMode::Off) {
-        return false;
+    if (reason.empty() && !voice_audio_ready_ && !voice_open_job_ && !voice_audio_error_.empty()) {
+        // The devices failed to open: try again now rather than in 30 s,
+        // and say why this press cannot carry audio.
+        voice_open_retry_at_ = {};
+        reason = "Voice audio unavailable (" + voice_audio_error_ +
+                 "); check Settings > Voice capture/playback devices";
     }
-
-    if (voice_start_pending_ && voice.state == VoiceState::Idle) {
-        voice_ptt_after_start_ = true;
-        voice_local_ptt_ = true;
-        return true;
+    if (!reason.empty()) {
+        *held = false;
+        reportVoice(reason, StatusKind::Error, source);
+        return reason;
     }
+    *held = true;
+    if (!voice_audio_ready_) voice_open_retry_at_ = {};
+    return "";
+}
 
-    if (voiceSessionReadyForPtt(voice)) {
-        if (voice.ptt) {
-            voice_local_ptt_ = true;
-            voice_ptt_after_start_ = false;
-            return true;
-        }
-        if (!modem_->setVoicePtt(true)) {
-            return false;
-        }
-        voice_local_ptt_ = true;
-        voice_ptt_after_start_ = false;
-        return true;
+VoiceContext App::voiceContext() const {
+    VoiceContext c;
+    c.configured_mode = gui::parseVoiceMode(config_.voice.mode);
+    c.modem_voice_unsupported = voice_unsupported_;
+    if (!modem_ || !modem_->isConnected()) return c;
+    const ModemStatus st = modem_->getStatus();
+    c.modem_connected = true;
+    c.voice_media = modem_->hasVoiceMedia();
+    c.link_state = st.link_state;
+    c.link_mode_index = st.link_state == LinkState::Connected ? st.mode_index : -1;
+    c.family = st.family;
+    c.my_callsign = st.my_callsign.empty() ? config_.station.callsign : st.my_callsign;
+    c.voice = modem_->getVoiceStatus();
+    return c;
+}
+
+void App::reportVoice(const std::string& text, StatusKind kind, VoiceUiSource source) {
+    if (text.empty()) return;
+    if (kind == StatusKind::Error || kind == StatusKind::Warning) voice_last_error_ = text;
+    if (!voice_notice_limiter_.allow(text, std::chrono::steady_clock::now())) return;
+    WindowBase* window = main_content_.get();
+    if (source == VoiceUiSource::Settings && settings_window_) window = settings_window_.get();
+    if (window) window->postStatus(text, kind);
+    appendSystemChat(text);
+    if (source == VoiceUiSource::Script) testLog("voice: " + text);
+}
+
+std::string App::requestVoiceStart(VoiceUiSource source) {
+    const VoiceContext ctx = voiceContext();
+    if (voiceSessionOpen(ctx.voice) || voice_start_inflight_) {
+        return "";
     }
-
-    if (voice.state == VoiceState::Opening) {
-        voice_ptt_after_start_ = true;
-        return true;
+    const std::string blocker = voiceStartBlocker(ctx);
+    if (!blocker.empty()) {
+        reportVoice(blocker, StatusKind::Error, source);
+        return blocker;
     }
+    voice_session_wanted_ = true;
+    voice_session_source_ = source;
+    voice_start_retry_at_ = {};
+    if (!voice_audio_ready_) voice_open_retry_at_ = {};
+    sendVoiceStart(source);
+    return "";
+}
 
-    if (!voiceStartReady(desired_mode, link_state)) {
-        return false;
-    }
-
+void App::sendVoiceStart(VoiceUiSource source) {
+    if (!modem_ || !modem_->isConnected() || voice_start_inflight_) return;
     applyVoiceSettingsToModem(false);
-    if (!modem_->voiceStart()) {
-        return false;
+    voice_start_inflight_ = true;
+    const bool user = source != VoiceUiSource::Auto;
+    const auto sent = modem_->voiceStart([this, source, user](bool ok, const std::string& response) {
+        voice_start_inflight_ = false;
+        if (ok) {
+            voice_last_error_.clear();
+            if (user) {
+                reportVoice(std::string("Voice: opening ") +
+                                (gui::parseVoiceMode(config_.voice.mode) == VoiceMode::Broadcast
+                                     ? "broadcast"
+                                     : "connected") +
+                                " voice",
+                            StatusKind::Info, source);
+            }
+            modem_->sendCommand("VOICESTATUS");
+            return;
+        }
+        if (response == "ERROR:UNSUPPORTED") voice_unsupported_ = true;
+        voice_session_wanted_ = false;
+        voice_auto_done_ = true;
+        // A held PTT cannot key without a session.
+        voice_ui_ptt_active_ = voice_settings_ptt_active_ = false;
+        voice_hotkey_ptt_active_ = voice_test_ptt_active_ = false;
+        voice_start_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        std::string why = explainVoiceCommandError("VOICESTART", response, voiceContext());
+        if (why.empty()) why = "Voice: the modem did not open voice";
+        reportVoice(why, StatusKind::Error,
+                    source == VoiceUiSource::Auto ? VoiceUiSource::MainPanel : source);
+    });
+    if (!sent) {
+        voice_start_inflight_ = false;
+    }
+}
+
+void App::requestVoiceStop(VoiceUiSource source) {
+    voice_session_wanted_ = false;
+    voice_auto_done_ = true;  // auto-start does not reopen what the operator closed
+    voice_ui_ptt_active_ = voice_settings_ptt_active_ = false;
+    voice_hotkey_ptt_active_ = voice_test_ptt_active_ = false;
+    if (!modem_ || !modem_->isConnected()) return;
+    modem_->voiceStop([this, source](bool ok, const std::string& response) {
+        if (ok) {
+            reportVoice("Voice closed", StatusKind::Info, source);
+            modem_->sendCommand("VOICESTATUS");
+        } else {
+            reportVoice(explainVoiceCommandError("VOICESTOP", response, voiceContext()),
+                        StatusKind::Error, source);
+        }
+    });
+    voice_ptt_sent_on_ = false;
+}
+
+void App::onVoiceButtonClicked() {
+    const VoiceContext ctx = voiceContext();
+    const VoiceButtonView view = voiceButtonView(ctx, voice_session_wanted_ || voice_start_inflight_,
+                                                 voice_last_error_);
+    if (view.session_open) {
+        requestVoiceStop(VoiceUiSource::MainPanel);
+    } else {
+        (void)requestVoiceStart(VoiceUiSource::MainPanel);
+    }
+}
+
+void App::sendVoicePtt(bool on) {
+    if (!modem_ || !modem_->isConnected() || voice_ptt_inflight_) return;
+    voice_ptt_inflight_ = true;
+    if (!on) voice_ptt_sent_on_ = false;
+    const auto sent = modem_->setVoicePtt(on, [this, on](bool ok, const std::string& response) {
+        voice_ptt_inflight_ = false;
+        const auto now = std::chrono::steady_clock::now();
+        if (on) {
+            voice_ptt_sent_on_ = ok;
+            // Give VOICESTATUS time to show the request before asking again.
+            voice_ptt_retry_at_ = now + std::chrono::milliseconds(ok ? 1500 : 3000);
+            if (!ok) {
+                std::string why = explainVoiceCommandError("VOICEPTT", response, voiceContext());
+                if (why.empty()) why = "Voice PTT: the modem did not answer";
+                VoiceUiSource src = VoiceUiSource::MainPanel;
+                if (voice_settings_ptt_active_) src = VoiceUiSource::Settings;
+                if (voice_test_ptt_active_) src = VoiceUiSource::Script;
+                reportVoice(why, StatusKind::Error, src);
+            }
+        }
+        modem_->sendCommand("VOICESTATUS");
+    });
+    if (!sent) {
+        voice_ptt_inflight_ = false;
+    }
+}
+
+void App::resetVoiceControlState() {
+    voice_session_wanted_ = false;
+    voice_auto_done_ = false;
+    voice_start_inflight_ = false;
+    voice_ptt_inflight_ = false;
+    voice_ptt_sent_on_ = false;
+    voice_ui_ptt_active_ = false;
+    voice_settings_ptt_active_ = false;
+    voice_hotkey_ptt_active_ = false;
+    voice_test_ptt_active_ = false;
+    voice_hotkey_capture_active_ = false;
+    voice_probe_sent_ = false;
+    voice_unsupported_ = false;
+}
+
+void App::updateVoiceControl(std::chrono::steady_clock::time_point now) {
+    if (!voice_probe_sent_) {
+        // One answered VOICESTATUS tells a modem without voice apart
+        // (ERROR:UNSUPPORTED); the 4 Hz poll below is fire-and-forget.
+        voice_probe_sent_ = true;
+        modem_->sendCommandAsync("VOICESTATUS", [this](bool ok, const std::string& response) {
+            if (!ok && response == "ERROR:UNSUPPORTED") {
+                voice_unsupported_ = true;
+                if (gui::parseVoiceMode(config_.voice.mode) != VoiceMode::Off) {
+                    appendSystemChat("Voice: this modem was built without voice "
+                                     "(VOICESTATUS -> ERROR:UNSUPPORTED)");
+                }
+            }
+        });
+    }
+    if (!voice_unsupported_ &&
+        now - last_voice_status_poll_ >= std::chrono::milliseconds(250)) {
+        // Fire-and-forget: the VOICESTATUS reply is folded into the
+        // status snapshot by poll(). queryVoiceStatus() would block the
+        // GUI thread (>= 10 ms, up to 500 ms) four times a second.
+        modem_->sendCommand("VOICESTATUS");
+        last_voice_status_poll_ = now;
     }
 
-    voice_start_pending_ = true;
-    voice_start_inflight_ = true;
-    voice_start_attempted_at_ = std::chrono::steady_clock::now();
-    voice_ptt_after_start_ = true;
-    voice_local_ptt_ = true;
-    return true;
+    const VoiceContext ctx = voiceContext();
+    const VoiceStatus& voice = ctx.voice;
+    const bool open = voiceSessionOpen(voice);
+    const std::string blocker = voiceStartBlocker(ctx);
+
+    if (open) {
+        voice_session_wanted_ = false;
+        voice_auto_done_ = true;
+    } else if (!voice_start_inflight_) {
+        if (voice_session_wanted_ && !blocker.empty()) {
+            // The chance went away (link dropped, mode changed) before
+            // the session opened.
+            voice_session_wanted_ = false;
+            voice_ui_ptt_active_ = voice_settings_ptt_active_ = false;
+            voice_hotkey_ptt_active_ = voice_test_ptt_active_ = false;
+            reportVoice(blocker, StatusKind::Error, voice_session_source_);
+        } else if (blocker.empty() && now >= voice_start_retry_at_) {
+            if (voice_session_wanted_) {
+                sendVoiceStart(voice_session_source_);
+            } else if (config_.voice.auto_start && !voice_auto_done_) {
+                voice_auto_done_ = true;
+                sendVoiceStart(VoiceUiSource::Auto);
+            }
+        }
+        if (!blocker.empty() && !voice_session_wanted_) {
+            // auto_start tries again at the next opportunity (a new link,
+            // the link speeding up to a voice mode, going idle).
+            voice_auto_done_ = false;
+        }
+    }
+
+    // PTT follows the held sources once a session can take it.
+    const bool want = voicePttWanted();
+    if (!open) {
+        voice_ptt_sent_on_ = false;
+    } else if (want && voiceSessionReadyForPtt(voice) && !voice.ptt && !voice_ptt_inflight_ &&
+               now >= voice_ptt_retry_at_ &&
+               !(voice.state == VoiceState::RxActive && voice_ptt_sent_on_)) {
+        // (While the peer talks the modem remembers the request.)
+        sendVoicePtt(true);
+    } else if (!want && (voice_ptt_sent_on_ || (voice.ptt && voice.local)) && !voice_ptt_inflight_ &&
+               now >= voice_ptt_retry_at_) {
+        sendVoicePtt(false);
+        voice_ptt_retry_at_ = now + std::chrono::milliseconds(500);
+    }
+    if (!want && !voice_ptt_inflight_ && !voice.ptt) {
+        voice_ptt_retry_at_ = {};
+    }
+}
+
+void App::updateVoiceUi() {
+    const VoiceContext ctx = voiceContext();
+    voice_ui_.button = voiceButtonView(ctx, voice_session_wanted_ || voice_start_inflight_,
+                                       voice_last_error_);
+    voice_ui_.ptt_available = ctx.modem_connected && ctx.configured_mode != VoiceMode::Off;
+    voice_ui_.ptt_wanted = voicePttWanted();
+    if (!ctx.modem_connected) {
+        voice_ui_.ptt_tooltip = "Connect the modem first";
+    } else if (ctx.configured_mode == VoiceMode::Off) {
+        voice_ui_.ptt_tooltip = "Voice is off (Settings > Voice > Usage)";
+    } else if (voiceSessionOpen(ctx.voice)) {
+        voice_ui_.ptt_tooltip = "Hold to talk";
+    } else {
+        const std::string blocker = voiceStartBlocker(ctx);
+        voice_ui_.ptt_tooltip = blocker.empty() ? "Hold to open voice and talk" : blocker;
+    }
+    voice_ui_.audio_ready = voice_audio_ready_;
+    voice_ui_.audio_opening = voice_open_job_ != nullptr;
+    voice_ui_.audio_error = voice_audio_error_;
+    voice_ui_.last_error = voice_last_error_;
+    voice_ui_.frames_sent = voice_frames_sent_;
+    voice_ui_.samples_sent = voice_samples_sent_;
+    voice_ui_.samples_received = modem_ ? modem_->voiceSamplesReceived() : 0;
+    voice_ui_.samples_played = voice_samples_played_;
+    voice_ui_.tx_dropped = voice_tx_dropped_;
 }
 
 // Menu shortcuts: Cmd+, / Cmd+Q on macOS, Ctrl+, / Ctrl+Q elsewhere.
@@ -2347,14 +2614,13 @@ bool App::handleVoiceHotkeyEvent(const SDL_KeyboardEvent& key, bool pressed) {
     }
 
     if (pressed) {
-        voice_hotkey_ptt_active_ = true;
-        (void)setVoicePttState(voice_ui_ptt_active_ || voice_hotkey_ptt_active_);
+        // A refusal is reported (rate-limited) by setVoicePttState.
+        (void)setVoicePttState(true, VoiceUiSource::Hotkey);
         return true;
     }
 
     if (voice_hotkey_ptt_active_) {
-        voice_hotkey_ptt_active_ = false;
-        (void)setVoicePttState(voice_ui_ptt_active_ || voice_hotkey_ptt_active_);
+        (void)setVoicePttState(false, VoiceUiSource::Hotkey);
         return true;
     }
 
@@ -2424,80 +2690,13 @@ void App::update() {
                     }
                 });
         }
-        auto voice_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_voice_status_poll_);
-        if (voice_elapsed.count() >= 250) {
-            // Fire-and-forget: the VOICESTATUS reply is folded into the
-            // status snapshot by poll(). queryVoiceStatus() would block the
-            // GUI thread (>= 10 ms, up to 500 ms) four times a second.
-            modem_->sendCommand("VOICESTATUS");
-            last_voice_status_poll_ = now;
-        }
-
-        const VoiceStatus voice = modem_->getVoiceStatus();
-        const VoiceMode desired_mode = gui::parseVoiceMode(config_.voice.mode);
-        const LinkState link_state = modem_->getStatus().link_state;
-        const bool voice_open =
-            desired_mode != VoiceMode::Off &&
-            voice.mode == desired_mode &&
-            voice.state != VoiceState::Idle;
-        const bool auto_requested =
-            config_.voice.auto_start &&
-            desired_mode != VoiceMode::Off &&
-            !voice_auto_started_;
-        const bool start_requested = voice_start_pending_ || auto_requested;
-        if (voice_start_inflight_ && voice.state == VoiceState::Idle) {
-            const auto attempt_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - voice_start_attempted_at_);
-            if (attempt_elapsed.count() >= 750) {
-                voice_start_inflight_ = false;
-            }
-        }
-
-        if (voice_open) {
-            voice_start_pending_ = false;
-            voice_start_inflight_ = false;
-            if (config_.voice.auto_start) {
-                voice_auto_started_ = true;
-            }
-        } else if (start_requested &&
-                   voiceStartReady(desired_mode, link_state) &&
-                   !voice_start_inflight_) {
-            applyVoiceSettingsToModem(false);
-            if (modem_->voiceStart()) {
-                voice_start_pending_ = true;
-                voice_start_inflight_ = true;
-                voice_start_attempted_at_ = now;
-                if (config_.voice.auto_start) {
-                    voice_auto_started_ = true;
-                }
-            }
-        }
-        if (voice_ptt_after_start_ && voiceSessionReadyForPtt(voice) && !voice.ptt) {
-            if (setVoicePttState(true)) {
-                voice_ptt_after_start_ = false;
-            }
-        }
-        if (!config_.voice.auto_start || desired_mode == VoiceMode::Off) {
-            voice_auto_started_ = false;
-        }
-        if (desired_mode == VoiceMode::Off) {
-            voice_start_pending_ = false;
-            voice_start_inflight_ = false;
-            voice_ptt_after_start_ = false;
-        }
+        updateVoiceControl(now);
     } else {
         last_status_update_ = now;
         last_voice_status_poll_ = now;
-        voice_auto_started_ = false;
-        voice_start_pending_ = false;
-        voice_start_inflight_ = false;
-        voice_local_ptt_ = false;
-        voice_ptt_after_start_ = false;
-        voice_ui_ptt_active_ = false;
-        voice_hotkey_capture_active_ = false;
-        voice_hotkey_ptt_active_ = false;
+        resetVoiceControlState();
     }
+    updateVoiceUi();
 
     applyMeshRelaySettings();
     flushMeshRelayQueue();
@@ -2732,7 +2931,25 @@ void App::render() {
 
     // Settings window
     if (show_settings_) {
-        prepareToolWindow(620, 520, 0);
+        // Wide enough that every tab label shows without scrolling the tab
+        // bar (also for an imgui.ini saved at the old, narrower size); a
+        // main window narrower than that still scrolls the tabs.
+        {
+            static const char* const kSettingsTabs[] = {
+                "Station", "Modem", "Radio", "Voice", "Files", "APRS", "Email",
+                "Winlink", "Beacon", "Away Mode", "PSK Reporter", "UI"};
+            const ImGuiStyle& st = ImGui::GetStyle();
+            // Margin: the scrollbar and rounding between tabs.
+            float tabs_w = st.WindowPadding.x * 2.0f + st.ScrollbarSize + ImGui::GetFontSize() * 2.0f;
+            for (const char* label : kSettingsTabs) {
+                tabs_w += ImGui::CalcTextSize(label).x + st.FramePadding.x * 2.0f +
+                          std::max(st.ItemInnerSpacing.x, st.ItemSpacing.x);
+            }
+            const ImGuiViewport* vp = ImGui::GetMainViewport();
+            const float min_w = std::min(tabs_w, vp->WorkSize.x * 0.95f);
+            ImGui::SetNextWindowSizeConstraints(ImVec2(min_w, 200.0f), ImVec2(FLT_MAX, FLT_MAX));
+            prepareToolWindow(std::max(620.0f, tabs_w / (ImGui::GetFontSize() / 13.0f)), 560, 0);
+        }
         if (ImGui::Begin("Settings", &show_settings_)) {
             if (settings_window_) settings_window_->render();
         }
@@ -3057,7 +3274,7 @@ void App::renderStatusBar() {
         voice.mode != VoiceMode::Off ||
         voice.state != VoiceState::Idle ||
         voice.active ||
-        voice_start_pending_;
+        (voice_session_wanted_ || voice_start_inflight_);
     if (show_voice) {
         const std::string transport =
             voice.transport_mode >= 0
@@ -3067,7 +3284,8 @@ void App::renderStatusBar() {
             voice.state == VoiceState::TxRequested ||
             voice.state == VoiceState::TxActive ||
             voice.state == VoiceState::RxActive ||
-            voice_start_pending_;
+            voice_session_wanted_ || voice_start_inflight_;
+        const bool voice_pending = voice_session_wanted_ || voice_start_inflight_;
         divider();
         if (voice_hot) {
             ImGui::TextColored(pal.warning,
@@ -3076,14 +3294,14 @@ void App::renderStatusBar() {
                                voiceStateLabel(voice.state),
                                liveVoiceCodecDisplayLabel(voice.codec),
                                transport.c_str(),
-                               voice.ptt ? " PTT" : (voice_start_pending_ ? " PENDING" : ""));
+                               voice.ptt ? " PTT" : (voice_pending ? " PENDING" : ""));
         } else {
             ImGui::Text("VOICE: %s %s %s %s%s",
                         voiceModeLabel(voice.mode),
                         voiceStateLabel(voice.state),
                         liveVoiceCodecDisplayLabel(voice.codec),
                         transport.c_str(),
-                        voice_start_pending_ ? " PENDING" : "");
+                        voice_pending ? " PENDING" : "");
         }
     }
 
@@ -4112,13 +4330,9 @@ void App::onConnected(const std::string& callsign) {
 
     appendSystemChat("Connected to " + current_chat_partner_);
 
-    if (config_.voice.auto_start &&
-        gui::parseVoiceMode(config_.voice.mode) == VoiceMode::Connected &&
-        modem_ && modem_->isConnected()) {
-        applyVoiceSettingsToModem(false);
-        voice_start_pending_ = true;
-        voice_start_inflight_ = false;
-    }
+    // auto_start opens voice from updateVoiceControl() once the link can
+    // carry it.
+    voice_auto_done_ = false;
 
     // If away mode, send auto-reply (with the commands this station offers),
     // signed with the operator's name when one is set (K20).
@@ -4165,10 +4379,9 @@ void App::onDisconnected(const std::string& reason) {
             appendSystemChat(why);
         }
     }
-    voice_local_ptt_ = false;
-    voice_auto_started_ = false;
-    voice_start_pending_ = false;
-    voice_start_inflight_ = false;
+    voice_session_wanted_ = false;
+    voice_auto_done_ = false;
+    voice_ptt_sent_on_ = false;
     pending_connect_auto_qsy_ = false;
 
     const bool workflow_active = (qsy_workflow_state_ != QsyWorkflowState::Idle) ||
@@ -4396,12 +4609,10 @@ void App::onModemConnected() {
 void App::disconnectFromModem() {
     modem_auto_paused_ = true;  // the operator chose to be disconnected
     if (modem_) {
-        if (voice_local_ptt_) {
+        if (voice_ptt_sent_on_) {
             (void)modem_->setVoicePtt(false);
-            voice_local_ptt_ = false;
         }
-        voice_start_pending_ = false;
-        voice_start_inflight_ = false;
+        resetVoiceControlState();
         modem_->disconnect();
     }
 }
@@ -6499,7 +6710,8 @@ void App::keepInboundLocally(const std::string& from,
                              const std::string& to,
                              const std::string& subject,
                              const std::string& body,
-                             const std::string& message_id) {
+                             const std::string& message_id,
+                             bool for_this_station) {
     const std::string mid = gui::trimCopy(message_id);
     if (!mid.empty()) {
         const bool seen = std::any_of(mail_inbox_.begin(), mail_inbox_.end(),
@@ -6526,8 +6738,13 @@ void App::keepInboundLocally(const std::string& from,
             mail_inbox_.back().store_id = id;
         }
     }
-    appendSystemChat("[EMAIL] Kept internet message for " + mail.to +
-                     " in the local inbox (no radio callsign to relay to)");
+    if (for_this_station) {
+        appendSystemChat("[EMAIL] New internet mail from " + mail.from +
+                         " in Mail > Inbox: " + mail.subject);
+    } else {
+        appendSystemChat("[EMAIL] Kept internet message for " + mail.to +
+                         " in Mail > Inbox (no radio callsign to relay to)");
+    }
 }
 
 // Messages window "Send Email": validated, stored, queued, and handed to
@@ -6589,6 +6806,15 @@ void App::applyInboundEmail(const EmailGatewayJobOutput& output) {
                                     const std::string& body,
                                     const std::string& message_id) -> bool {
         const std::string target_callsign = deriveRadioRelayTarget(to);
+        // Mail for this station itself (a Winlink message to its callsign)
+        // was queued for "radio relay" to itself and never reached the
+        // Mail Inbox; it belongs there.
+        if (!target_callsign.empty() &&
+            (gui::sameStationCallsign(target_callsign, config_.station.callsign) ||
+             gui::sameStationCallsign(target_callsign, config_.email.winlink_telnet_callsign))) {
+            keepInboundLocally(from, to, subject, body, message_id, true);
+            return false;
+        }
         if (target_callsign.empty()) {
             // Not addressed to a radio station: the server copy is gone, so
             // keep it in the local inbox rather than dropping it.
@@ -6667,6 +6893,11 @@ void App::applyInboundEmail(const EmailGatewayJobOutput& output) {
         relay_diagnostics_.last_attempt_unix = unixNowSeconds();
         relay_diagnostics_.last_login_attempts = wl_result.login_attempts;
 
+        relay_diagnostics_.winlink_last_unix = relay_diagnostics_.last_attempt_unix;
+        relay_diagnostics_.winlink_last_target = output.winlink_target;
+        relay_diagnostics_.winlink_last_error = wl_result.success ? std::string() : wl_result.error;
+        relay_diagnostics_.winlink_last_messages =
+            wl_result.success ? static_cast<int>(wl_result.messages.size()) : 0;
         if (!wl_result.success) {
             relay_diagnostics_.winlink_fetch_fail++;
             relay_diagnostics_.last_result = "winlink-fetch-fail";
@@ -10522,6 +10753,17 @@ void skylink::App::runTestScript() {
         if (f.size() >= 2) updatePosition(std::atof(f[0].c_str()), std::atof(f[1].c_str()));
     } else if (cmd == "family") {
         setModemFamily(arg);
+    } else if (cmd == "voice_start") {
+        // The VOICE button's start path (requestVoiceStart).
+        const std::string why = requestVoiceStart(VoiceUiSource::Script);
+        if (!why.empty()) testLog("voice_start refused: " + why);
+    } else if (cmd == "voice_stop") {
+        requestVoiceStop(VoiceUiSource::Script);
+    } else if (cmd == "voice_ptt") {
+        // As holding / releasing a PTT button (setVoicePttState).
+        const bool on = skylink::gui::upperCopy(arg) == "ON";
+        const std::string why = setVoicePttState(on, VoiceUiSource::Script);
+        if (!why.empty()) testLog("voice_ptt refused: " + why);
     } else if (cmd == "modem") {
         if (modem_) modem_->sendCommand(arg);
     } else if (cmd == "screenshot") {
@@ -10533,8 +10775,13 @@ void skylink::App::runTestScript() {
             {"mail", AppTab::Mail}, {"weather", AppTab::Weather},
             {"position", AppTab::Position}, {"map", AppTab::StationMap},
         };
-        if (arg == "settings") {
+        if (arg.rfind("settings", 0) == 0) {
+            // `show settings:<Tab>` also selects a tab (e.g. settings:Winlink).
             show_settings_ = true;
+            const size_t colon = arg.find(':');
+            if (colon != std::string::npos && settings_window_) {
+                settings_window_->selectTab(arg.substr(colon + 1));
+            }
         } else if (arg == "chat") {
             current_tab_ = AppTab::Chat;
             close_tool_windows_ = true;
@@ -10547,6 +10794,7 @@ void skylink::App::runTestScript() {
                 }
             }
             if (!found) testLog("unknown window: " + arg);
+            if (arg == "mail" && mail_window_) mail_window_->selectTab(MailWindow::Tab::Inbox);
         }
     } else if (cmd == "theme") {
         config_.ui.dark_mode = (arg != "light");
@@ -10632,6 +10880,29 @@ void skylink::App::dumpTestReport(const std::string& path) {
     o << "],\n  \"psk\": {\"active\": " << (psk_status_.active ? "true" : "false")
       << ", \"queued\": " << psk_status_.queued_spots << ", \"sent\": " << psk_status_.spots_sent
       << ", \"error\": \"" << jsonEsc(psk_status_.last_error) << "\"},\n";
-    o << "  \"voice_tx_dropped\": " << voice_tx_dropped_ << "\n}\n";
+    o << "  \"voice_tx_dropped\": " << voice_tx_dropped_ << ",\n";
+    {
+        const VoiceStatus v = modem_ ? modem_->getVoiceStatus() : VoiceStatus{};
+        const char* mode = v.mode == VoiceMode::Connected   ? "CONNECTED"
+                           : v.mode == VoiceMode::Broadcast ? "BROADCAST"
+                                                            : "OFF";
+        o << "  \"voice\": {\"state\": \"" << voiceStateName(v.state) << "\", \"mode\": \""
+          << mode << "\", \"config_mode\": \"" << jsonEsc(config_.voice.mode)
+          << "\", \"ptt\": " << (v.ptt ? "true" : "false")
+          << ", \"ptt_wanted\": " << (voicePttWanted() ? "true" : "false")
+          << ", \"codec\": \"" << jsonEsc(v.codec) << "\", \"transport\": " << v.transport_mode
+          << ", \"broadcast_rx\": " << (v.broadcast_rx ? "true" : "false")
+          << ", \"media\": " << (modem_ && modem_->hasVoiceMedia() ? "true" : "false")
+          << ", \"unsupported\": " << (voice_unsupported_ ? "true" : "false")
+          << ", \"audio_ready\": " << (voice_audio_ready_ ? "true" : "false")
+          << ", \"audio_error\": \"" << jsonEsc(voice_audio_error_)
+          << "\", \"frames_sent\": " << voice_frames_sent_
+          << ", \"samples_sent\": " << voice_samples_sent_
+          << ", \"samples_received\": " << (modem_ ? modem_->voiceSamplesReceived() : 0)
+          << ", \"samples_played\": " << voice_samples_played_
+          << ", \"capture_peak\": " << voice_ui_.capture_peak
+          << ", \"button\": \"" << jsonEsc(voice_ui_.button.label)
+          << "\", \"last_error\": \"" << jsonEsc(voice_last_error_) << "\"}\n}\n";
+    }
     testLog("report written: " + path);
 }

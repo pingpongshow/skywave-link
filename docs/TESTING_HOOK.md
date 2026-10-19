@@ -55,10 +55,12 @@ SKYLINK_TEST_LOG=scriptA.log \
 | `bbs_fetch <OWNER>\|<filename>` | `requestRemoteBBSDownload()` |
 | `position <lat>\|<lon>` | `updatePosition()` |
 | `family <NAME>` | `setModemFamily()`, as choosing a Bandwidth Family in Settings (WIDE, MID, NARROW, ULTRA; ULTRA sends `ULTRA ON` first; a refusal reverts the setting and is logged) |
+| `voice_start`, `voice_stop` | the VOICE button / Settings Start-Stop paths (`requestVoiceStart()`, `requestVoiceStop()`); a refusal logs `voice_start refused: <reason>` |
+| `voice_ptt on\|off` | holding / releasing a PTT button (`setVoicePttState()`): opens a session if needed, keys once it is open; a refusal logs `voice_ptt refused: <reason>` |
 | `modem <command>` | a raw modem control command |
 | `screenshot <path.ppm>` | the next rendered frame, read back from GL (works with the display asleep) |
 | `dump <path.json>` | JSON report, see below |
-| `show <window>` | open a window: `settings`, `files`, `bbs`, `frequency`, `messages`, `mail`, `weather`, `position`, `map`; `show chat` returns to the main view and closes every floating window, Settings included |
+| `show <window>` | open a window: `settings` (`settings:<Tab>` also selects a tab, e.g. `settings:Winlink`), `files`, `bbs`, `frequency`, `messages`, `mail`, `weather`, `position`, `map`; `show chat` returns to the main view and closes every floating window, Settings included |
 | `theme dark\|light` | switch the colour theme (as Settings -> UI -> Dark Mode) |
 | `quit` | normal shutdown (graceful link teardown, config save) |
 
@@ -78,6 +80,7 @@ SKYLINK_TEST_LOG=scriptA.log \
 | `bbs_files` | `file`, `remote`, `uploader` |
 | `psk` | PSK Reporter client: `active`, `queued`, `sent`, `error` |
 | `voice_tx_dropped` | uplink voice frames the modem client refused this session |
+| `voice` | `state` (CLOSED, OPENING, OPEN, REQUESTING, TALKING, RECEIVING), `mode` (modem), `config_mode`, `ptt` (modem), `ptt_wanted` (a PTT source held), `codec`, `transport`, `broadcast_rx`, `media` (voice socket open), `unsupported`, `audio_ready`, `audio_error`, `frames_sent`, `samples_sent`, `samples_received`, `samples_played` (8 kHz samples), `capture_peak`, `button` (VOICE button label), `last_error` |
 
 ## Two-station runs
 

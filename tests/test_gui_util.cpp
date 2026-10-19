@@ -185,6 +185,14 @@ TEST(chat_history_result_helpers) {
     PASS();
 }
 
+TEST(same_station_callsign_ignores_ssid_and_case) {
+    ASSERT_TRUE(gui::sameStationCallsign("k1aaa-2", "K1AAA"));
+    ASSERT_TRUE(gui::sameStationCallsign(" K1AAA ", "k1aaa"));
+    ASSERT_FALSE(gui::sameStationCallsign("K1AAB", "K1AAA"));
+    ASSERT_FALSE(gui::sameStationCallsign("", ""));
+    PASS();
+}
+
 TEST(window_status_line) {
     SharedAppState state;
     ProbeWindow window(state);

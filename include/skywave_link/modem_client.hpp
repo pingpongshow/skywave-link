@@ -370,10 +370,12 @@ public:
     // `VOICECODEC <codec>`; false (nothing sent) for a value the modem does
     // not accept (see normalizeVoiceCodec).
     bool setVoiceCodec(const std::string& codec, CommandResultCallback cb = {});
-    bool setVoiceMode(VoiceMode mode);              // VOICE OFF|CONNECTED|BROADCAST
-    bool voiceStart();
-    bool voiceStop();
-    bool setVoicePtt(bool enabled);
+    // `cb` (optional) gets the modem's answer: ok=false with "ERROR:..."
+    // (ERROR:STATE, ERROR:UNSUPPORTED) or "" when there was no answer.
+    bool setVoiceMode(VoiceMode mode, CommandResultCallback cb = {});  // VOICE OFF|CONNECTED|BROADCAST
+    bool voiceStart(CommandResultCallback cb = {});
+    bool voiceStop(CommandResultCallback cb = {});
+    bool setVoicePtt(bool enabled, CommandResultCallback cb = {});
     std::optional<VoiceStatus> queryVoiceStatus();
     // Queues one uplink record (whole, never split) and writes what the
     // socket takes without blocking; poll() flushes the rest. False when
@@ -384,6 +386,13 @@ public:
     size_t pendingVoiceBytes() const;
     static constexpr size_t kMaxVoiceBacklogBytes = 32u * 1024u;  // ~2 s of PCM
     std::vector<int16_t> receiveVoicePcm(size_t max_samples = 1600);
+    // Downlink PCM samples taken off the voice socket since connect (the
+    // receive buffer holds at most kMaxVoiceRxSamples; older audio is
+    // dropped when nobody plays it).
+    uint64_t voiceSamplesReceived() const;
+    size_t voiceSamplesBuffered() const;
+    void discardVoicePcm();
+    static constexpr size_t kMaxVoiceRxSamples = 8000u * 10u;  // 10 s
 
     // Callbacks
     void onStateChange(StateCallback cb) { state_callback_ = std::move(cb); }
@@ -426,6 +435,7 @@ private:
     std::vector<uint8_t> session_rx_;
     std::vector<uint8_t> voice_buffer_;
     std::deque<int16_t> voice_rx_samples_;
+    uint64_t voice_rx_total_samples_ = 0;
     mutable std::mutex voice_mutex_;
     uint32_t voice_tx_sequence_ = 0;
     uint64_t voice_tx_sample_counter_ = 0;

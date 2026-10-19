@@ -6,6 +6,55 @@ The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed (voice, mail and settings usability, 2026-10-19)
+
+- **PTT never put the microphone on the air.** The local "PTT held" flag
+  was cleared by any voice status with `PTT=OFF`, including the answer to
+  a `VOICESTATUS` poll sent just before `VOICEPTT ON`; the modem then
+  talked with no audio. PTT is now level-triggered: the held buttons and
+  hotkey are the intent, and `VOICEPTT ON/OFF` follows them once the
+  session can take it
+- **Silence chopped speech apart.** A frame with no new capture data sent
+  40 ms of silence, so ~16 ms frames against 20 ms capture blocks inserted
+  silence between real speech. Filler silence now only covers a stalled
+  or absent microphone, paced to real time
+- **Voice errors were swallowed.** `VOICESTART`/`VOICEPTT`/`VOICE` answers
+  (`ERROR:STATE`, `ERROR:UNSUPPORTED`) only reached stderr; a refused
+  `VOICESTART` was retried every 750 ms forever. Refusals are explained
+  (no link, link mode below the voice floor, peer without voice, N0CALL,
+  modem without voice) on the status line and in the log, once
+- **VOICE button was an indicator only.** It now opens or closes a voice
+  session in the configured mode and explains when it cannot. PTT is
+  enabled whenever the modem is connected and voice is not OFF, opens a
+  session if needed, and says why when it cannot key (main panel,
+  Settings -> Voice, hotkey; hotkey messages rate-limited)
+- **Hotkey typed into text fields.** The PTT key's character is no longer
+  typed into a focused text field while it keys; the hotkey works only
+  while the app window has focus (documented in Settings -> Voice)
+- **auto_start** reopens voice at each new opportunity (link up, link
+  speeding up to a voice mode, going idle for broadcast) and no longer
+  reopens a session the operator stopped
+- **Received voice with nobody playing it** accumulated without bound in
+  the client and was replayed later; it is capped at 10 s and discarded
+  while no speaker is open. EVT:VOICE TALKING/STOPPED now set the PTT flag
+- **Internet mail for this station never reached the Inbox.** A Winlink
+  message addressed to the station's own callsign was queued for radio
+  relay to itself; it now goes to Mail -> Inbox
+
+### Changed (voice, mail and settings usability, 2026-10-19)
+
+- Mail window: Inbox (default, unread count) | Sent | Compose tabs, with
+  Reply; the main panel button is now MAIL (with the unread count) and
+  opens the Inbox
+- Settings: Winlink has its own tab (moved out of Email) with the last CMS
+  exchange; the Settings window is wide enough for every tab label (the
+  tab bar still scrolls in a narrower main window)
+- Main panel: PTT and VOICE share one row
+- Settings -> Voice shows audio device state, frames/seconds sent,
+  received and played, and the last voice problem
+- Test hook: `voice_start`, `voice_stop`, `voice_ptt on|off`,
+  `show settings:<Tab>`, and a `voice` object in `dump`
+
 ### Security (code review, 2026-10-19)
 
 - **Email relay allowlist fails closed and is persisted.** `[email]

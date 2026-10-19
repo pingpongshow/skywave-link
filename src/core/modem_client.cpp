@@ -1020,6 +1020,15 @@ void ModemClient::readVoiceSocket() {
                     (static_cast<uint16_t>(payload[i * 2 + 1]) << 8));
                 voice_rx_samples_.push_back(sample);
             }
+            voice_rx_total_samples_ += sample_count;
+            // Nobody playing (devices closed): keep only the newest audio
+            // rather than replaying minutes of it later.
+            if (voice_rx_samples_.size() > kMaxVoiceRxSamples) {
+                voice_rx_samples_.erase(
+                    voice_rx_samples_.begin(),
+                    voice_rx_samples_.begin() +
+                        static_cast<std::ptrdiff_t>(voice_rx_samples_.size() - kMaxVoiceRxSamples));
+            }
         }
 
         voice_buffer_.erase(voice_buffer_.begin(), voice_buffer_.begin() + static_cast<std::ptrdiff_t>(frame_len));
@@ -1349,10 +1358,14 @@ void ModemClient::handleEventLine(const std::string& body) {
             snapshot.state = VoiceState::TxActive;
             snapshot.active = true;
             snapshot.local = true;
+            snapshot.ptt = true;
+            snapshot.granted = true;
         } else if (snapshot.last_event == "STOPPED") {
             snapshot.state = snapshot.open ? VoiceState::Ready : VoiceState::Idle;
             snapshot.active = false;
             snapshot.local = false;
+            snapshot.ptt = false;
+            snapshot.granted = false;
         }
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
@@ -2086,20 +2099,20 @@ bool ModemClient::setVoiceCodec(const std::string& codec, CommandResultCallback 
     return sendCommandOk("VOICECODEC " + normalized, 500, std::move(cb));
 }
 
-bool ModemClient::setVoiceMode(VoiceMode mode) {
-    return sendCommandOk("VOICE " + voiceModeCommand(mode));
+bool ModemClient::setVoiceMode(VoiceMode mode, CommandResultCallback cb) {
+    return sendCommandOk("VOICE " + voiceModeCommand(mode), 500, std::move(cb));
 }
 
-bool ModemClient::voiceStart() {
-    return sendCommandOk("VOICESTART");
+bool ModemClient::voiceStart(CommandResultCallback cb) {
+    return sendCommandOk("VOICESTART", 500, std::move(cb));
 }
 
-bool ModemClient::voiceStop() {
-    return sendCommandOk("VOICESTOP");
+bool ModemClient::voiceStop(CommandResultCallback cb) {
+    return sendCommandOk("VOICESTOP", 500, std::move(cb));
 }
 
-bool ModemClient::setVoicePtt(bool enabled) {
-    return sendCommandOk(std::string("VOICEPTT ") + (enabled ? "ON" : "OFF"));
+bool ModemClient::setVoicePtt(bool enabled, CommandResultCallback cb) {
+    return sendCommandOk(std::string("VOICEPTT ") + (enabled ? "ON" : "OFF"), 500, std::move(cb));
 }
 
 std::optional<VoiceStatus> ModemClient::queryVoiceStatus() {
@@ -2190,6 +2203,21 @@ bool ModemClient::flushVoiceLocked() {
     voice_tx_pending_.erase(voice_tx_pending_.begin(),
                             voice_tx_pending_.begin() + static_cast<std::ptrdiff_t>(total_sent));
     return ok;
+}
+
+uint64_t ModemClient::voiceSamplesReceived() const {
+    std::lock_guard<std::mutex> lock(voice_mutex_);
+    return voice_rx_total_samples_;
+}
+
+size_t ModemClient::voiceSamplesBuffered() const {
+    std::lock_guard<std::mutex> lock(voice_mutex_);
+    return voice_rx_samples_.size();
+}
+
+void ModemClient::discardVoicePcm() {
+    std::lock_guard<std::mutex> lock(voice_mutex_);
+    voice_rx_samples_.clear();
 }
 
 std::vector<int16_t> ModemClient::receiveVoicePcm(size_t max_samples) {

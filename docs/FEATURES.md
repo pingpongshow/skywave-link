@@ -73,7 +73,11 @@ This document reflects the current codebase, not the original roadmap.
 ### Mail and messaging
 
 - Store-and-forward message persistence via `MessageStore` (SQLite)
-- Radio mail inbox/sent views
+- Mail window with Inbox (default view, unread count on the tab), Sent and
+  Compose tabs; Reply fills Compose. The main panel MAIL button (with the
+  unread count) opens the Inbox
+- Internet mail for this station (POP3, or Winlink mail to its callsign)
+  lands in the Mail Inbox; mail for other radio stations is relayed
 - Private mail is sent over the link only when the linked station is the
   addressee; otherwise it waits in the outbox (or goes by mesh relay)
 - Message priorities: routine, priority, emergency
@@ -101,6 +105,9 @@ This document reflects the current codebase, not the original roadmap.
 - Gateway mail never tears down the operator's QSO; gateway calls are
   capped with backoff
 - Winlink-compatible B2F envelope option for radio mail
+- Settings -> Winlink tab: CMS enable, host, port, TLS, callsign, password
+  (secure-login note), fetch interval, max messages, compatibility mode,
+  and the last CMS exchange (time, server, messages or error)
 - Weak-signal profile knobs:
   - SNR threshold
   - ACK timeout
@@ -160,8 +167,24 @@ Requests go to the linked station, which fetches the data from the internet:
   - broadcast
 - Capture/playback device selection
 - Capture/playback gain controls
-- Push-to-talk button and focus-scoped hotkey capture
-- Voice media state and queue counters in the UI; the voice socket is
+- VOICE button: opens a voice session in the configured mode (or says why
+  it cannot: no modem, voice off, CONNECTED without a link, BROADCAST while
+  linked, link mode below the family's voice floor, voice port closed,
+  modem without voice, N0CALL) and closes an open one; label VOICE /
+  VOICE... / VOICE ON / VOICE TX / VOICE RX with a tooltip
+- Push-to-talk (main panel, Settings -> Voice, configured hotkey): opens a
+  session when none is open and keys once it is; every refusal is shown on
+  the window's status line and in the log (hotkey messages rate-limited).
+  The hotkey works only while the app window has focus, also while a text
+  field has focus (the key's character is not typed); focus loss releases
+  PTT
+- auto_start opens voice whenever the configured mode becomes possible
+  (link up / station idle) and stays closed after the operator stops it
+- Audio devices open on demand (link up, broadcast mode, start request or
+  PTT held); a microphone that delivers only silence (macOS privacy
+  settings) is reported
+- Voice media state, audio device state, frames/seconds sent, received
+  and played in Settings -> Voice; the voice socket is
   reopened when it closes. Uplink audio is queued in whole records; frames
   the modem cannot take are dropped whole and reported (rate-limited)
 

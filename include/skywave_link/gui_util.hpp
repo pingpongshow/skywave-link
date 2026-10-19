@@ -39,6 +39,17 @@ inline std::string normalizeCallsign(const std::string& input) {
     return upperCopy(trimCopy(input));
 }
 
+// Same station: callsigns equal once trimmed, upper-cased and stripped of
+// a -SSID suffix (mail for K1AAA-2 is this station's when it is K1AAA).
+inline bool sameStationCallsign(const std::string& a, const std::string& b) {
+    auto base = [](const std::string& c) {
+        const std::string n = normalizeCallsign(c);
+        return n.substr(0, n.find('-'));
+    };
+    const std::string x = base(a);
+    return !x.empty() && x == base(b);
+}
+
 // "hamlib" | "kenwood_tcp" | "none".
 inline std::string normalizeRadioBackend(const std::string& backend) {
     const std::string upper = upperCopy(trimCopy(backend));
